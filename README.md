@@ -1,4 +1,4 @@
-# MetaWriter v4.0
+# MetaWriter
 Self-Correcting Long-Form Generation via Decision Trace Graphs
 
 ## 核心特性
