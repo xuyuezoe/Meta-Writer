@@ -111,7 +111,7 @@ class CorrectionLog:
             'total_rollbacks':        int,   # 总回退次数
             'avg_rollback_distance':  float, # 平均回退距离
             'total_failures':         int,   # 彻底失败章节数
-            'avg_attempts':           float, # 成功章节平均尝试次数
+            'avg_attempts':           float, # 所有节（成功+失败）的平均实际尝试次数
         }
         """
         successes  = [e for e in self.events if e["type"] == "SUCCESS"]
@@ -137,9 +137,24 @@ class CorrectionLog:
         distances = [e.get("distance", 0) for e in rollbacks]
         avg_rollback_distance = sum(distances) / len(distances) if distances else 0.0
 
-        # 成功章节平均尝试次数
-        attempt_counts = [e.get("attempts", 1) for e in successes]
-        avg_attempts = sum(attempt_counts) / len(attempt_counts) if attempt_counts else 0.0
+        # 所有节（成功+失败）的实际尝试次数
+        # 成功节：来自 SUCCESS 事件的 attempts 字段
+        # 失败节：该节 RETRY 事件数 + 1（最后一次未通过的尝试）
+        section_attempts: Dict[str, int] = {}
+        for e in successes:
+            section_attempts[e["section"]] = e.get("attempts", 1)
+
+        retry_per_section: Dict[str, int] = {}
+        for e in retries:
+            sec = e["section"]
+            retry_per_section[sec] = retry_per_section.get(sec, 0) + 1
+
+        for e in failures:
+            sec = e["section"]
+            section_attempts[sec] = retry_per_section.get(sec, 0) + 1
+
+        all_attempt_counts = list(section_attempts.values())
+        avg_attempts = sum(all_attempt_counts) / len(all_attempt_counts) if all_attempt_counts else 0.0
 
         return {
             "total_sections":          total_sections,

@@ -37,6 +37,7 @@ class LLMClient:
         temperature: float,
         max_tokens: int,
         stop_sequences: Optional[List[str]] = None,
+        strip_think: bool = True,
     ) -> str:
         """
         调用 LLM 生成文本
@@ -46,9 +47,15 @@ class LLMClient:
             temperature:    采样温度
             max_tokens:     最大输出 token 数
             stop_sequences: 停止词列表（可选）
+            strip_think:    是否剥离 <think> 推理块（默认 True）
+
+                            生成叙事内容时应设为 True（推理过程不应混入输出）。
+                            LLM-as-judge 的评估调用应设为 False：推理模型（MiniMax M2.5、
+                            DeepSeek-R1 等）会将结构化评分结果放在 <think> 块内，
+                            剥离后仅剩确认语，导致评分无法被解析。
 
         返回：
-            生成的文本字符串（已剥离 <think> 推理块）
+            生成的文本字符串；strip_think=True 时已剥离 <think> 推理块
 
         异常：
             RuntimeError：API 调用失败时抛出，附带原始错误信息
@@ -64,14 +71,16 @@ class LLMClient:
         except openai.OpenAIError as e:
             raise RuntimeError(f"LLM API 调用失败：{e}") from e
 
-        self.total_tokens  += response.usage.total_tokens
+        if response.usage is not None:
+            self.total_tokens += response.usage.total_tokens
         self.request_count += 1
 
         text = response.choices[0].message.content or ""
 
         # 推理模型兼容（DeepSeek-R1、MiniMax M2.5 等输出 <think> 块的模型）
-        # 优先取思考块之后的可见输出；若可见输出为空则回退到全文
-        if "<think>" in text:
+        # strip_think=True（默认）：优先取可见输出；可见输出为空则回退到全文
+        # strip_think=False：返回原始全文（含 <think> 块），供评估调用自行解析
+        if strip_think and "<think>" in text:
             visible = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
             text = visible if visible else text
 
