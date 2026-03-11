@@ -20,7 +20,7 @@ from pathlib import Path
 # ================================================================
 # 修改此处选择运行的任务
 # ================================================================
-TASK_NAME = "argumentative_essay"
+TASK_NAME = "scifi_story"
 # ================================================================
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -119,9 +119,18 @@ def main() -> None:
         dtg_stats = orchestrator.dtg.get_statistics()
         print(f"\nDTG 统计:")
         print(f"  决策总数:        {dtg_stats['total_decisions']}")
+        print(f"  意图节点数:      {dtg_stats['total_intent_nodes']}")
         print(f"  平均置信度:      {dtg_stats['avg_confidence']:.3f}")
         print(f"  平均引用数/决策: {dtg_stats['avg_references_per_decision']:.2f}")
         print(f"  累计回退次数:    {dtg_stats['rollback_count']}")
+
+        metric_summary = orchestrator.metric_collector.summary()
+        g2 = metric_summary["g2_repair_efficiency"]
+        g3 = metric_summary["g3_memory_effectiveness"]
+        print(f"\n评估指标:")
+        print(f"  首次通过率:      {g2.get('first_pass_rate', 'N/A')}")
+        print(f"  DSL 活跃条目数:  {g3.get('final_active_entries', 'N/A')}")
+        print(f"  DSL 信任度:      {orchestrator.meta_state.memory_trust_level:.3f}")
 
         llm_stats = client.get_statistics()
         print(f"\nLLM 统计:")

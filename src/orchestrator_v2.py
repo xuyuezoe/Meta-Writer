@@ -1,56 +1,101 @@
-from typing import Tuple, List, Dict, Optional
+"""
+自我修正协调器：SelfCorrectingOrchestrator
+
+功能：
+    整合所有新组件，执行"规划 → 注入 → 生成 → 验证 → 诊断 → 修复"的完整主循环。
+    三层修复策略（local_rewrite / partial_rollback / memory_purge）由 MRSD 诊断结果驱动。
+    MetaState 提供元认知门控，MetricCollector 收集内部机制指标。
+
+依赖：Generator、SectionPlanner、DiscourseLedger、CommitmentExtractor、DTGStore、
+      OnlineValidator、MRSD、AlignmentScorer、MetaState、PlanState、MetricCollector、
+      CorrectionLog
+被依赖：main.py
+"""
+from __future__ import annotations
+
 import logging
+from typing import Dict, List, Optional, Tuple
 
 from rich.console import Console
 from rich.panel import Panel
-from rich.text import Text
 
 from .agents.generator import Generator
+from .agents.section_planner import SectionPlanner
+from .algorithms.mrsd import MRSD
+from .core.decision import Decision
+from .core.meta_state import MetaState
+from .core.plan import PlanState, SectionIntent
+from .core.state import GenerationState
+from .evaluation.metric_collector import MetricCollector
+from .logging.correction_log import CorrectionLog
+from .memory.commitment_extractor import CommitmentExtractor
+from .memory.discourse_ledger import DiscourseLedger
 from .memory.dtg_store import DTGStore
-from .algorithms.debugger import DTGDebugger
 from .metrics.alignment import AlignmentScorer
 from .validators.online_validator import OnlineValidator
-from .logging.correction_log import CorrectionLog
-from .core.state import GenerationState
-from .core.decision import Decision
 
 
 class SelfCorrectingOrchestrator:
     """
     自我修正协调器
 
-    核心功能：
-    1. 主循环（带自我修正）：逐节生成，验证失败时执行修正
-    2. 修正策略执行：RETRY_SIMPLE / STRENGTHEN_CONSTRAINT /
-                     ROLLBACK_TO / RETRY_WITH_STRONGER_PROMPT
-    3. 回退机制：清除错误决策和内容，跳回目标节重新生成
-    4. 降级策略：超过最大重试次数后接受最后一次生成的内容，即使有问题也不管了，继续前进
-    5. 修正日志：完整记录每次成功、重试、回退、失败
+    功能：
+        1. 主循环：逐节规划 → DSL 注入 → 生成 → 验证 → MRSD 诊断 → 三层修复
+        2. MetaState 元认知门控：gate_action() 控制 trust_validator_major /
+           allow_rollback / strengthen_dsl_injection 三类动作
+        3. DiscourseLedger 动态约束管理：salience 驱动的条目注入
+        4. MetricCollector 指标收集：不改变系统行为，仅记录
+
+    参数：
+        llm_client: LLM 客户端实例
+        memory_path: DTG 存储路径（默认 ./sessions）
+        session_name: 会话名称，用于文件命名和自动清理
+
+    关键常数：
+        MAX_RETRIES_PER_SECTION = 3
+        MAX_ROLLBACKS = 5
+        DCAS_THRESHOLD = 0.6
     """
 
     MAX_RETRIES_PER_SECTION = 3
-    # 单次生成的最大回退次数（防止无限循环）
     MAX_ROLLBACKS = 5
+    DCAS_THRESHOLD = 0.6
 
-    def __init__(self, llm_client, memory_path: str = "./sessions", session_name: str = "session"):
+    def __init__(
+        self,
+        llm_client,
+        memory_path: str = "./sessions",
+        session_name: str = "session",
+    ):
         """
         初始化自我修正协调器
 
+        功能：
+            创建并连接所有子组件，MetaState 初始化为信任状态。
+
         参数：
-            llm_client:   LLM客户端实例
-            memory_path:  DTG存储路径（默认 ./sessions）
-            session_name: 会话名称，用于文件命名和自动清理
+            llm_client: LLM 客户端实例
+            memory_path: DTG 存储路径
+            session_name: 会话名称
         """
-        self.generator        = Generator(llm_client)
         self.dtg              = DTGStore(memory_path, session_name=session_name)
-        self.debugger         = DTGDebugger(self.dtg)
+        self.meta_state       = MetaState()
+        self.dsl              = DiscourseLedger(llm_client=llm_client)
+        self.generator        = Generator(llm_client)
+        self.section_planner  = SectionPlanner(llm_client, self.dtg)
+        self.commitment_extractor = CommitmentExtractor(llm_client)
         self.alignment_scorer = AlignmentScorer(llm_client)
         self.online_validator = OnlineValidator(
-            llm_client, self.dtg, self.debugger, self.alignment_scorer
+            llm_client=llm_client,
+            dtg_store=self.dtg,
+            alignment_scorer=self.alignment_scorer,
+            meta_state=self.meta_state,
         )
-        self.correction_log = CorrectionLog()
-        self.console        = Console()
-        self.logger         = logging.getLogger(__name__)
+        self.mrsd = MRSD(dtg_store=self.dtg, llm_client=llm_client)
+        self.correction_log   = CorrectionLog()
+        self.metric_collector = MetricCollector()
+        self.console          = Console()
+        self.logger           = logging.getLogger(__name__)
 
     # ------------------------------------------------------------------
     # 主入口
@@ -65,178 +110,275 @@ class SelfCorrectingOrchestrator:
         """
         自我修正生成（主方法）
 
-        核心流程：
-            for each section:
-                attempt = 0
-                while attempt < max_retries:
-                    生成 → 验证 →
-                    if 通过: 保存并继续到下一节
-                    else:    诊断 → 执行修正策略 → 重试或回退
+        功能：
+            主循环：对每节执行"规划→注入→生成→验证→诊断→修复"。
+            失败时调用 MRSD 获取诊断结果，根据 repair_scope 选择修复策略。
 
-        :param task:        生成任务描述
-        :param constraints: 全局约束列表
-        :param outline:     有序章节大纲 {section_id: section_title}
-        :return:            (最终文本, 决策日志列表, 修正日志)
+        参数：
+            task: 生成任务描述
+            constraints: 全局约束列表（IMMUTABLE 类型）
+            outline: 有序章节大纲 {section_id: section_title}
+
+        返回值：
+            Tuple[str, List[Decision], CorrectionLog]：
+                (最终文本, 决策列表, 修正日志)
         """
         self._print_header(task, outline)
 
-        state            = self._initialize_state(task, constraints, outline)
+        state = self._initialize_state(constraints, outline)
+        plan_state = PlanState(global_outline=outline)
         generated_content: Dict[str, str] = {}
-        section_queue    = list(outline.keys())
-        rollback_count   = 0
-        current_idx      = 0
+        section_queue = list(outline.keys())
+
+        rollback_count = 0
+        current_idx = 0
+
+        # 节级别的诊断跟踪
+        consecutive_failures_this_section = 0
+        last_purge_succeeded = False
+        last_diagnosis_event_id: Optional[str] = None
 
         while current_idx < len(section_queue):
             section_id = section_queue[current_idx]
             state.current_section = section_id
+            section_title = outline[section_id]
 
-            self._print_section_start(section_id, outline[section_id], current_idx, len(section_queue))
+            self._print_section_start(section_id, section_title, current_idx, len(section_queue))
 
-            # 每节独立的修正上下文
-            correction_context: Dict = {
-                "last_failure_reason":       None,
-                "strengthened_constraints":  [],
-            }
+            # 第一阶段：规划当前节（SectionPlanner）
+            section_intent = self._plan_section(
+                section_id=section_id,
+                section_title=section_title,
+                task=task,
+                plan_state=plan_state,
+            )
+            plan_state.add_intent(section_intent)
+
+            # 准备 DSL 注入
+            self._update_dsl_injection(state, section_id, section_queue, current_idx)
 
             rolled_back = False
-            report = None          # 确保降级路径可访问
+            report = None
+            content: Optional[str] = None
+            decision: Optional[Decision] = None
 
             for attempt in range(self.MAX_RETRIES_PER_SECTION):
-                # ── 步骤1：生成 ──────────────────────────────────────
+                # 第二阶段：生成
                 try:
-                    content, decision = self._generate_section(
-                        state, task, correction_context
+                    temperature = self._get_temperature(consecutive_failures_this_section)
+                    content, decision = self.generator.generate_with_decision(
+                        state=state,
+                        task=task,
+                        recent_content=self._get_recent_content(),
+                        section_intent=section_intent,
+                        temperature=temperature,
                     )
                 except Exception as e:
                     self.logger.error("生成异常（section=%s attempt=%d）: %s", section_id, attempt + 1, e)
-                    correction_context["last_failure_reason"] = f"生成异常：{e}"
+                    consecutive_failures_this_section += 1
                     self.correction_log.add_retry(section_id, attempt + 1, "RETRY_SIMPLE", [str(e)])
                     continue
 
-                # ── 步骤2：验证 ──────────────────────────────────────
+                # 第三阶段：验证
                 try:
-                    report = self.online_validator.validate_and_diagnose(
-                        decision, content, state
-                    )
+                    report = self.online_validator.validate_and_diagnose(decision, content, state)
+                    self.meta_state.update_validator_stability(report.dcas_score)
                 except Exception as e:
                     self.logger.error("验证异常（section=%s）: %s", section_id, e)
                     report = None
 
-                # ── 步骤3：处理验证结果 ──────────────────────────────
+                # 第四阶段：处理验证结果
                 if report is None or report.passed:
-                    # ✓ 通过（或验证器崩溃时降级接受）
-                    generated_content[section_id] = content
-                    state.generated_sections.append(section_id)
-                    state.section_snippets[section_id] = content[:300]  # 供后续一致性检查
-                    state.update_progress()
-                    self.dtg.add_decision(decision)
-                    self.correction_log.add_success(section_id, attempt + 1)
-
-                    dcas = report.dcas_score if report else 1.0
-                    self._print_success(section_id, attempt + 1, dcas)
+                    # 验证通过
+                    self._on_section_success(
+                        section_id=section_id,
+                        content=content,
+                        decision=decision,
+                        state=state,
+                        generated_content=generated_content,
+                        section_queue=section_queue,
+                        plan_state=plan_state,
+                        attempt=attempt,
+                        dcas=report.dcas_score if report else 1.0,
+                    )
+                    # 记录诊断结果（若上一次有诊断）
+                    if last_diagnosis_event_id:
+                        self.metric_collector.record_diagnosis_outcome(
+                            last_diagnosis_event_id, succeeded=True
+                        )
+                        last_diagnosis_event_id = None
+                    self.metric_collector.record_section_first_pass(
+                        section_id, passed_on_first_try=(attempt == 0)
+                    )
+                    consecutive_failures_this_section = 0
+                    last_purge_succeeded = False
                     current_idx += 1
                     break
 
                 else:
-                    # ✗ 失败 — 执行修正策略
-                    strategy = report.suggested_strategy
-                    params   = report.strategy_params
+                    # 验证失败：MRSD 诊断
+                    consecutive_failures_this_section += 1
+                    diagnosis = self.mrsd.diagnose(
+                        report=report,
+                        current_section_id=section_id,
+                        section_queue=section_queue,
+                        contamination_risk_score=self.meta_state.contamination_risk_score,
+                        consecutive_failures_this_section=consecutive_failures_this_section,
+                        low_trust_dsl_ref_ratio=self._compute_low_trust_ratio(section_id),
+                        last_purge_succeeded=last_purge_succeeded,
+                        intent_from_trusted_dsl=(
+                            section_intent.dsl_trust_at_generation > 0.6
+                        ),
+                        recent_section_failure_tiers=[],
+                    )
 
-                    self._print_failure(section_id, attempt + 1, strategy, report)
+                    # 记录诊断事件
+                    diag_event_id = self.metric_collector.record_diagnosis(
+                        section_id=section_id,
+                        predicted_tier=diagnosis.error_tier.value,
+                        predicted_source=diagnosis.error_source.value,
+                        confidence=diagnosis.confidence,
+                        repair_scope=diagnosis.repair_scope,
+                        causal_subgraph_size=len(diagnosis.causal_subgraph),
+                        llm_calls_used=min(self.mrsd._max_llm_budget, len(diagnosis.causal_subgraph) + 1),
+                    )
+                    if last_diagnosis_event_id:
+                        self.metric_collector.record_diagnosis_outcome(
+                            last_diagnosis_event_id, succeeded=False
+                        )
+                    last_diagnosis_event_id = diag_event_id
 
-                    if strategy == "RETRY_SIMPLE":
-                        correction_context["last_failure_reason"] = (
-                            "; ".join(i.description for i in report.issues)
-                        )
-                        self.correction_log.add_retry(
-                            section_id, attempt + 1, strategy, report.issues
-                        )
-                        continue
+                    # 更新 MetaState
+                    self.meta_state.record_failure(
+                        diagnosis.error_tier.value, diagnosis.error_source.value
+                    )
+                    self.meta_state.update_contamination_risk(
+                        low_trust_ref_ratio=self._compute_low_trust_ratio(section_id),
+                        recent_same_tier_failure_rate=0.0,
+                    )
 
-                    elif strategy == "STRENGTHEN_CONSTRAINT":
-                        violations = params.get("violated_constraints", [])
-                        correction_context["strengthened_constraints"].extend(violations)
-                        correction_context["last_failure_reason"] = (
-                            f"约束违反：{violations}"
-                        )
-                        self.correction_log.add_retry(
-                            section_id, attempt + 1, strategy, report.issues
-                        )
-                        continue
+                    self._print_failure(section_id, attempt + 1, diagnosis, report)
+                    self.correction_log.add_retry(
+                        section_id, attempt + 1,
+                        f"{diagnosis.repair_scope}({diagnosis.error_tier.value})",
+                        report.issues,
+                    )
 
-                    elif strategy == "RETRY_WITH_STRONGER_PROMPT":
-                        correction_context["last_failure_reason"] = (
-                            "; ".join(i.description for i in report.issues)
-                        )
-                        self.correction_log.add_retry(
-                            section_id, attempt + 1, strategy, report.issues
-                        )
-                        continue
-
-                    elif strategy.startswith("ROLLBACK_TO:"):
-                        target_section = strategy.split(":", 1)[1]
-
-                        if rollback_count >= self.MAX_ROLLBACKS:
-                            self.logger.warning(
-                                "已达到最大回退次数(%d)，跳过回退，继续重试", self.MAX_ROLLBACKS
-                            )
-                            correction_context["last_failure_reason"] = "回退次数超限，改为重试"
-                            self.correction_log.add_retry(
-                                section_id, attempt + 1, "RETRY_SIMPLE(rollback_limit)", report.issues
-                            )
+                    # 执行修复
+                    if diagnosis.repair_scope == "partial_rollback":
+                        # 回退策略：需要 MetaState 门控
+                        if (
+                            not self.meta_state.gate_action("allow_rollback")
+                            or rollback_count >= self.MAX_ROLLBACKS
+                            or not diagnosis.should_rollback()
+                        ):
+                            self.logger.info("回退被门控或超限，降级为 local_rewrite")
+                            self._update_dsl_injection_strengthen(state)
                             continue
 
-                        success = self._execute_rollback(
-                            target_section, section_id,
+                        target = diagnosis.target_section
+                        if target and self._execute_rollback(
+                            target_section=target,
+                            current_section=section_id,
                             reason="; ".join(i.description for i in report.issues),
                             state=state,
                             generated_content=generated_content,
                             section_queue=section_queue,
-                        )
-
-                        if success:
+                            plan_state=plan_state,
+                        ):
                             rollback_count += 1
+                            self.meta_state.remaining_rollback_budget = max(
+                                0, self.meta_state.remaining_rollback_budget - 1
+                            )
                             self.correction_log.add_rollback(
                                 from_section=section_id,
-                                to_section=target_section,
-                                reason=strategy,
+                                to_section=target,
+                                reason=f"MRSD:{diagnosis.error_tier.value}",
                             )
-                            current_idx = section_queue.index(target_section)
+                            self.metric_collector.record_repair(
+                                section_id=section_id,
+                                repair_scope="partial_rollback",
+                                triggered_by_tier=diagnosis.error_tier.value,
+                                triggered_by_confidence=diagnosis.confidence,
+                                succeeded=True,
+                                extra_llm_calls=self.mrsd._max_llm_budget,
+                                rollback_distance=abs(
+                                    section_queue.index(section_id)
+                                    - (section_queue.index(target) if target in section_queue else 0)
+                                ),
+                            )
+                            consecutive_failures_this_section = 0
+                            current_idx = section_queue.index(target)
                             rolled_back = True
-                            break   # 跳出重试循环，从 target 节重新开始
+                            break
                         else:
-                            # 回退失败（目标节不存在），降级为简单重试
-                            correction_context["last_failure_reason"] = f"回退目标 {target_section} 不存在"
-                            self.correction_log.add_retry(
-                                section_id, attempt + 1, "RETRY_SIMPLE(rollback_failed)", report.issues
-                            )
+                            self.logger.warning("回退执行失败，降级为 local_rewrite")
                             continue
 
+                    elif diagnosis.repair_scope == "memory_purge":
+                        # 精确记忆清除
+                        purged = self.dsl.purge_contaminated_entries(
+                            contaminated_section=section_id,
+                            conflict_description="; ".join(
+                                i.description for i in report.issues[:2]
+                            ),
+                        )
+                        last_purge_succeeded = len(purged) > 0
+                        self.logger.info("memory_purge：清除 %d 条条目", len(purged))
+                        # 更新 DSL 注入
+                        self._update_dsl_injection(state, section_id, section_queue, current_idx)
+                        self.metric_collector.record_repair(
+                            section_id=section_id,
+                            repair_scope="memory_purge",
+                            triggered_by_tier=diagnosis.error_tier.value,
+                            triggered_by_confidence=diagnosis.confidence,
+                            succeeded=last_purge_succeeded,
+                            extra_llm_calls=0,
+                        )
+                        continue
+
                     else:
-                        # 未知策略 → 简单重试
-                        correction_context["last_failure_reason"] = str(report.issues)
-                        self.correction_log.add_retry(
-                            section_id, attempt + 1, strategy or "UNKNOWN", report.issues
+                        # local_rewrite：更新 DSL 注入（若需要强化）
+                        if diagnosis.decoding_config.strengthen_dsl_injection:
+                            self._update_dsl_injection_strengthen(state)
+                        # plan_level：重规划 SectionIntent
+                        if diagnosis.decoding_config.trigger_section_intent_revision:
+                            section_intent = self._plan_section(
+                                section_id=section_id,
+                                section_title=section_title,
+                                task=task,
+                                plan_state=plan_state,
+                                is_revision=True,
+                                revision_reason="; ".join(i.description for i in report.issues),
+                            )
+                            plan_state.revise_intent(
+                                section_id=section_id,
+                                new_intent=section_intent,
+                                reason="plan_level repair",
+                            )
+                        self.metric_collector.record_repair(
+                            section_id=section_id,
+                            repair_scope="local_rewrite",
+                            triggered_by_tier=diagnosis.error_tier.value,
+                            triggered_by_confidence=diagnosis.confidence,
+                            succeeded=False,  # 后续验证后更新
+                            extra_llm_calls=1,
                         )
                         continue
 
             else:
-                # ── 超过最大重试次数：降级策略 ──────────────────────
+                # 超过最大重试次数：降级接受
                 if not rolled_back:
                     self.logger.warning(
                         "section=%s 超过最大重试次数，以最后一次内容降级继续", section_id
                     )
-                    # 使用最后一次生成的内容（变量在 for 循环中保持）
-                    try:
-                        fallback_content  = content   # noqa: F821 — 至少执行过一次
-                        fallback_decision = decision  # noqa: F821
-                    except NameError:
-                        fallback_content  = f"[{section_id} 生成失败]"
-                        fallback_decision = None
+                    fallback_content = content if content is not None else f"[{section_id} 生成失败]"
+                    fallback_decision = decision
 
                     generated_content[section_id] = fallback_content
                     state.generated_sections.append(section_id)
                     state.section_snippets[section_id] = fallback_content[:300]
+                    state.section_summaries[section_id] = fallback_content[:500]
                     state.update_progress()
                     if fallback_decision:
                         self.dtg.add_decision(fallback_decision)
@@ -244,42 +386,229 @@ class SelfCorrectingOrchestrator:
                     last_issues = report.issues if report else []
                     self.correction_log.add_failure(section_id, last_issues)
                     state.flagged_issues.append(f"{section_id}：降级内容（验证未通过）")
+                    self.metric_collector.record_section_first_pass(section_id, False)
+                    consecutive_failures_this_section = 0
                     current_idx += 1
 
-        # ── 组装最终文本 ──────────────────────────────────────────────
+        # 组装最终文本
         final_text = self._assemble_text(outline, generated_content)
         self._print_summary()
 
         return final_text, self.dtg.decision_log, self.correction_log
 
     # ------------------------------------------------------------------
-    # 生成单节
+    # 第一阶段：规划
     # ------------------------------------------------------------------
 
-    def _generate_section(
+    def _plan_section(
         self,
-        state: GenerationState,
+        section_id: str,
+        section_title: str,
         task: str,
-        correction_context: Dict,
-    ) -> Tuple[str, Decision]:
+        plan_state: PlanState,
+        is_revision: bool = False,
+        revision_reason: str = "",
+    ) -> SectionIntent:
         """
-        生成单个section（注入修正上下文）
+        调用 SectionPlanner 生成当前节的 SectionIntent
 
-        若 correction_context 含失败原因或加强约束，附加到任务描述末尾
+        功能：
+            获取 DSL 上下文、已完成章节摘要，调用 SectionPlanner.plan_section()。
+
+        参数：
+            section_id: 当前节 ID
+            section_title: 当前节标题
+            task: 全局任务描述
+            plan_state: 当前规划状态
+            is_revision: 是否为修订（plan_level repair 时为 True）
+            revision_reason: 修订原因（plan_level repair 时提供）
+
+        返回值：
+            SectionIntent：生成的局部计划
         """
-        task_with_context = task
+        memory_trust = self.dsl.compute_memory_trust_level()
+        low_trust_ids = self.dsl.get_low_trust_entry_ids(threshold=0.5)
+        dsl_entry_ids = [e.entry_id for e in self.dsl.get_active_entries()]
 
-        if correction_context.get("last_failure_reason"):
-            task_with_context += (
-                f"\n\n⚠️ 上次失败原因（请针对性改进）：{correction_context['last_failure_reason']}"
+        injectable = self.dsl.get_injectable_entries(
+            target_section_idx=list(plan_state.global_outline.keys()).index(section_id)
+            if section_id in plan_state.global_outline else 0,
+            total_sections=len(plan_state.global_outline),
+            recent_decision_ids=[],
+            historical_failure_entry_ids=[],
+            outline=plan_state.global_outline,
+            target_section_id=section_id,
+        )
+        dsl_context = "\n".join(f"- [{e.commitment_type.value}] {e.content}" for e in injectable)
+
+        section_summaries_str = "\n".join(
+            f"[{sid}] {intent.local_goal}"
+            for sid, intent in list(plan_state.section_intents.items())[:5]
+        )
+
+        if is_revision and revision_reason:
+            task_with_reason = f"{task}\n\n（修订原因：{revision_reason}）"
+        else:
+            task_with_reason = task
+
+        try:
+            return self.section_planner.plan_section(
+                section_id=section_id,
+                section_title=section_title,
+                task_description=task_with_reason,
+                dsl_context=dsl_context,
+                section_summaries=section_summaries_str,
+                source_dsl_entry_ids=dsl_entry_ids,
+                dsl_trust_at_generation=memory_trust,
+            )
+        except Exception as e:
+            self.logger.warning("SectionPlanner 异常，使用默认 intent：%s", e)
+            return SectionIntent.create(
+                section_id=section_id,
+                local_goal=f"完成 {section_title} 的内容生成",
+                open_loops_to_advance=[],
+                commitments_to_maintain=[],
+                risks_to_avoid=[],
+                success_criteria=["内容符合节目标，无严重约束违反"],
+                source_dsl_entry_ids=dsl_entry_ids,
+                dsl_trust_at_generation=memory_trust,
             )
 
-        if correction_context.get("strengthened_constraints"):
-            extra = "、".join(correction_context["strengthened_constraints"])
-            task_with_context += f"\n⚠️ 特别注意以下约束必须严格满足：{extra}"
+    # ------------------------------------------------------------------
+    # 第二阶段：DSL 注入
+    # ------------------------------------------------------------------
 
-        recent_content = self._get_recent_content(state)
-        return self.generator.generate_with_decision(state, task_with_context, recent_content)
+    def _update_dsl_injection(
+        self,
+        state: GenerationState,
+        section_id: str,
+        section_queue: List[str],
+        current_idx: int,
+    ) -> None:
+        """
+        更新 GenerationState 的 DSL 注入文本
+
+        功能：
+            计算当前节的 injectable entries，格式化为注入字符串，
+            写入 state.dsl_injection。
+
+        参数：
+            state: 当前生成状态
+            section_id: 当前节 ID
+            section_queue: 全局节列表
+            current_idx: 当前节序号（0-based）
+        """
+        injectable = self.dsl.get_injectable_entries(
+            target_section_idx=current_idx,
+            total_sections=len(section_queue),
+            recent_decision_ids=[
+                d.decision_id for d in self.dtg.decision_log[-2:]
+            ],
+            historical_failure_entry_ids=[],
+            outline={sid: sid for sid in section_queue},
+            target_section_id=section_id,
+        )
+        if injectable:
+            state.dsl_injection = "\n".join(
+                f"- [{e.commitment_type.value}/{e.constraint_type.value}] {e.content}"
+                for e in injectable
+            )
+        else:
+            state.dsl_injection = ""
+
+    def _update_dsl_injection_strengthen(self, state: GenerationState) -> None:
+        """
+        强化 DSL 注入（strengthen_dsl_injection=True 时调用）
+
+        功能：
+            在当前 dsl_injection 基础上追加强调说明。
+        """
+        if state.dsl_injection:
+            state.dsl_injection = "【重要】以下话语状态约束必须严格遵守：\n" + state.dsl_injection
+
+    # ------------------------------------------------------------------
+    # 成功处理
+    # ------------------------------------------------------------------
+
+    def _on_section_success(
+        self,
+        section_id: str,
+        content: str,
+        decision: Decision,
+        state: GenerationState,
+        generated_content: Dict[str, str],
+        section_queue: List[str],
+        plan_state: PlanState,
+        attempt: int,
+        dcas: float,
+    ) -> None:
+        """
+        验证通过后的统一处理逻辑
+
+        功能：
+            1. 保存内容和决策
+            2. 更新 state 和 plan_state
+            3. 从生成内容中提取承诺并写入 DSL
+            4. 更新 DSL 条目稳定性
+            5. 更新 MetaState.memory_trust_level
+            6. 记录 DSL 快照（MetricCollector）
+            7. 打印成功信息
+
+        参数：
+            section_id: 节 ID
+            content: 生成内容
+            decision: 决策对象
+            state: 生成状态
+            generated_content: 已生成内容字典
+            section_queue: 全局节列表
+            plan_state: 规划状态
+            attempt: 本次为第几次尝试（0-based）
+            dcas: DCAS 评分
+        """
+        generated_content[section_id] = content
+        state.generated_sections.append(section_id)
+        state.section_snippets[section_id] = content[:300]
+        state.section_summaries[section_id] = content[:500]
+        state.update_progress()
+        self.dtg.add_decision(decision)
+        self.correction_log.add_success(section_id, attempt + 1)
+
+        # 提取承诺并写入 DSL
+        try:
+            entries = self.commitment_extractor.extract(
+                section_content=content,
+                section_id=section_id,
+                decision_id=decision.decision_id,
+                existing_summary="; ".join(state.section_summaries.get(sid, "")[:100] for sid in state.generated_sections[-3:-1]),
+            )
+            for entry in entries:
+                self.dsl.add_entry(entry)
+        except Exception as e:
+            self.logger.warning("承诺提取失败（跳过）：%s", e)
+
+        # 更新 DSL 稳定性
+        self.dsl.update_entry_stability(section_id, state.generated_sections)
+
+        # 更新 MetaState
+        self.meta_state.memory_trust_level = self.dsl.compute_memory_trust_level()
+        self.meta_state.update_contamination_risk(
+            low_trust_ref_ratio=self._compute_low_trust_ratio(section_id),
+            recent_same_tier_failure_rate=0.0,
+        )
+
+        # 记录 DSL 快照
+        active = self.dsl.get_active_entries()
+        self.metric_collector.record_dsl_snapshot(
+            section_id=section_id,
+            total_entries=len(active),
+            high_stability_count=sum(1 for e in active if e.stability_score > 0.7),
+            revoked_count=0,
+            open_loop_count=len(self.dsl.get_open_loops()),
+            closed_loop_count=0,
+            memory_trust_level=self.meta_state.memory_trust_level,
+        )
+
+        self._print_success(section_id, attempt + 1, dcas)
 
     # ------------------------------------------------------------------
     # 回退
@@ -293,52 +622,70 @@ class SelfCorrectingOrchestrator:
         state: GenerationState,
         generated_content: Dict[str, str],
         section_queue: List[str],
+        plan_state: PlanState,
     ) -> bool:
         """
         执行回退操作
 
-        步骤：
-        1. 验证目标节存在于 section_queue
-        2. 确定需要清除的节（target 之后到 current 之间）
-        3. 清除 generated_content 和 state.generated_sections
-        4. 清除 DTGStore 中对应决策
-        5. 清除 state.flagged_issues 中相关标记
+        功能：
+            1. 验证目标节存在
+            2. 清除 generated_content、state 和 DTGStore 中的被回退节数据
+            3. 回退 DiscourseLedger（清除被回退节引入的 DSL 条目）
+            4. 回退 PlanState（清除 intent）
+            5. 清除 flagged_issues 中的相关标记
 
-        :return: 回退是否成功
+        参数：
+            target_section: 回退目标节 ID（从此节重新生成）
+            current_section: 当前失败节 ID
+            reason: 回退原因
+            state: 生成状态
+            generated_content: 已生成内容字典
+            section_queue: 全局节列表
+            plan_state: 规划状态
+
+        返回值：
+            bool：回退是否成功
         """
         if target_section not in section_queue:
             self.logger.warning("回退目标 '%s' 不在 section_queue 中，跳过", target_section)
             return False
 
-        target_idx  = section_queue.index(target_section)
-        current_idx = section_queue.index(current_section) if current_section in section_queue else len(section_queue)
-
-        # 需要清除的节：[target_idx, current_idx]（含目标节，目标节本身也需重新生成）
+        target_idx = section_queue.index(target_section)
+        current_idx = (
+            section_queue.index(current_section)
+            if current_section in section_queue
+            else len(section_queue)
+        )
         sections_to_remove = section_queue[target_idx: current_idx + 1]
 
-        # 清除生成内容
+        # 清除内容和状态
         for sec in sections_to_remove:
             generated_content.pop(sec, None)
-
-        # 清除状态中的已生成列表
         state.generated_sections = [
             s for s in state.generated_sections if s not in sections_to_remove
         ]
         state.update_progress()
 
-        # 清除 DTGStore 决策（回退到 target 节之前的状态）
+        # 回退 DTGStore
         prev_section = section_queue[target_idx - 1] if target_idx > 0 else None
         self.dtg.rollback_to_section(prev_section)
 
-        # 清除与被删除节相关的 flagged_issues
+        # 回退 DiscourseLedger（清除目标节及之后引入的条目）
+        cutoff = section_queue[target_idx - 1] if target_idx > 0 else section_queue[0]
+        self.dsl.rollback_to_section(cutoff, section_queue)
+
+        # 回退 PlanState（清除 intent）
+        plan_state.rollback_intents_from(target_section, section_queue)
+
+        # 清除 flagged_issues
         state.flagged_issues = [
             issue for issue in state.flagged_issues
             if not any(sec in issue for sec in sections_to_remove)
         ]
 
         self.logger.info(
-            "回退完成：%s → %s，清除节：%s，原因：%s",
-            current_section, target_section, sections_to_remove, reason
+            "回退完成：%s → %s，清除 %d 节，原因：%s",
+            current_section, target_section, len(sections_to_remove), reason
         )
         return True
 
@@ -348,44 +695,93 @@ class SelfCorrectingOrchestrator:
 
     def _initialize_state(
         self,
-        task: str,
         constraints: List[str],
         outline: Dict[str, str],
     ) -> GenerationState:
-        """初始化生成状态"""
+        """
+        初始化 GenerationState
+
+        参数：
+            constraints: 全局约束列表
+            outline: 章节大纲
+
+        返回值：
+            GenerationState：初始化后的生成状态
+        """
         first_section = next(iter(outline))
         return GenerationState(
             current_section=first_section,
             progress=0.0,
             global_constraints=constraints,
-            pending_goals=[task],
             outline=outline,
             generated_sections=[],
-            flagged_issues=[],
         )
 
-    def _get_recent_content(self, state: GenerationState) -> str:
+    def _get_recent_content(self) -> str:
         """
-        获取最近生成内容（用于上下文）
+        获取最近 2 个决策的 expected_effect 作为上下文摘要
 
-        策略：取最近2个已生成节的 decision 中 reasoning 字段，
-        避免把完整内容全部传入（节省token）。
-        实际内容存在 generated_content 中由调用方传递，
-        这里通过 DTGStore 的 decision_log 读取最近决策的 expected_effect 作为摘要。
+        返回值：
+            str：最近内容摘要字符串
         """
         recent = self.dtg.decision_log[-2:]
         if not recent:
             return ""
-        return "\n".join(
-            f"[{d.target_section}] {d.expected_effect}" for d in recent
-        )
+        return "\n".join(f"[{d.target_section}] {d.expected_effect}" for d in recent)
+
+    def _get_temperature(self, consecutive_failures: int) -> float:
+        """
+        根据连续失败次数决定生成温度
+
+        关键实现细节：
+            0 次失败 → 0.7（正常生成）
+            1 次失败 → 0.5（中等保守）
+            2+ 次失败 → 0.3（低温保守重写）
+
+        参数：
+            consecutive_failures: 当前节连续失败次数
+
+        返回值：
+            float：生成温度
+        """
+        if consecutive_failures == 0:
+            return 0.7
+        elif consecutive_failures == 1:
+            return 0.5
+        else:
+            return 0.3
+
+    def _compute_low_trust_ratio(self, section_id: str) -> float:
+        """
+        计算当前节引用的低信任 DSL 条目比例
+
+        参数：
+            section_id: 当前节 ID
+
+        返回值：
+            float：低信任条目比例 [0.0, 1.0]
+        """
+        active = self.dsl.get_active_entries()
+        if not active:
+            return 0.0
+        low_trust = self.dsl.get_low_trust_entry_ids(threshold=0.5)
+        return len(low_trust) / len(active)
 
     def _assemble_text(
         self,
         outline: Dict[str, str],
         generated_content: Dict[str, str],
     ) -> str:
-        """按大纲顺序组装最终文本"""
+        """
+        按大纲顺序组装最终文本
+
+        参数：
+            outline: 章节大纲
+            generated_content: 已生成内容字典
+
+        返回值：
+            str：完整文本
+        """
         parts = []
         for section_id, title in outline.items():
             content = generated_content.get(section_id, f"[{section_id} 内容缺失]")
@@ -396,7 +792,7 @@ class SelfCorrectingOrchestrator:
     # Rich 打印
     # ------------------------------------------------------------------
 
-    def _print_header(self, task: str, outline: Dict[str, str]):
+    def _print_header(self, task: str, outline: Dict[str, str]) -> None:
         self.console.print(Panel(
             f"[bold cyan]MetaWriter v4.0[/bold cyan]\n"
             f"任务：{task}\n"
@@ -405,32 +801,39 @@ class SelfCorrectingOrchestrator:
             border_style="cyan",
         ))
 
-    def _print_section_start(self, section_id: str, title: str, idx: int, total: int):
+    def _print_section_start(
+        self, section_id: str, title: str, idx: int, total: int
+    ) -> None:
         self.console.print(
             f"\n[bold blue]▶ [{idx+1}/{total}] {section_id}[/bold blue] — {title}"
         )
 
-    def _print_success(self, section_id: str, attempt: int, dcas: float):
-        attempt_str = f"(第{attempt}次)" if attempt > 1 else "(一次通过)"
+    def _print_success(self, section_id: str, attempt: int, dcas: float) -> None:
+        attempt_str = f"(第 {attempt} 次)" if attempt > 1 else "(一次通过)"
         self.console.print(
             f"  [green]✓ {section_id} 通过 {attempt_str} DCAS={dcas:.3f}[/green]"
         )
 
-    def _print_failure(self, section_id: str, attempt: int, strategy: str, report):
+    def _print_failure(self, section_id: str, attempt: int, diagnosis, report) -> None:
         issues_str = " | ".join(i.description[:40] for i in report.issues[:3])
         self.console.print(
-            f"  [yellow]✗ {section_id} 第{attempt}次失败 → {strategy}[/yellow]\n"
+            f"  [yellow]✗ {section_id} 第 {attempt} 次失败 → "
+            f"{diagnosis.repair_scope}({diagnosis.error_tier.value}/"
+            f"{diagnosis.error_source.value})[/yellow]\n"
             f"    [dim]{issues_str}[/dim]"
         )
 
-    def _print_summary(self):
+    def _print_summary(self) -> None:
         stats = self.correction_log.get_statistics()
+        metric_summary = self.metric_collector.compute_repair_efficiency()
         self.console.print(Panel(
             f"总节数：{stats['total_sections']}   "
             f"一次通过率：{stats['success_rate_first_try']:.0%}   "
-            f"重试：{stats['total_retries']}次   "
-            f"回退：{stats['total_rollbacks']}次   "
-            f"失败：{stats['total_failures']}节",
+            f"重试：{stats['total_retries']} 次   "
+            f"回退：{stats['total_rollbacks']} 次   "
+            f"失败：{stats['total_failures']} 节\n"
+            f"False Rollback Rate：{metric_summary.get('false_rollback_rate', 'N/A')}   "
+            f"DSL 信任度：{self.meta_state.memory_trust_level:.3f}",
             title="[bold green]生成完成[/bold green]",
             border_style="green",
         ))
