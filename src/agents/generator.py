@@ -15,11 +15,14 @@ from __future__ import annotations
 import re
 import time
 import logging
-from typing import Optional, List, Tuple
+from typing import TYPE_CHECKING, Optional, List, Tuple
 
 from ..core.decision import Decision
 from ..core.plan import SectionIntent
 from ..core.state import GenerationState
+
+if TYPE_CHECKING:
+    from ..logging.run_logger import RunLogger
 
 
 class Generator:
@@ -43,8 +46,16 @@ class Generator:
     MAX_RETRIES = 3
     RECENT_CONTENT_LIMIT = 500
 
-    def __init__(self, llm_client):
+    def __init__(self, llm_client, run_logger: Optional["RunLogger"] = None):
+        """
+        初始化生成器
+
+        参数：
+            llm_client: LLM 客户端实例
+            run_logger: 可选的运行日志器，用于记录 prompt 和 LLM 原始响应
+        """
         self.llm = llm_client
+        self.run_logger = run_logger
         self.logger = logging.getLogger(__name__)
 
     def generate_with_decision(
@@ -54,6 +65,7 @@ class Generator:
         recent_content: str = "",
         section_intent: Optional[SectionIntent] = None,
         temperature: float = 0.7,
+        orchestrator_attempt: int = 1,
     ) -> Tuple[str, Decision]:
         """
         生成内容并返回决策对象
@@ -70,6 +82,7 @@ class Generator:
             recent_content: 最近已生成内容（截断到最后 500 字符）
             section_intent: 可选的章节局部计划（来自 SectionPlanner）
             temperature: 生成温度（由 DecodingConfig 或默认值决定）
+            orchestrator_attempt: 协调器层的尝试序号（1-based），传给 run_logger
 
         返回值：
             Tuple[str, Decision]：(生成内容, 决策对象)
@@ -78,6 +91,7 @@ class Generator:
             RuntimeError：三次重试后仍无法解析响应
         """
         last_error: Optional[Exception] = None
+        section_id = state.current_section
 
         for attempt in range(self.MAX_RETRIES):
             # 第三次尝试降温至 0.3
@@ -92,17 +106,33 @@ class Generator:
             self.logger.debug(
                 "第 %d 次尝试生成，section=%s temp=%.2f",
                 attempt + 1,
-                state.current_section,
+                section_id,
                 actual_temp,
             )
 
+            # 第一阶段：记录 prompt
+            if self.run_logger is not None:
+                self.run_logger.log_prompt(section_id, orchestrator_attempt, prompt)
+
             try:
                 response = self.llm.generate(prompt, temperature=actual_temp, max_tokens=2048)
+
+                # 第二阶段：记录 LLM 原始响应
+                if self.run_logger is not None:
+                    self.run_logger.log_llm_raw_response(section_id, orchestrator_attempt, response)
+
                 content, decision = self._parse_response(response, state)
+
+                # 第三阶段：记录解析后的决策和内容
+                if self.run_logger is not None:
+                    self.run_logger.log_parsed_decision(
+                        section_id, orchestrator_attempt, content, decision
+                    )
+
                 self.logger.info(
                     "生成成功 [尝试 %d] section=%s confidence=%.2f",
                     attempt + 1,
-                    state.current_section,
+                    section_id,
                     decision.confidence,
                 )
                 return content, decision

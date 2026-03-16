@@ -85,7 +85,10 @@ def main() -> None:
     # ── 第三阶段：生成 ─────────────────────────────────────────
     client       = LLMClient(api_key=api_key, model=model, base_url=base_url)
     orchestrator = SelfCorrectingOrchestrator(
-        client, memory_path="./sessions", session_name=session_name
+        client,
+        memory_path="./sessions",
+        session_name=session_name,
+        output_dir=str(output_dir),
     )
 
     try:

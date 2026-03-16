@@ -18,13 +18,16 @@ from __future__ import annotations
 
 import logging
 import re
-from typing import Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 from ..core.decision import Decision
 from ..core.meta_state import MetaState
 from ..core.state import GenerationState
 from ..core.validation import Issue, IssueSeverity, ValidationReport
 from ..metrics.alignment import AlignmentScorer
+
+if TYPE_CHECKING:
+    from ..logging.run_logger import RunLogger
 
 
 class OnlineValidator:
@@ -61,11 +64,23 @@ class OnlineValidator:
         dtg_store,
         alignment_scorer: AlignmentScorer,
         meta_state: MetaState,
+        run_logger: Optional["RunLogger"] = None,
     ):
+        """
+        初始化在线验证器
+
+        参数：
+            llm_client: LLM 客户端（约束 LLM 兜底和一致性检查）
+            dtg_store: DTGStore（历史决策信息）
+            alignment_scorer: AlignmentScorer（计算 DCAS）
+            meta_state: MetaState（行为门控）
+            run_logger: 可选的运行日志器，用于记录四层验证逐层结果
+        """
         self.llm = llm_client
         self.dtg = dtg_store
         self.alignment_scorer = alignment_scorer
         self.meta_state = meta_state
+        self.run_logger = run_logger
         self.logger = logging.getLogger(__name__)
 
     # ------------------------------------------------------------------
@@ -77,6 +92,7 @@ class OnlineValidator:
         decision: Decision,
         content: str,
         state: GenerationState,
+        attempt: int = 1,
     ) -> ValidationReport:
         """
         在线验证（核心方法）
@@ -94,6 +110,7 @@ class OnlineValidator:
             decision: 当前节对应的决策对象
             content: 当前节生成内容
             state: 当前生成状态
+            attempt: 协调器层的尝试序号（1-based），传给 run_logger
 
         返回值：
             ValidationReport：包含问题列表、DCAS 分数和约束违反列表
@@ -104,16 +121,33 @@ class OnlineValidator:
         issues: List[Issue] = []
         constraint_violations: List[str] = []
         dcas_score = 1.0
+        section_id = state.current_section
+
+        # 记录验证开始
+        if self.run_logger is not None:
+            self.run_logger.log_validation_start(section_id, attempt)
 
         # 第一层：格式检查
+        format_passed = True
         try:
             format_issues = self._check_format(content)
             issues.extend(format_issues)
+            format_passed = not bool(format_issues)
+            char_count = len(content.strip())
+            format_details = f"长度={char_count}字符"
+            if format_issues:
+                format_details += "  " + " | ".join(i.description for i in format_issues)
             self.logger.debug("格式检查完成，发现 %d 个问题", len(format_issues))
         except Exception as e:
             self.logger.warning("格式检查异常（跳过）：%s", e)
+            format_details = f"异常跳过：{e}"
+        if self.run_logger is not None:
+            self.run_logger.log_validation_result(
+                section_id, attempt, "格式检查", format_passed, format_details
+            )
 
         # 第二层：约束检查
+        constraint_passed = True
         try:
             constraint_violations = self._check_constraints(content, state.global_constraints)
             for v in constraint_violations:
@@ -121,16 +155,29 @@ class OnlineValidator:
                     type="constraint",
                     severity=IssueSeverity.MAJOR.value,
                     description=f"违反约束：{v}",
-                    location=state.current_section,
+                    location=section_id,
                 ))
+            constraint_passed = not bool(constraint_violations)
+            total_c = len(state.global_constraints)
+            passed_c = total_c - len(constraint_violations)
+            constraint_details = f"{passed_c}/{total_c} 条通过"
             self.logger.debug("约束检查完成，违反 %d 条", len(constraint_violations))
         except Exception as e:
             self.logger.warning("约束检查异常（跳过）：%s", e)
+            constraint_details = f"异常跳过：{e}"
+        if self.run_logger is not None:
+            self.run_logger.log_validation_result(
+                section_id, attempt, "约束检查", constraint_passed, constraint_details
+            )
 
         # 第三层：对齐度检查（DCAS）
+        dcas_passed = True
+        dcas_details = ""
         try:
             alignment_result = self.alignment_scorer.compute_dcas(decision, content)
             dcas_score = alignment_result.get("dcas", 1.0)
+            dcas_passed = dcas_score >= self.THRESHOLD_DCAS
+            dcas_details = f"score={dcas_score:.3f}  (阈值={self.THRESHOLD_DCAS})"
             if dcas_score < self.THRESHOLD_DCAS:
                 severity = (
                     IssueSeverity.CRITICAL.value
@@ -143,20 +190,40 @@ class OnlineValidator:
                     description=(
                         f"决策-内容对齐度不足（DCAS={dcas_score:.3f} < {self.THRESHOLD_DCAS}）"
                     ),
-                    location=state.current_section,
+                    location=section_id,
                 ))
             self.logger.debug("对齐度检查完成，DCAS=%.3f", dcas_score)
         except Exception as e:
             self.logger.warning("对齐度检查异常（跳过）：%s", e)
             dcas_score = 0.5
+            dcas_passed = False
+            dcas_details = f"异常跳过：{e}"
+        if self.run_logger is not None:
+            self.run_logger.log_validation_result(
+                section_id, attempt, "对齐度(DCAS)", dcas_passed, dcas_details
+            )
 
         # 第四层：一致性检查
+        consistency_passed = True
         try:
             consistency_issues = self._check_consistency(decision, content, state)
             issues.extend(consistency_issues)
+            # 一致性问题全为 MINOR，不阻断，但记录到日志
+            blocking_consistency = [
+                i for i in consistency_issues if i.severity != IssueSeverity.MINOR.value
+            ]
+            consistency_passed = not bool(blocking_consistency)
+            dim_count = 4
+            fail_count = len(consistency_issues)
+            consistency_details = f"{dim_count - fail_count}/{dim_count} 维度通过"
             self.logger.debug("一致性检查完成，发现 %d 个问题", len(consistency_issues))
         except Exception as e:
             self.logger.warning("一致性检查异常（跳过）：%s", e)
+            consistency_details = f"异常跳过：{e}"
+        if self.run_logger is not None:
+            self.run_logger.log_validation_result(
+                section_id, attempt, "一致性检查", consistency_passed, consistency_details
+            )
 
         # MetaState 门控：验证器不稳定时，将 MAJOR 降级为 MINOR
         if not self.meta_state.gate_action("trust_validator_major"):
@@ -175,17 +242,23 @@ class OnlineValidator:
                 "验证失败 [%d blocking issues] DCAS=%.3f section=%s",
                 len(blocking_issues),
                 dcas_score,
-                state.current_section,
+                section_id,
             )
         else:
-            self.logger.info("验证通过 DCAS=%.3f section=%s", dcas_score, state.current_section)
+            self.logger.info("验证通过 DCAS=%.3f section=%s", dcas_score, section_id)
 
-        return ValidationReport(
+        report = ValidationReport(
             passed=passed,
             issues=blocking_issues,
             violated_constraints=constraint_violations,
             dcas_score=dcas_score,
         )
+
+        # 记录验证汇总
+        if self.run_logger is not None:
+            self.run_logger.log_validation_summary(section_id, attempt, report)
+
+        return report
 
     # ------------------------------------------------------------------
     # 第一层：格式检查

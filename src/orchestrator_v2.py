@@ -28,6 +28,7 @@ from .core.plan import PlanState, SectionIntent
 from .core.state import GenerationState
 from .evaluation.metric_collector import MetricCollector
 from .logging.correction_log import CorrectionLog
+from .logging.run_logger import RunLogger
 from .memory.commitment_extractor import CommitmentExtractor
 from .memory.discourse_ledger import DiscourseLedger
 from .memory.dtg_store import DTGStore
@@ -66,22 +67,27 @@ class SelfCorrectingOrchestrator:
         llm_client,
         memory_path: str = "./sessions",
         session_name: str = "session",
+        output_dir: str = "./outputs",
     ):
         """
         初始化自我修正协调器
 
         功能：
             创建并连接所有子组件，MetaState 初始化为信任状态。
+            创建 RunLogger 并传给 Generator 和 OnlineValidator。
 
         参数：
             llm_client: LLM 客户端实例
             memory_path: DTG 存储路径
             session_name: 会话名称
+            output_dir: 输出目录（RunLogger 日志文件存放位置）
         """
+        self.session_name     = session_name
         self.dtg              = DTGStore(memory_path, session_name=session_name)
         self.meta_state       = MetaState()
         self.dsl              = DiscourseLedger(llm_client=llm_client)
-        self.generator        = Generator(llm_client)
+        self.run_logger       = RunLogger(output_dir=output_dir, session_name=session_name)
+        self.generator        = Generator(llm_client, run_logger=self.run_logger)
         self.section_planner  = SectionPlanner(llm_client, self.dtg)
         self.commitment_extractor = CommitmentExtractor(llm_client)
         self.alignment_scorer = AlignmentScorer(llm_client)
@@ -90,6 +96,7 @@ class SelfCorrectingOrchestrator:
             dtg_store=self.dtg,
             alignment_scorer=self.alignment_scorer,
             meta_state=self.meta_state,
+            run_logger=self.run_logger,
         )
         self.mrsd = MRSD(dtg_store=self.dtg, llm_client=llm_client)
         self.correction_log   = CorrectionLog()
@@ -125,6 +132,9 @@ class SelfCorrectingOrchestrator:
         """
         self._print_header(task, outline)
 
+        # 记录运行开始
+        self.run_logger.log_run_start(task, constraints, outline)
+
         state = self._initialize_state(constraints, outline)
         plan_state = PlanState(global_outline=outline)
         generated_content: Dict[str, str] = {}
@@ -154,8 +164,22 @@ class SelfCorrectingOrchestrator:
             )
             plan_state.add_intent(section_intent)
 
-            # 准备 DSL 注入
-            self._update_dsl_injection(state, section_id, section_queue, current_idx)
+            # 记录节开始（规划前先取 DSL 活跃数）
+            dsl_active_count = len(self.dsl.get_active_entries())
+            self.run_logger.log_section_start(
+                section_id=section_id,
+                title=section_title,
+                idx=current_idx,
+                total=len(section_queue),
+                state=state,
+                dsl_active_count=dsl_active_count,
+            )
+            # 记录规划结果
+            self.run_logger.log_planning(section_id, section_intent)
+
+            # 准备 DSL 注入，并记录注入条目
+            injectable = self._update_dsl_injection(state, section_id, section_queue, current_idx)
+            self.run_logger.log_dsl_injection(section_id, injectable)
 
             rolled_back = False
             report = None
@@ -163,15 +187,20 @@ class SelfCorrectingOrchestrator:
             decision: Optional[Decision] = None
 
             for attempt in range(self.MAX_RETRIES_PER_SECTION):
+                temperature = self._get_temperature(consecutive_failures_this_section)
+
+                # 记录本次尝试开始
+                self.run_logger.log_attempt_start(section_id, attempt + 1, temperature)
+
                 # 第二阶段：生成
                 try:
-                    temperature = self._get_temperature(consecutive_failures_this_section)
                     content, decision = self.generator.generate_with_decision(
                         state=state,
                         task=task,
                         recent_content=self._get_recent_content(),
                         section_intent=section_intent,
                         temperature=temperature,
+                        orchestrator_attempt=attempt + 1,
                     )
                 except Exception as e:
                     self.logger.error("生成异常（section=%s attempt=%d）: %s", section_id, attempt + 1, e)
@@ -181,7 +210,9 @@ class SelfCorrectingOrchestrator:
 
                 # 第三阶段：验证
                 try:
-                    report = self.online_validator.validate_and_diagnose(decision, content, state)
+                    report = self.online_validator.validate_and_diagnose(
+                        decision, content, state, attempt=attempt + 1
+                    )
                     self.meta_state.update_validator_stability(report.dcas_score)
                 except Exception as e:
                     self.logger.error("验证异常（section=%s）: %s", section_id, e)
@@ -232,6 +263,9 @@ class SelfCorrectingOrchestrator:
                         recent_section_failure_tiers=[],
                     )
 
+                    # 记录诊断结果
+                    self.run_logger.log_diagnosis(section_id, attempt + 1, diagnosis)
+
                     # 记录诊断事件
                     diag_event_id = self.metric_collector.record_diagnosis(
                         section_id=section_id,
@@ -267,13 +301,27 @@ class SelfCorrectingOrchestrator:
                     # 执行修复
                     if diagnosis.repair_scope == "partial_rollback":
                         # 回退策略：需要 MetaState 门控
+                        rollback_allowed = self.meta_state.gate_action("allow_rollback")
+                        self.run_logger.log_meta_state_gate(
+                            section_id=section_id,
+                            action_name="allow_rollback",
+                            granted=rollback_allowed,
+                            reason=(
+                                f"remaining_budget={self.meta_state.remaining_rollback_budget}"
+                                f"  contamination={self.meta_state.contamination_risk_score:.2f}"
+                            ),
+                        )
                         if (
-                            not self.meta_state.gate_action("allow_rollback")
+                            not rollback_allowed
                             or rollback_count >= self.MAX_ROLLBACKS
                             or not diagnosis.should_rollback()
                         ):
                             self.logger.info("回退被门控或超限，降级为 local_rewrite")
                             self._update_dsl_injection_strengthen(state)
+                            self.run_logger.log_repair_action(
+                                section_id, attempt + 1, "local_rewrite（回退降级）",
+                                {"reason": "rollback_denied_or_exceeds_limit"}
+                            )
                             continue
 
                         target = diagnosis.target_section
@@ -307,12 +355,20 @@ class SelfCorrectingOrchestrator:
                                     - (section_queue.index(target) if target in section_queue else 0)
                                 ),
                             )
+                            self.run_logger.log_repair_action(
+                                section_id, attempt + 1, "partial_rollback",
+                                {"target_section": target, "rollback_count": rollback_count}
+                            )
                             consecutive_failures_this_section = 0
                             current_idx = section_queue.index(target)
                             rolled_back = True
                             break
                         else:
                             self.logger.warning("回退执行失败，降级为 local_rewrite")
+                            self.run_logger.log_repair_action(
+                                section_id, attempt + 1, "local_rewrite（回退失败降级）",
+                                {"target": target, "reason": "rollback_execution_failed"}
+                            )
                             continue
 
                     elif diagnosis.repair_scope == "memory_purge":
@@ -334,6 +390,10 @@ class SelfCorrectingOrchestrator:
                             triggered_by_confidence=diagnosis.confidence,
                             succeeded=last_purge_succeeded,
                             extra_llm_calls=0,
+                        )
+                        self.run_logger.log_repair_action(
+                            section_id, attempt + 1, "memory_purge",
+                            {"purged_count": len(purged), "succeeded": last_purge_succeeded}
                         )
                         continue
 
@@ -364,6 +424,14 @@ class SelfCorrectingOrchestrator:
                             succeeded=False,  # 后续验证后更新
                             extra_llm_calls=1,
                         )
+                        self.run_logger.log_repair_action(
+                            section_id, attempt + 1, "local_rewrite",
+                            {
+                                "strengthen_dsl_injection": diagnosis.decoding_config.strengthen_dsl_injection,
+                                "trigger_section_intent_revision": diagnosis.decoding_config.trigger_section_intent_revision,
+                                "next_temperature": f"{self._get_temperature(consecutive_failures_this_section):.2f}",
+                            }
+                        )
                         continue
 
             else:
@@ -390,9 +458,19 @@ class SelfCorrectingOrchestrator:
                     consecutive_failures_this_section = 0
                     current_idx += 1
 
+                    # 记录节降级
+                    self.run_logger.log_section_degraded(section_id, self.MAX_RETRIES_PER_SECTION)
+
         # 组装最终文本
         final_text = self._assemble_text(outline, generated_content)
         self._print_summary()
+
+        # 记录运行汇总，关闭日志
+        self.run_logger.log_run_summary(
+            correction_stats=self.correction_log.get_statistics(),
+            meta_state=self.meta_state,
+        )
+        self.run_logger.close()
 
         return final_text, self.dtg.decision_log, self.correction_log
 
@@ -484,7 +562,7 @@ class SelfCorrectingOrchestrator:
         section_id: str,
         section_queue: List[str],
         current_idx: int,
-    ) -> None:
+    ) -> List:
         """
         更新 GenerationState 的 DSL 注入文本
 
@@ -497,6 +575,9 @@ class SelfCorrectingOrchestrator:
             section_id: 当前节 ID
             section_queue: 全局节列表
             current_idx: 当前节序号（0-based）
+
+        返回值：
+            List：本次注入的 LedgerEntry 列表（供 run_logger 记录）
         """
         injectable = self.dsl.get_injectable_entries(
             target_section_idx=current_idx,
@@ -515,6 +596,7 @@ class SelfCorrectingOrchestrator:
             )
         else:
             state.dsl_injection = ""
+        return injectable
 
     def _update_dsl_injection_strengthen(self, state: GenerationState) -> None:
         """
@@ -574,14 +656,15 @@ class SelfCorrectingOrchestrator:
         self.correction_log.add_success(section_id, attempt + 1)
 
         # 提取承诺并写入 DSL
+        new_entries: List = []
         try:
-            entries = self.commitment_extractor.extract(
+            new_entries = self.commitment_extractor.extract(
                 section_content=content,
                 section_id=section_id,
                 decision_id=decision.decision_id,
                 existing_summary="; ".join(state.section_summaries.get(sid, "")[:100] for sid in state.generated_sections[-3:-1]),
             )
-            for entry in entries:
+            for entry in new_entries:
                 self.dsl.add_entry(entry)
         except Exception as e:
             self.logger.warning("承诺提取失败（跳过）：%s", e)
@@ -606,6 +689,16 @@ class SelfCorrectingOrchestrator:
             open_loop_count=len(self.dsl.get_open_loops()),
             closed_loop_count=0,
             memory_trust_level=self.meta_state.memory_trust_level,
+        )
+
+        # 记录节成功（含新增 DSL 条目）
+        self.run_logger.log_section_success(
+            section_id=section_id,
+            total_attempts=attempt + 1,
+            dcas=dcas,
+            new_entries=new_entries,
+            total_active_entries=len(active),
+            memory_trust=self.meta_state.memory_trust_level,
         )
 
         self._print_success(section_id, attempt + 1, dcas)
