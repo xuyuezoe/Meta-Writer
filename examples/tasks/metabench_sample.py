@@ -22,8 +22,8 @@ def get_task_config() -> Dict[str, object]:
         Dict[str, object]：包含 Meta-Writer 生成所需的任务、约束、大纲和会话名。
 
     关键实现细节：
-        当前固定接入 `s1` 样本，保证 example 接口可直接运行，后续可按相同模式扩展。
+        当前固定接入 `med_s001` 样本，保证医学 bench example 接口可直接运行。
     """
-    benchmark_task = build_benchmark_task_config("s1")
-    benchmark_task["session_name"] = "metabench_sample_s1"
+    benchmark_task = build_benchmark_task_config("med_s001")
+    benchmark_task["session_name"] = "metabench_sample_med_s001"
     return benchmark_task
