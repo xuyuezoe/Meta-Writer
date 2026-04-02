@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import math
+import re
 from dataclasses import asdict
 from typing import Dict, List, Optional, Tuple
 
@@ -23,10 +24,26 @@ def _clamp_zero_one(value: float) -> float:
 
 
 def _word_count(text: str) -> int:
-    """基于空白分词统计词数。"""
+    """统计中文长文本的长度单元。
 
-    words = [word for word in text.strip().split() if word != ""]
-    return len(words)
+    参数:
+        text: 待统计文本。
+
+    返回:
+        int：长度单元数量。
+
+    关键实现细节:
+        对中文连续文本按 CJK 字符计数，对英文/数字片段按单词计数，
+        使 benchmark 中“目标字数”与实际评分口径更一致。
+    """
+
+    stripped_text = text.strip()
+    if stripped_text == "":
+        return 0
+
+    cjk_count = len(re.findall(r"[\u4e00-\u9fff]", stripped_text))
+    latin_token_count = len(re.findall(r"[A-Za-z0-9]+(?:[-_/][A-Za-z0-9]+)*", stripped_text))
+    return cjk_count + latin_token_count
 
 
 def compute_s_stability(eval_metrics: EvalMetrics) -> float:
