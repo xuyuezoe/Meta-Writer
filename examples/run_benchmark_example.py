@@ -6,9 +6,9 @@
 
 用法：
     python -m examples.run_benchmark_example
-    python -m examples.run_benchmark_example --task-id s2
+    python -m examples.run_benchmark_example --task-id med_s010
     python -m examples.run_benchmark_example --all
-    python -m examples.run_benchmark_example --task-id s1 --save-text --print-response
+    python -m examples.run_benchmark_example --task-id med_s001 --save-text --print-response
 """
 
 from __future__ import annotations
@@ -16,7 +16,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, cast
 
 from .benchmark_template import (
     evaluate_output,
@@ -131,7 +131,10 @@ def _run_single(task_id: str) -> Dict[str, object]:
     benchmark_task = load_benchmark_task(task_id)
     output_row = _load_demo_output(task_id)
     response_text = str(output_row["response"])
-    evaluation_result = evaluate_output(response_text, benchmark_task["reference"])
+    reference_object = benchmark_task["reference"]
+    if not isinstance(reference_object, (str, dict)):
+        raise TypeError("benchmark_task.reference 必须是字符串或字典")
+    evaluation_result = evaluate_output(response_text, reference_object)
     return {
         "task_id": task_id,
         "task": benchmark_task["task"],
@@ -156,23 +159,43 @@ def _build_summary(results: List[Dict[str, object]]) -> Dict[str, object]:
     """
     compact_results: List[Dict[str, object]] = []
     for item in results:
-        evaluation = item["evaluation"]
+        evaluation_object = item["evaluation"]
+        if not isinstance(evaluation_object, dict):
+            raise TypeError("evaluation 必须是字典")
+        evaluation = cast(Dict[str, object], evaluation_object)
+        entity_consistency_score_object = evaluation["entity_consistency_score"]
+        logical_coherence_object = evaluation["logical_coherence"]
+        constraint_violation_rate_object = evaluation["constraint_violation_rate"]
+        if not isinstance(entity_consistency_score_object, (int, float)):
+            raise TypeError("entity_consistency_score 必须是数值")
+        if not isinstance(logical_coherence_object, (int, float)):
+            raise TypeError("logical_coherence 必须是数值")
+        if not isinstance(constraint_violation_rate_object, (int, float)):
+            raise TypeError("constraint_violation_rate 必须是数值")
+
+        entity_consistency_score = float(entity_consistency_score_object)
+        logical_coherence = float(logical_coherence_object)
+        constraint_violation_rate = float(constraint_violation_rate_object)
         composite_score = (
-            evaluation["entity_consistency_score"]
-            + evaluation["logical_coherence"]
-            + (1.0 - evaluation["constraint_violation_rate"])
+            entity_consistency_score + logical_coherence + (1.0 - constraint_violation_rate)
         ) / 3.0
         compact_results.append(
             {
                 "task_id": item["task_id"],
-                "cvr": evaluation["constraint_violation_rate"],
-                "ecs": evaluation["entity_consistency_score"],
-                "lc": evaluation["logical_coherence"],
+                "cvr": constraint_violation_rate,
+                "ecs": entity_consistency_score,
+                "lc": logical_coherence,
                 "score": round(composite_score, 4),
             }
         )
 
-    compact_results.sort(key=lambda item: (-item["score"], item["task_id"]))
+    def _sort_key(item: Dict[str, object]) -> tuple[float, str]:
+        score_object = item["score"]
+        if not isinstance(score_object, (int, float)):
+            raise TypeError("score 必须是数值")
+        return (-float(score_object), str(item["task_id"]))
+
+    compact_results.sort(key=_sort_key)
     return {
         "task_count": len(compact_results),
         "ranking": compact_results,
@@ -189,11 +212,11 @@ def _parse_args() -> argparse.Namespace:
         argparse.Namespace：命令行参数对象。
 
     关键实现细节：
-        `--all` 与 `--task-id` 二选一语义由调用约定保证，默认单样本运行 `s1`。
+        `--all` 与 `--task-id` 二选一语义由调用约定保证，默认单样本运行 `med_s001`。
     """
     parser = argparse.ArgumentParser(description="运行本地 benchmark example")
     parser.add_argument(
-        "--task-id", type=str, default="s1", help="指定 benchmark 样本 ID"
+        "--task-id", type=str, default="med_s001", help="指定 benchmark 样本 ID"
     )
     parser.add_argument(
         "--all", action="store_true", help="批量运行全部 benchmark 样本"
@@ -215,7 +238,7 @@ def main() -> None:
         无。
 
     关键实现细节：
-        默认运行 `s1`，支持指定样本 ID，也支持 `--all` 批量验证全部样本。
+        默认运行 `med_s001`，支持指定样本 ID，也支持 `--all` 批量验证全部样本。
     """
     args = _parse_args()
 
@@ -228,7 +251,7 @@ def main() -> None:
                 f"benchmark_example_{task_id}.json", single_result
             )
             if args.save_text:
-                _write_text_result(task_id, single_result["response"])
+                _write_text_result(task_id, str(single_result["response"]))
             print(f"[OK] {task_id} -> {result_path}")
 
         full_summary = {
@@ -253,7 +276,7 @@ def main() -> None:
     )
     text_path: Path | None = None
     if args.save_text:
-        text_path = _write_text_result(args.task_id, single_result["response"])
+        text_path = _write_text_result(args.task_id, str(single_result["response"]))
 
     print("=" * 60)
     print(f"Benchmark Example | task_id={args.task_id}")
