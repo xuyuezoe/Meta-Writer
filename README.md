@@ -36,12 +36,23 @@ cp .env.example .env
 
 ```bash
 python main.py
+python main.py --task-name argumentative_essay
+python main.py --task-id med_s010
+python main.py --all
 ```
 
-默认运行 `scifi_story` 任务。切换任务只需修改 `main.py` 第一行参数：
+默认运行 `metabench_med_s001`，也就是正式 benchmark 主链路中的一条样本。也可以继续修改 `main.py` 中的 `TASK_NAME` 作为默认任务：
 
 ```python
-TASK_NAME = "argumentative_essay"   # 改为其他任务名即可
+TASK_NAME = "metabench_med_s001"   # 改为其他任务名即可
+```
+
+更推荐直接用命令行切换：
+
+```bash
+python -m main --task-name scifi_story
+python -m main --task-id med_s010
+python -m main --all
 ```
 
 每次运行会自动清理 `sessions/` 和 `outputs/` 中的旧文件，确保结果干净可复现。
@@ -50,22 +61,24 @@ TASK_NAME = "argumentative_essay"   # 改为其他任务名即可
 
 | 文件 | 内容 |
 |---|---|
-| `outputs/demo_text.txt` | 生成的完整文本 |
-| `outputs/demo_correction_log.json` | 修正行为日志 + 统计数据 |
-| `outputs/demo_dtg.json` | 决策追溯图（可视化用） |
-| `sessions/demo_session.json` | 完整 session（决策链） |
+| `outputs/{session_name}_text.txt` | 生成的完整文本 |
+| `outputs/{session_name}_correction_log.json` | 修正行为日志 + 统计数据 |
+| `outputs/{session_name}_dtg.json` | 决策追溯图（可视化用） |
+| `outputs/{session_name}_summary.json` | 单次运行摘要 |
+| `outputs/{session_name}_benchmark_eval.json` | benchmark 任务的本地评估结果 |
+| `sessions/{session_name}.json` | 完整 session（决策链） |
 
 ### 5. 查看结果
 
 ```bash
 # 查看生成的文本
-cat outputs/demo_text.txt
+cat outputs/metabench_med_s001_text.txt
 
 # 查看修正日志（分析自我修正行为）
-cat outputs/demo_correction_log.json
+cat outputs/metabench_med_s001_correction_log.json
 
 # 查看决策日志（分析 DTG）
-cat sessions/demo_session.json
+cat sessions/metabench_med_s001.json
 ```
 
 ## 系统架构
@@ -95,7 +108,7 @@ SelfCorrectingOrchestrator（主循环）
 
 ```
 metawriter/
-├── main.py                 # 项目入口（修改 TASK_NAME 切换任务）
+├── main.py                 # 项目入口（支持普通任务 / 单 benchmark / 批量 benchmark）
 ├── src/
 │   ├── core/               # 核心数据结构（泛化）
 │   ├── agents/             # 生成器（泛化）
@@ -109,20 +122,32 @@ metawriter/
 │   ├── tasks/
 │   │   ├── scifi_story.py          # 任务：科幻短篇故事
 │   │   └── argumentative_essay.py  # 任务：议论文（大数据与隐私）
-│   └── benchmark_template.py       # Benchmark 接入模板（TODO）
+│   └── benchmark_template.py       # Benchmark 样本加载与本地评估
 ├── sessions/               # 动态生成（.gitignore）
 ├── outputs/                # 动态生成（.gitignore）
 ├── .env.example            # API 配置模板
 └── README.md
 ```
 
-`src/` 目录下所有模块保持泛化，接受任意任务输入。任务定义集中在 `examples/tasks/`，通过 `main.py` 中的 `TASK_NAME` 统一调度。
+`src/` 目录下所有模块保持泛化，接受任意任务输入。任务定义集中在 `examples/tasks/`，既可以通过 `main.py` 中的 `TASK_NAME` 设置默认任务，也可以通过 CLI 参数直接调度。
 
-## Benchmark（开发中）
+## Benchmark
 
-TODO：后续接入标准 benchmark。
+正式入口已经接入 `main.py`。benchmark 样本会走 MetaWriter 的真实生成主循环，生成完成后再调用本地 `evaluate_output` 做评估。
 
-预留接口：`examples/benchmark_template.py`，定义了 `load_benchmark_task` 和 `evaluate_output` 的接口规范。
+常用命令：
+
+```bash
+python main.py --task-id med_s010
+python main.py --all
+python -m main --task-id med_s010
+```
+
+说明：
+
+- benchmark 的正式入口只有 `main.py`。
+- 推荐使用 `python -m main --task-id ...` 或 `python -m main --all`。
+- 结果会写入 `outputs/{session_name}_summary.json` 和 `outputs/{session_name}_benchmark_eval.json`。
 
 ## 配置
 
@@ -138,7 +163,7 @@ BASE_URL=https://...           # API 端点，使用 OpenAI 官方可省略
 
 ## 实验数据
 
-运行后，从 `outputs/demo_correction_log.json` 可以提取：
+运行后，从 `outputs/{session_name}_correction_log.json` 可以提取：
 
 - 首次成功率 (First-Attempt Success Rate)
 - 平均尝试次数 (Average Attempts)

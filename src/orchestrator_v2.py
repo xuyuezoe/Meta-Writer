@@ -544,6 +544,7 @@ class SelfCorrectingOrchestrator:
             return SectionIntent.create(
                 section_id=section_id,
                 local_goal=f"完成 {section_title} 的内容生成",
+                scope_boundary="",
                 open_loops_to_advance=[],
                 commitments_to_maintain=[],
                 risks_to_avoid=[],
@@ -898,19 +899,19 @@ class SelfCorrectingOrchestrator:
         self, section_id: str, title: str, idx: int, total: int
     ) -> None:
         self.console.print(
-            f"\n[bold blue]▶ [{idx+1}/{total}] {section_id}[/bold blue] — {title}"
+            f"\n[bold blue][{idx+1}/{total}] {section_id}[/bold blue] - {title}"
         )
 
     def _print_success(self, section_id: str, attempt: int, dcas: float) -> None:
         attempt_str = f"(第 {attempt} 次)" if attempt > 1 else "(一次通过)"
         self.console.print(
-            f"  [green]✓ {section_id} 通过 {attempt_str} DCAS={dcas:.3f}[/green]"
+            f"  [green][OK] {section_id} 通过 {attempt_str} DCAS={dcas:.3f}[/green]"
         )
 
     def _print_failure(self, section_id: str, attempt: int, diagnosis, report) -> None:
         issues_str = " | ".join(i.description[:40] for i in report.issues[:3])
         self.console.print(
-            f"  [yellow]✗ {section_id} 第 {attempt} 次失败 → "
+            f"  [yellow][FAIL] {section_id} 第 {attempt} 次失败 -> "
             f"{diagnosis.repair_scope}({diagnosis.error_tier.value}/"
             f"{diagnosis.error_source.value})[/yellow]\n"
             f"    [dim]{issues_str}[/dim]"

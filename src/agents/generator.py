@@ -45,6 +45,7 @@ class Generator:
 
     MAX_RETRIES = 3
     RECENT_CONTENT_LIMIT = 500
+    GENERATION_MAX_TOKENS = 4096
 
     def __init__(self, llm_client, run_logger: Optional["RunLogger"] = None):
         """
@@ -115,7 +116,11 @@ class Generator:
                 self.run_logger.log_prompt(section_id, orchestrator_attempt, prompt)
 
             try:
-                response = self.llm.generate(prompt, temperature=actual_temp, max_tokens=2048)
+                response = self.llm.generate(
+                    prompt,
+                    temperature=actual_temp,
+                    max_tokens=self.GENERATION_MAX_TOKENS,
+                )
 
                 # 第二阶段：记录 LLM 原始响应
                 if self.run_logger is not None:
@@ -277,6 +282,17 @@ class Generator:
         pattern = rf"<{tag}>(.*?)</{tag}>"
         match = re.search(pattern, text, re.DOTALL)
         if not match:
+            if tag == "content":
+                opening_match = re.search(r"<content>", text, re.DOTALL)
+                if opening_match:
+                    trailing_content = text[opening_match.end() :].strip()
+                    if trailing_content:
+                        # 目的：
+                        #   某些长输出会在接近 token 上限时被服务端截断，常见症状是
+                        #   `<content>` 已经开始但结尾的 `</content>` 丢失。
+                        #   这里优先保住已经生成出来的正文，避免因为最后一个闭合标签
+                        #   缺失就整轮重试，拖慢全量 benchmark。
+                        return trailing_content
             raise ValueError(f"响应中缺少 <{tag}> 标签")
         return match.group(1)
 
