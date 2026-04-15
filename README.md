@@ -3,12 +3,12 @@ Self-Correcting Long-Form Generation via Decision Trace Graphs
 
 ## 核心特性
 
-MetaWriter 是一个长文本自我修正生成系统，核心创新在于引入 **决策追溯图（DTG）** 追踪生成过程中的所有决策依赖，并在验证失败时精准定位错误根源，执行有针对性的修正策略（重试、加强约束或回退）。
+MetaWriter 是一个长文本自我修正生成系统，核心创新在于引入 **决策追溯图（DTG）** 追踪生成过程中的决策依赖，并在验证失败时执行有针对性的修正策略。
 
-- **在线自我修正**：生成过程中实时验证，发现问题立即修正，无需后处理
-- **决策追溯图（DTG）**：记录每个生成决策的依赖关系，支持跨节点回溯错误根源
-- **智能修正策略**：根据问题类型自动选择 RETRY / STRENGTHEN_CONSTRAINT / ROLLBACK
-- **完整可溯源**：每个生成决策都有明确的 reasoning 和对历史内容的引用
+- **在线自我修正**：生成过程中实时验证，发现问题立即修正
+- **决策追溯图（DTG）**：记录每次生成决策及其依赖关系
+- **分层修复策略**：根据错误类型自动选择重试、加强约束或局部回退
+- **完整可追溯**：运行日志、修正日志、DTG 和 session 都会落盘
 
 ## 快速开始
 
@@ -25,7 +25,7 @@ cd metawriter
 pip install -r requirements.txt
 ```
 
-### 3. 配置 API Key
+### 3. 配置 API
 
 ```bash
 cp .env.example .env
@@ -34,137 +34,129 @@ cp .env.example .env
 
 ### 4. 运行
 
+普通任务：
+
 ```bash
-python main.py
+python main.py --task survey_paper
+python main.py --task argumentative_essay
+python -m main --task scifi_story
 ```
 
-默认运行 `scifi_story` 任务。切换任务只需修改 `main.py` 第一行参数：
+benchmark：
 
-```python
-TASK_NAME = "argumentative_essay"   # 改为其他任务名即可
+```bash
+python main.py --task-id med_s010
+python main.py --all
+python -m main --task-id med_s010
 ```
 
-每次运行会自动清理 `sessions/` 和 `outputs/` 中的旧文件，确保结果干净可复现。
-
-运行后生成以下输出文件：
-
-| 文件 | 内容 |
-|---|---|
-| `outputs/demo_text.txt` | 生成的完整文本 |
-| `outputs/demo_correction_log.json` | 修正行为日志 + 统计数据 |
-| `outputs/demo_dtg.json` | 决策追溯图（可视化用） |
-| `sessions/demo_session.json` | 完整 session（决策链） |
+默认情况下，`python main.py` / `python -m main` 会运行 `metabench_med_s001`，也就是正式 benchmark 主链路中的一个样本，方便直接做真实链路烟雾验证。
 
 ### 5. 查看结果
 
-```bash
-# 查看生成的文本
-cat outputs/demo_text.txt
+每次运行会自动清理对应 `session_name` 下的旧输出，避免历史结果混入当前实验。
 
-# 查看修正日志（分析自我修正行为）
-cat outputs/demo_correction_log.json
+常见产物如下：
 
-# 查看决策日志（分析 DTG）
-cat sessions/demo_session.json
-```
+| 文件 | 内容 |
+|---|---|
+| `outputs/{session_name}_text.txt` | 生成的完整文本 |
+| `outputs/{session_name}_correction_log.json` | 修正行为日志 |
+| `outputs/{session_name}_dtg.json` | 决策追溯图 |
+| `outputs/{session_name}_summary.json` | 单次运行摘要 |
+| `outputs/{session_name}_benchmark_eval.json` | benchmark 评估结果 |
+| `outputs/{session_name}_run.log` | 完整运行日志 |
+| `sessions/{session_name}.json` | 完整 session |
 
-## 系统架构
+## Benchmark
 
-```
-SelfCorrectingOrchestrator（主循环）
-    ↓
-┌───────────┬───────────┬───────────┬───────────┐
-│ Generator │ DTGStore  │ Validator │ Debugger  │
-│  (生成)   │  (决策图) │  (验证)   │  (定位)   │
-└───────────┴───────────┴───────────┴───────────┘
-```
+benchmark 的正式入口已经接入 `main.py`，不再依赖单独的 demo 脚本。
 
-主循环逐节生成，每节通过四层验证（格式 → 约束 → 对齐度 → 一致性），验证失败时根据诊断结果执行修正策略。
+设计上分两层：
 
-## 修正策略说明
+- `examples/benchmark_template.py`：负责加载本地 benchmark 样本，并提供本地评估函数
+- `main.py`：负责把 benchmark 样本接进 MetaWriter 的真实生成主循环
 
-| 问题类型 | 触发条件 | 修正策略 |
-|---|---|---|
-| 对齐度极低 | DCAS < 0.5 | RETRY_SIMPLE |
-| 约束违反（历史根源） | violations + suspected_source | ROLLBACK |
-| 约束违反（当前问题） | violations only | STRENGTHEN_CONSTRAINT |
-| 一致性问题（历史根源） | consistency + suspected_source | ROLLBACK |
-| 其他 | — | RETRY_WITH_STRONGER_PROMPT |
+运行 `--task-id` 或 `--all` 时，流程会：
+
+1. 从本地 `metabench/examples/samples.jsonl` 加载样本
+2. 通过 `TASK_REGISTRY` 动态注册为正式任务
+3. 走 MetaWriter 的真实生成、验证、修正主循环
+4. 对真实生成结果调用 `evaluate_output()` 做本地评估
 
 ## 项目结构
 
-```
+```text
 metawriter/
-├── main.py                 # 项目入口（修改 TASK_NAME 切换任务）
-├── src/
-│   ├── core/               # 核心数据结构（泛化）
-│   ├── agents/             # 生成器（泛化）
-│   ├── memory/             # DTG存储模块（泛化）
-│   ├── algorithms/         # 调试器（泛化）
-│   ├── metrics/            # 评分器（泛化）
-│   ├── validators/         # 验证器（泛化）
-│   ├── logging/            # 日志（泛化）
-│   └── orchestrator_v2.py  # 协调器（泛化）
+├── main.py
 ├── examples/
-│   ├── tasks/
-│   │   ├── scifi_story.py          # 任务：科幻短篇故事
-│   │   ├── argumentative_essay.py  # 任务：议论文（大数据与隐私）
-│   │   └── survey_paper.py         # 任务：综述论文（LLM 与软件工程）
-├── sessions/               # 动态生成（.gitignore）
-├── outputs/                # 动态生成（.gitignore）
-├── .env.example            # API 配置模板
+│   ├── benchmark_template.py
+│   └── tasks/
+│       ├── argumentative_essay.py
+│       ├── metabench_sample.py
+│       ├── scifi_story.py
+│       └── survey_paper.py
+├── metabench/
+│   ├── examples/
+│   └── src/metabench/
+├── src/
+│   ├── agents/
+│   ├── algorithms/
+│   ├── core/
+│   ├── evaluation/
+│   ├── logging/
+│   ├── memory/
+│   ├── metrics/
+│   ├── utils/
+│   ├── validators/
+│   └── orchestrator_v2.py
+├── outputs/
+├── sessions/
 └── README.md
 ```
 
-`src/` 目录下所有模块保持泛化，接受任意任务输入。任务定义集中在 `examples/tasks/`，可通过 `python main.py --task <task_name>` 或环境变量 `TASK_NAME` 统一调度。
+## 配置说明
 
-## 配置
-
-在 `.env` 文件中配置：
+在 `.env` 中配置：
 
 ```bash
 API_KEY=your_api_key_here
-MODEL=your-model-name          # 如 gpt-4o、deepseek-chat、MiniMax-M2.5
-BASE_URL=https://...           # API 端点，使用 OpenAI 官方可省略
+MODEL=your-model-name
+BASE_URL=https://...
 ```
 
-系统兼容所有遵循 OpenAI Chat Completions API 格式的服务（OpenAI、DeepSeek、MiniMax、智谱、本地 vLLM/Ollama 等），切换模型只需修改 `.env`，无需改动任何代码。
+系统默认优先兼容 OpenAI Chat Completions，也支持通过同一个 `BASE_URL` 自动探测兼容 Anthropic Messages 的网关。
 
-## 实验数据
+如果需要核对请求是否真的打到了服务端，可以查看：
 
-运行后，从 `outputs/demo_correction_log.json` 可以提取：
+```text
+outputs/llm_api_trace.jsonl
+```
 
-- 首次成功率 (First-Attempt Success Rate)
-- 平均尝试次数 (Average Attempts)
-- 回退频率和距离 (Rollback Frequency & Distance)
-- 策略使用分布 (Strategy Distribution)
+这个 trace 会记录每次请求的时间、协议、endpoint 和状态。
 
 ## 故障排查
 
-**Q: 生成失败，报"API key 错误"**
-A: 检查 `.env` 文件中的 `API_KEY` 是否正确设置。
+**Q: 报错说没有 API_KEY**
 
-**Q: 重试次数过多**
-A: 可能 constraints 不够明确，或 LLM 理解偏差。检查约束描述是否清晰具体。
+A: 检查 `.env` 中是否正确设置了 `API_KEY`。
 
-**Q: 回退导致无限循环**
-A: 系统设有最大回退次数限制（`MAX_ROLLBACKS=5`），超过后自动改为重试。3次重试失败后降级继续。
+**Q: benchmark 跑的是不是 demo 结果而不是真实生成？**
+
+A: 不是。`main.py --task-id ...` / `main.py --all` 会走 MetaWriter 的真实生成主循环，评估也基于真实生成文本而不是预存输出。
+
+**Q: 如何确认请求是否真的发出？**
+
+A: 除了服务端面板，还可以直接检查 `outputs/llm_api_trace.jsonl` 与 `outputs/{session_name}_run.log`。
 
 ## 共创原则
 
-为了共建更好的协作共创环境，要求各位共创作者遵循以下原则：
-
-- 禁止直接提交到 main
+- 禁止直接提交到 `main`
 - 每个任务创建独立分支
 - 分支命名：类型/简短描述
 - 使用中文描述
-- 代码撰写勤写注释，方便其他贡献者快速理解
-- 一次提交要求至少完成一份完整功能
-- 尽量做到每次提交的内容小而完整
-- 描述清晰具体
-- pr要求描述：改动内容，测试情况，相关问题（如果有）
-
-记住：提交前检查，合并前测试，有疑问先沟通
+- 注释除了说明功能，也尽量说明设计目的
+- 提交前先自测，合并前先沟通
 
 ## 许可
 
