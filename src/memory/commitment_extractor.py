@@ -84,7 +84,7 @@ class CommitmentExtractor:
                 SOFT      → 0.6（风格偏好或非核心细节，较低初始可信度）
         """
         prompt = self._build_prompt(section_content, existing_summary)
-        raw = self._llm_client.generate(prompt, temperature=0.0, max_tokens=1024)
+        raw = self._llm_client.generate(prompt, temperature=0.0, max_tokens=32768)
         items = self._parse_output(raw)
 
         entries: List[LedgerEntry] = []

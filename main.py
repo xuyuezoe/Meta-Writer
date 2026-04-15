@@ -1,27 +1,25 @@
 """
-MetaWriter v4.0 — 项目入口
+MetaWriter — 项目入口
 
 用法：
-    python main.py
+    python main.py --task survey_paper
 
 切换任务：
-    修改下方 TASK_NAME 变量，然后直接运行即可。
+    通过 --task/-t 指定任务名，或设置环境变量 TASK_NAME。
 
 可用任务：
     "scifi_story"         科幻短篇故事（创意写作）
     "argumentative_essay" 议论文——大数据时代的个人隐私保护（非虚构写作）
+    "survey_paper"        学术领域综述（外部调研）
 """
+import argparse
 import os
 import sys
 import json
 import traceback
 from pathlib import Path
 
-# ================================================================
-# 修改此处选择运行的任务
-# ================================================================
-TASK_NAME = "scifi_story"
-# ================================================================
+DEFAULT_TASK = "survey_paper"
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -30,6 +28,18 @@ from dotenv import load_dotenv
 from src.orchestrator_v2 import SelfCorrectingOrchestrator
 from src.utils.llm_client import LLMClient
 from examples.tasks import TASK_REGISTRY
+
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="MetaWriter 任务运行器")
+    parser.add_argument(
+        "-t",
+        "--task",
+        choices=sorted(TASK_REGISTRY.keys()),
+        default=os.getenv("TASK_NAME", DEFAULT_TASK),
+        help="要执行的任务名，默认读取环境变量 TASK_NAME 或使用 survey_paper",
+    )
+    return parser.parse_args()
 
 
 def main() -> None:
@@ -42,9 +52,12 @@ def main() -> None:
         第三阶段：生成（带自我修正的主循环）
         第四阶段：结果保存与统计输出
     """
+    args = _parse_args()
+    task_name = args.task
+
     # ── 第一阶段：环境准备 ─────────────────────────────────────
-    if TASK_NAME not in TASK_REGISTRY:
-        print(f"错误：未知任务 '{TASK_NAME}'")
+    if task_name not in TASK_REGISTRY:
+        print(f"错误：未知任务 '{task_name}'")
         print(f"可用任务：{list(TASK_REGISTRY.keys())}")
         return
 
@@ -54,11 +67,11 @@ def main() -> None:
         print("错误：请在 .env 文件中设置 API_KEY")
         return
 
-    model    = os.getenv("MODEL", "MiniMax-M2.5")
+    model    = os.getenv("MODEL")
     base_url = os.getenv("BASE_URL")
 
     # ── 第二阶段：任务加载 ─────────────────────────────────────
-    config       = TASK_REGISTRY[TASK_NAME]()
+    config       = TASK_REGISTRY[task_name]()
     task         = config["task"]
     constraints  = config["constraints"]
     outline      = config["outline"]
@@ -71,7 +84,7 @@ def main() -> None:
         old_file.unlink()
 
     print("=" * 60)
-    print(f"MetaWriter  |  任务：{TASK_NAME}")
+    print(f"MetaWriter  |  任务：{task_name}")
     print("=" * 60)
     print(f"\n任务描述：{task}")
     print(f"约束数量：{len(constraints)}")
@@ -85,10 +98,7 @@ def main() -> None:
     # ── 第三阶段：生成 ─────────────────────────────────────────
     client       = LLMClient(api_key=api_key, model=model, base_url=base_url)
     orchestrator = SelfCorrectingOrchestrator(
-        client,
-        memory_path="./sessions",
-        session_name=session_name,
-        output_dir=str(output_dir),
+        client, memory_path="./sessions", session_name=session_name
     )
 
     try:

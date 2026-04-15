@@ -108,21 +108,15 @@ metawriter/
 ├── examples/
 │   ├── tasks/
 │   │   ├── scifi_story.py          # 任务：科幻短篇故事
-│   │   └── argumentative_essay.py  # 任务：议论文（大数据与隐私）
-│   └── benchmark_template.py       # Benchmark 接入模板（TODO）
+│   │   ├── argumentative_essay.py  # 任务：议论文（大数据与隐私）
+│   │   └── survey_paper.py         # 任务：综述论文（LLM 与软件工程）
 ├── sessions/               # 动态生成（.gitignore）
 ├── outputs/                # 动态生成（.gitignore）
 ├── .env.example            # API 配置模板
 └── README.md
 ```
 
-`src/` 目录下所有模块保持泛化，接受任意任务输入。任务定义集中在 `examples/tasks/`，通过 `main.py` 中的 `TASK_NAME` 统一调度。
-
-## Benchmark（开发中）
-
-TODO：后续接入标准 benchmark。
-
-预留接口：`examples/benchmark_template.py`，定义了 `load_benchmark_task` 和 `evaluate_output` 的接口规范。
+`src/` 目录下所有模块保持泛化，接受任意任务输入。任务定义集中在 `examples/tasks/`，可通过 `python main.py --task <task_name>` 或环境变量 `TASK_NAME` 统一调度。
 
 ## 配置
 

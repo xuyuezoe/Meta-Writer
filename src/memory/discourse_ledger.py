@@ -237,7 +237,7 @@ class DiscourseLedger:
         )
 
         try:
-            raw = self._llm_client.generate(prompt, temperature=0.0, max_tokens=64)
+            raw = self._llm_client.generate(prompt, temperature=0.0, max_tokens=32768)
             parsed = self._parse_relation_json(raw)
             if not parsed:
                 return

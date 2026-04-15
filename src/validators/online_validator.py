@@ -16,6 +16,7 @@
 """
 from __future__ import annotations
 
+import json
 import logging
 import re
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
@@ -148,8 +149,13 @@ class OnlineValidator:
 
         # 第二层：约束检查
         constraint_passed = True
+        constraint_unknowns: List[str] = []
         try:
-            constraint_violations = self._check_constraints(content, state.global_constraints)
+            constraint_violations, constraint_unknowns = self._check_constraints(
+                content,
+                state.global_constraints,
+                section_id,
+            )
             for v in constraint_violations:
                 issues.append(Issue(
                     type="constraint",
@@ -160,14 +166,30 @@ class OnlineValidator:
             constraint_passed = not bool(constraint_violations)
             total_c = len(state.global_constraints)
             passed_c = total_c - len(constraint_violations)
-            constraint_details = f"{passed_c}/{total_c} 条通过"
-            self.logger.debug("约束检查完成，违反 %d 条", len(constraint_violations))
+            detail_parts = [f"{passed_c}/{total_c} 条通过"]
+            if constraint_unknowns:
+                detail_parts.append(f"未知 {len(constraint_unknowns)} 条")
+            constraint_details = "，".join(detail_parts)
+            self.logger.debug("约束检查完成，违反 %d 条，未知 %d 条", len(constraint_violations), len(constraint_unknowns))
         except Exception as e:
+            constraint_details = f"validator_exception: {e}"
             self.logger.warning("约束检查异常（跳过）：%s", e)
-            constraint_details = f"异常跳过：{e}"
+            constraint_unknowns = list(state.global_constraints)
         if self.run_logger is not None:
             self.run_logger.log_validation_result(
                 section_id, attempt, "约束检查", constraint_passed, constraint_details
+            )
+            if constraint_unknowns:
+                self.run_logger.log_validation_note(
+                    section_id,
+                    attempt,
+                    f"constraint_unknown={len(constraint_unknowns)}"
+                )
+        if constraint_unknowns:
+            self.logger.warning(
+                "constraint_unknown: %d 条（section=%s）",
+                len(constraint_unknowns),
+                section_id,
             )
 
         # 第三层：对齐度检查（DCAS）
@@ -310,7 +332,12 @@ class OnlineValidator:
     # 第二层：约束检查
     # ------------------------------------------------------------------
 
-    def _check_constraints(self, content: str, constraints: List[str]) -> List[str]:
+    def _check_constraints(
+        self,
+        content: str,
+        constraints: List[str],
+        section_id: Optional[str],
+    ) -> Tuple[List[str], List[str]]:
         """
         约束检查（四阶段规则 + LLM 兜底）
 
@@ -322,15 +349,39 @@ class OnlineValidator:
             List[str]：违反的约束列表
         """
         violations: List[str] = []
+        unknown: List[str] = []
         for constraint in constraints:
             try:
-                if not self._check_constraint_satisfaction(constraint, content):
+                result, reason = self._check_constraint_satisfaction(
+                    constraint,
+                    content,
+                    section_id,
+                )
+                if result is False:
                     violations.append(constraint)
+                elif result is None:
+                    unknown.append(constraint)
+                    if reason:
+                        self.logger.warning(
+                            "constraint_unknown[%s]: %s",
+                            reason,
+                            constraint[:80],
+                        )
             except Exception as e:
-                self.logger.warning("约束 '%s' 检查失败（视为通过）：%s", constraint[:30], e)
-        return violations
+                unknown.append(constraint)
+                self.logger.warning(
+                    "validator_exception: constraint=%s error=%s",
+                    constraint[:80],
+                    e,
+                )
+        return violations, unknown
 
-    def _check_constraint_satisfaction(self, constraint: str, content: str) -> bool:
+    def _check_constraint_satisfaction(
+        self,
+        constraint: str,
+        content: str,
+        section_id: Optional[str],
+    ) -> Tuple[Optional[bool], Optional[str]]:
         """
         检查单个约束是否满足
 
@@ -338,46 +389,81 @@ class OnlineValidator:
             规则1 — 字数/篇幅类约束：整篇目标，单节直接通过
             规则2 — 情节/事件类约束：全文要求，单节直接通过
             规则3 — 实体/属性类约束：在内容中找到关键实体即通过
-            规则4 — LLM 兜底：仅对无法规则判断的约束使用，失败默认通过
+            规则4 — LLM 兜底：无法判断时返回 UNKNOWN（不再视为通过）
 
         参数：
             constraint: 约束文本
             content: 生成内容
 
         返回值：
-            bool：True 表示满足约束（或无法判断，保守放行）
+            Tuple[Optional[bool], Optional[str]]：
+                - True/False 表示明确满足/违反
+                - None 表示 UNKNOWN，并返回原因关键词
         """
         c_lower = constraint.lower()
         content_lower = content.lower()
 
         # 规则1：字数/篇幅类 → 整篇目标，单节直接通过
         if re.search(r'\d+\s*[字词]|字数|篇幅|字以内|字左右|字以上', constraint):
-            return True
+            return True, None
 
         # 规则2：情节/事件类 → 故事整体要求，单节不强制
         if re.search(r'包含|必须包含|需要包含|出现|发生|有一个|存在|结局|结尾|必须有|要有', c_lower):
-            return True
+            return True, None
 
         # 规则3：实体/属性类 → 提取关键实体，在内容中命中即通过
         entities = self._extract_key_entities(constraint)
         if entities and any(e in content_lower for e in entities):
-            return True
+            return True, None
 
-        # 规则4：LLM 兜底（失败默认通过）
+        # 规则4：LLM 兜底（无法判断也需显式返回 UNKNOWN）
         prompt = (
-            "判断章节内容是否与约束直接矛盾。\n"
-            "只有存在明确矛盾时输出 false，否则一律输出 true。\n\n"
+            "判断章节内容是否直接违反下列约束。只回答 true 或 false，"
+            "true=满足，false=违反，不要解释，也不要添加其他文字。\n\n"
             f"约束：{constraint}\n"
-            f"内容：{content[:400]}\n\n"
-            "仅输出 <satisfied>true</satisfied> 或 <satisfied>false</satisfied>，不要其他内容。"
+            f"内容：{content[:400]}\n"
         )
         try:
-            response = self.llm.generate(prompt, temperature=0.1, max_tokens=64)
-            raw = self._extract_tag(response, "satisfied").lower()
-            return raw != "false"
+            response = self.llm.generate(
+                prompt,
+                temperature=0.1,
+                max_tokens=32768,
+                strip_think=False,
+                allow_think_only_fallback=False,
+                log_meta={
+                    "component": "Validator.constraint",
+                    "section_id": section_id,
+                    "constraint": constraint[:80],
+                },
+            )
+            stripped = response.strip()
+            if not stripped:
+                return None, "llm_empty_visible_output"
+
+            visible = re.sub(r"<think>.*?</think>", "", stripped, flags=re.DOTALL).strip()
+            candidates = [text for text in (visible, stripped) if text]
+
+            for text in candidates:
+                lowered = text.strip().lower()
+                if lowered in {"true", "false"}:
+                    return (lowered == "true"), None
+
+                payload = self._extract_json_object(text)
+                if payload:
+                    data = self._safe_load_json(payload)
+                    if isinstance(data, bool):
+                        return data, None
+                    if isinstance(data, dict):
+                        satisfied = data.get("satisfied")
+                        if isinstance(satisfied, bool):
+                            return satisfied, None
+
+            if "<think>" in stripped.lower() and not visible:
+                return None, "llm_think_only"
+            return None, "protocol_parse_failure"
         except Exception as e:
-            self.logger.warning("LLM 约束验证失败，默认通过：%s", e)
-            return True
+            self.logger.warning("validator_exception: constraint=%s error=%s", constraint[:80], e)
+            return None, "validator_exception"
 
     def _extract_key_entities(self, constraint: str) -> List[str]:
         """
@@ -398,6 +484,82 @@ class OnlineValidator:
         entities = [t.lower() for t in tokens if len(t) >= 2]
         extra = [e[:2] for e in entities if len(e) >= 4]
         return entities + extra
+
+    def _extract_json_object(self, text: str) -> Optional[str]:
+        """提取首个 JSON 对象文本，失败返回 None"""
+        if not text:
+            return None
+        stripped = text.strip()
+        try:
+            json.loads(stripped)
+            return stripped
+        except Exception:
+            pass
+
+        start = stripped.find("{")
+        if start == -1:
+            return None
+        depth = 0
+        for idx in range(start, len(stripped)):
+            ch = stripped[idx]
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    return stripped[start:idx + 1]
+        return None
+
+    def _safe_load_json(self, payload: str):
+        """安全加载 JSON，失败返回 None"""
+        try:
+            return json.loads(payload)
+        except json.JSONDecodeError:
+            return None
+
+    def _parse_consistency_flags(self, response: str, keys: List[str]) -> Dict[str, Optional[bool]]:
+        """解析一致性判断，返回每个维度的布尔值或 None"""
+        result: Dict[str, Optional[bool]] = {k: None for k in keys}
+        if not response:
+            return result
+
+        payload = self._extract_json_object(response)
+        if payload:
+            data = self._safe_load_json(payload)
+            if isinstance(data, dict):
+                for key in keys:
+                    result[key] = self._interpret_bool(data.get(key))
+                return result
+
+        lowered = response.lower()
+        for key in keys:
+            idx = lowered.find(key.lower())
+            if idx == -1:
+                continue
+            window = lowered[idx: idx + 80]
+            result[key] = self._keyword_to_bool(window)
+        return result
+
+    def _interpret_bool(self, value: Optional[object]) -> Optional[bool]:
+        """宽松解析多种布尔表达"""
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            lowered = value.strip().lower()
+            if lowered in {"true", "是", "通过", "一致", "有"}:
+                return True
+            if lowered in {"false", "否", "矛盾", "冲突", "重复"}:
+                return False
+        return None
+
+    def _keyword_to_bool(self, text: str) -> Optional[bool]:
+        """根据局部关键词推断布尔值"""
+        lowered = text.lower()
+        if "false" in lowered or "矛盾" in lowered or "冲突" in lowered or "重复" in lowered:
+            return False
+        if "true" in lowered or "一致" in lowered or "连贯" in lowered or "通过" in lowered:
+            return True
+        return None
 
     # ------------------------------------------------------------------
     # 第四层：一致性检查
@@ -445,43 +607,41 @@ class OnlineValidator:
 
         context_hint = "\n".join(prev_snippets)
         prompt = (
-            "检查新生成内容与已有章节是否存在明确矛盾或叙事重复。\n\n"
+            "检查新内容与已有章节是否存在明确矛盾或叙事重复。"
+            "使用 JSON 回复，例如 {\"entity_consistency\": true, ...}，"
+            "字段分别为 entity_consistency / timeline_consistency / setting_consistency / narrative_progress。"
+            "true=通过，false=存在问题，不要输出 markdown 代码块或额外文本。\n\n"
             f"已有章节片段：\n{context_hint}\n\n"
-            f"新生成内容：{content[:500]}\n\n"
-            "对以下四个维度，只有存在明确问题时才输出 false，否则输出 true。\n\n"
-            "<entity_consistency>true 或 false：实体属性（人物/地点/数字）是否前后一致</entity_consistency>\n"
-            "<timeline_consistency>true 或 false：事件时间线是否连贯合理</timeline_consistency>\n"
-            "<setting_consistency>true 或 false：世界设定与规则是否前后一致</setting_consistency>\n"
-            "<narrative_progress>true 或 false：新内容是否推进了叙事，"
-            "而非重复已有章节的核心情节动作（如果新内容在做和前文相同的核心动作则为 false）</narrative_progress>"
+            f"新生成内容：{content[:500]}"
         )
-
-        _POSITIVE = {"true", "一致", "连贯", "通过", "正确", "无矛盾", "没有矛盾", "没有冲突", "推进"}
-        _NEGATIVE = {"false", "矛盾", "冲突", "不连贯", "不一致", "有问题", "有矛盾", "有冲突", "重复"}
 
         issues: List[Issue] = []
         try:
-            response = self.llm.generate(prompt, temperature=0.1, max_tokens=512)
+            response = self.llm.generate(
+                prompt,
+                temperature=0.1,
+                max_tokens=32768,
+                strip_think=True,
+                allow_think_only_fallback=False,
+                log_meta={
+                    "component": "Validator.consistency",
+                    "section_id": state.current_section,
+                },
+            )
             checks = {
                 "entity_consistency":   ("实体属性矛盾",   IssueSeverity.MINOR.value),
                 "timeline_consistency": ("时间线不连贯",   IssueSeverity.MINOR.value),
                 "setting_consistency":  ("设定前后冲突",   IssueSeverity.MINOR.value),
-                # MINOR 级别：LLM 对"叙事重复"的判断错误率较高，不适合作为强制重写依据；
-                # 结果仍记入报告，供统计分析使用。
                 "narrative_progress":   ("叙事重复已有章节", IssueSeverity.MINOR.value),
             }
+            flags = self._parse_consistency_flags(response, list(checks.keys()))
             for tag, (label, severity) in checks.items():
-                raw = self._extract_tag(response, tag).strip().lower()
-                if not raw:
-                    continue
-                if any(p in raw for p in _POSITIVE):
-                    continue
-                if any(n in raw for n in _NEGATIVE):
-                    detail = raw.replace("false", "").strip(" —-：:[]")[:80]
+                value = flags.get(tag)
+                if value is False:
                     issues.append(Issue(
                         type="consistency",
                         severity=severity,
-                        description=f"{label}：{detail}" if detail else label,
+                        description=label,
                         location=state.current_section,
                     ))
         except Exception as e:
@@ -524,18 +684,3 @@ class OnlineValidator:
     # ------------------------------------------------------------------
     # 工具方法
     # ------------------------------------------------------------------
-
-    def _extract_tag(self, text: str, tag: str) -> str:
-        """
-        提取 XML 标签内容
-
-        参数：
-            text: 原始文本
-            tag: 标签名
-
-        返回值：
-            str：标签内容，标签不存在时返回空字符串
-        """
-        pattern = rf"<{tag}>(.*?)</{tag}>"
-        match = re.search(pattern, text, re.DOTALL)
-        return match.group(1).strip() if match else ""

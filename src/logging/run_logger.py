@@ -20,7 +20,8 @@ from __future__ import annotations
 
 import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, List
+import json
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 if TYPE_CHECKING:
     from ..core.decision import Decision
@@ -280,17 +281,23 @@ class RunLogger:
         self._write(f"  DSL 总活跃条目：{total_active_entries}  信任度：{memory_trust:.3f}")
         self._write("")
 
-    def log_section_degraded(self, section_id: str, total_attempts: int) -> None:
+    def log_section_degraded(self, section_id: str, total_attempts: int, reason: str) -> None:
         """
         记录节降级（超过最大重试次数，以最后一次内容继续）
 
         参数：
             section_id: 节 ID
             total_attempts: 本节总尝试次数
+            reason: 降级原因
         """
         self._write(
-            f"[DEGRADED] ✗  节 {section_id} 超过最大重试次数（{total_attempts} 次），以降级内容继续"
+            f"[DEGRADED] ✗  节 {section_id} 超过最大重试次数（{total_attempts} 次），以降级内容继续  原因：{reason}"
         )
+        self._write("")
+
+    def log_postprocess_skipped(self, section_id: str, reason: str) -> None:
+        """记录成功节跳过 postprocess 的原因。"""
+        self._write(f"[POSTPROCESS] 节 {section_id} 跳过后处理，原因：{reason}")
         self._write("")
 
     # ------------------------------------------------------------------
@@ -352,6 +359,36 @@ class RunLogger:
         for line in raw_text.split("\n"):
             self._write("  " + line)
         self._write("[/LLM 原始响应]")
+        self._write("")
+
+    def log_llm_call(
+        self,
+        component: str,
+        section_id: Optional[str],
+        attempt: Optional[int],
+        prompt_text: str,
+        response_text: str,
+        extra: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """记录一次 LLM 调用的 prompt 与响应"""
+        section_label = section_id if section_id is not None else "-"
+        attempt_label = attempt if attempt is not None else "-"
+        self._write(f"[LLM CALL] component={component} section={section_label} attempt={attempt_label}")
+        if extra:
+            try:
+                meta = json.dumps(extra, ensure_ascii=False)
+            except Exception:
+                meta = str(extra)
+            self._write(f"  meta: {meta}")
+        self._write("  [PROMPT]")
+        for line in prompt_text.split("\n"):
+            self._write("    " + line)
+        self._write("  [/PROMPT]")
+        self._write("  [RESPONSE]")
+        for line in response_text.split("\n"):
+            self._write("    " + line)
+        self._write("  [/RESPONSE]")
+        self._write("[/LLM CALL]")
         self._write("")
 
     def log_parsed_decision(
@@ -418,6 +455,15 @@ class RunLogger:
         """
         status = "PASS" if passed else "FAIL"
         self._write(f"  {layer:<16}: {status}  {details}")
+
+    def log_validation_note(
+        self,
+        section_id: str,
+        attempt: int,
+        note: str,
+    ) -> None:
+        """记录验证过程中的附加说明"""
+        self._write(f"    · {note}")
 
     def log_validation_summary(
         self,

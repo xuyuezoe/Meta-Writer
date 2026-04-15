@@ -14,7 +14,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from rich.console import Console
 from rich.panel import Panel
@@ -42,9 +42,8 @@ class SelfCorrectingOrchestrator:
 
     功能：
         1. 主循环：逐节规划 → DSL 注入 → 生成 → 验证 → MRSD 诊断 → 三层修复
-        2. MetaState 元认知门控：gate_action() 控制 trust_validator_major /
-           allow_rollback / strengthen_dsl_injection 三类动作
-        3. DiscourseLedger 动态约束管理：salience 驱动的条目注入
+        2. MetaState 元认知门控：gate_action() 控制 trust_validator_major / allow_rollback / strengthen_dsl_injection 三类动作
+        3. DiscourseLedger 动态约束管理：salience 显著性驱动的条目注入
         4. MetricCollector 指标收集：不改变系统行为，仅记录
 
     参数：
@@ -67,26 +66,27 @@ class SelfCorrectingOrchestrator:
         llm_client,
         memory_path: str = "./sessions",
         session_name: str = "session",
-        output_dir: str = "./outputs",
     ):
         """
         初始化自我修正协调器
 
         功能：
             创建并连接所有子组件，MetaState 初始化为信任状态。
-            创建 RunLogger 并传给 Generator 和 OnlineValidator。
 
         参数：
             llm_client: LLM 客户端实例
             memory_path: DTG 存储路径
             session_name: 会话名称
-            output_dir: 输出目录（RunLogger 日志文件存放位置）
         """
-        self.session_name     = session_name
         self.dtg              = DTGStore(memory_path, session_name=session_name)
         self.meta_state       = MetaState()
         self.dsl              = DiscourseLedger(llm_client=llm_client)
-        self.run_logger       = RunLogger(output_dir=output_dir, session_name=session_name)
+        self.console          = Console()
+        self.logger           = logging.getLogger(__name__)
+        self.run_logger       = RunLogger(output_dir="./outputs", session_name=session_name)
+
+        llm_client.attach_run_logger(self.run_logger)
+
         self.generator        = Generator(llm_client, run_logger=self.run_logger)
         self.section_planner  = SectionPlanner(llm_client, self.dtg)
         self.commitment_extractor = CommitmentExtractor(llm_client)
@@ -101,8 +101,6 @@ class SelfCorrectingOrchestrator:
         self.mrsd = MRSD(dtg_store=self.dtg, llm_client=llm_client)
         self.correction_log   = CorrectionLog()
         self.metric_collector = MetricCollector()
-        self.console          = Console()
-        self.logger           = logging.getLogger(__name__)
 
     # ------------------------------------------------------------------
     # 主入口
@@ -131,123 +129,127 @@ class SelfCorrectingOrchestrator:
                 (最终文本, 决策列表, 修正日志)
         """
         self._print_header(task, outline)
-
-        # 记录运行开始
         self.run_logger.log_run_start(task, constraints, outline)
 
-        state = self._initialize_state(constraints, outline)
-        plan_state = PlanState(global_outline=outline)
-        generated_content: Dict[str, str] = {}
-        section_queue = list(outline.keys())
+        try:
+            state = self._initialize_state(constraints, outline)
+            plan_state = PlanState(global_outline=outline)
+            generated_content: Dict[str, str] = {}
+            section_queue = list(outline.keys())
 
-        rollback_count = 0
-        current_idx = 0
+            rollback_count = 0
+            current_idx = 0
 
-        # 节级别的诊断跟踪
-        consecutive_failures_this_section = 0
-        last_purge_succeeded = False
-        last_diagnosis_event_id: Optional[str] = None
+            # 节级别的诊断跟踪
+            consecutive_failures_this_section = 0
+            last_purge_succeeded = False
+            last_diagnosis_event_id: Optional[str] = None
 
-        while current_idx < len(section_queue):
-            section_id = section_queue[current_idx]
-            state.current_section = section_id
-            section_title = outline[section_id]
+            while current_idx < len(section_queue):
+                section_id = section_queue[current_idx]
+                state.current_section = section_id
+                section_title = outline[section_id]
 
-            self._print_section_start(section_id, section_title, current_idx, len(section_queue))
-
-            # 第一阶段：规划当前节（SectionPlanner）
-            section_intent = self._plan_section(
-                section_id=section_id,
-                section_title=section_title,
-                task=task,
-                plan_state=plan_state,
-            )
-            plan_state.add_intent(section_intent)
-
-            # 记录节开始（规划前先取 DSL 活跃数）
-            dsl_active_count = len(self.dsl.get_active_entries())
-            self.run_logger.log_section_start(
-                section_id=section_id,
-                title=section_title,
-                idx=current_idx,
-                total=len(section_queue),
-                state=state,
-                dsl_active_count=dsl_active_count,
-            )
-            # 记录规划结果
-            self.run_logger.log_planning(section_id, section_intent)
-
-            # 准备 DSL 注入，并记录注入条目
-            injectable = self._update_dsl_injection(state, section_id, section_queue, current_idx)
-            self.run_logger.log_dsl_injection(section_id, injectable)
-
-            rolled_back = False
-            report = None
-            content: Optional[str] = None
-            decision: Optional[Decision] = None
-
-            for attempt in range(self.MAX_RETRIES_PER_SECTION):
-                temperature = self._get_temperature(consecutive_failures_this_section)
-
-                # 记录本次尝试开始
-                self.run_logger.log_attempt_start(section_id, attempt + 1, temperature)
-
-                # 第二阶段：生成
-                try:
-                    content, decision = self.generator.generate_with_decision(
-                        state=state,
-                        task=task,
-                        recent_content=self._get_recent_content(),
-                        section_intent=section_intent,
-                        temperature=temperature,
-                        orchestrator_attempt=attempt + 1,
+                self._print_section_start(section_id, section_title, current_idx, len(section_queue))
+                if self.run_logger is not None:
+                    self.run_logger.log_section_start(
+                        section_id,
+                        section_title,
+                        current_idx,
+                        len(section_queue),
+                        state,
+                        len(self.dsl.get_active_entries()),
                     )
-                except Exception as e:
-                    self.logger.error("生成异常（section=%s attempt=%d）: %s", section_id, attempt + 1, e)
-                    consecutive_failures_this_section += 1
-                    self.correction_log.add_retry(section_id, attempt + 1, "RETRY_SIMPLE", [str(e)])
-                    continue
 
-                # 第三阶段：验证
-                try:
-                    report = self.online_validator.validate_and_diagnose(
-                        decision, content, state, attempt=attempt + 1
-                    )
-                    self.meta_state.update_validator_stability(report.dcas_score)
-                except Exception as e:
-                    self.logger.error("验证异常（section=%s）: %s", section_id, e)
-                    report = None
+                # 第一阶段：规划当前节（SectionPlanner）
+                section_intent = self._plan_section(
+                    section_id=section_id,
+                    section_title=section_title,
+                    task=task,
+                    plan_state=plan_state,
+                )
+                plan_state.add_intent(section_intent)
+                if self.run_logger is not None:
+                    self.run_logger.log_planning(section_id, section_intent)
 
-                # 第四阶段：处理验证结果
-                if report is None or report.passed:
-                    # 验证通过
-                    self._on_section_success(
-                        section_id=section_id,
-                        content=content,
-                        decision=decision,
-                        state=state,
-                        generated_content=generated_content,
-                        section_queue=section_queue,
-                        plan_state=plan_state,
-                        attempt=attempt,
-                        dcas=report.dcas_score if report else 1.0,
-                    )
-                    # 记录诊断结果（若上一次有诊断）
-                    if last_diagnosis_event_id:
-                        self.metric_collector.record_diagnosis_outcome(
-                            last_diagnosis_event_id, succeeded=True
+                # 准备 DSL 注入
+                self._update_dsl_injection(state, section_id, section_queue, current_idx)
+
+                rolled_back = False
+                report = None
+                content: Optional[str] = None
+                decision: Optional[Decision] = None
+                last_failure_reason: Optional[str] = None
+
+                for attempt in range(self.MAX_RETRIES_PER_SECTION):
+                    # 第二阶段：生成
+                    temperature = self._get_temperature(consecutive_failures_this_section)
+                    if self.run_logger is not None:
+                        self.run_logger.log_attempt_start(section_id, attempt + 1, temperature)
+                    try:
+                        content, decision = self.generator.generate_with_decision(
+                            state=state,
+                            task=task,
+                            recent_content=self._get_recent_content(),
+                            section_intent=section_intent,
+                            temperature=temperature,
                         )
-                        last_diagnosis_event_id = None
-                    self.metric_collector.record_section_first_pass(
-                        section_id, passed_on_first_try=(attempt == 0)
-                    )
-                    consecutive_failures_this_section = 0
-                    last_purge_succeeded = False
-                    current_idx += 1
-                    break
+                    except Exception as e:
+                        self.logger.error("生成异常（section=%s attempt=%d）: %s", section_id, attempt + 1, e)
+                        consecutive_failures_this_section += 1
+                        last_failure_reason = "generator_parse_failure"
+                        self.correction_log.add_retry(section_id, attempt + 1, "RETRY_SIMPLE", [str(e)])
+                        continue
 
-                else:
+                    # 第三阶段：验证
+                    try:
+                        report = self.online_validator.validate_and_diagnose(decision, content, state)
+                        self.meta_state.update_validator_stability(report.dcas_score)
+                    except Exception as e:
+                        self.logger.error("验证异常（section=%s）: %s", section_id, e)
+                        report = None
+
+                    if report is None:
+                        last_failure_reason = "validator_exception"
+                        consecutive_failures_this_section += 1
+                        self.correction_log.add_retry(
+                            section_id,
+                            attempt + 1,
+                            "VALIDATOR_EXCEPTION",
+                            ["validator_exception"],
+                        )
+                        continue
+
+                    # 第四阶段：处理验证结果
+                    if report.passed:
+                        # 验证通过
+                        self._on_section_success(
+                            section_id=section_id,
+                            content=content,
+                            decision=decision,
+                            state=state,
+                            generated_content=generated_content,
+                            section_queue=section_queue,
+                            plan_state=plan_state,
+                            attempt=attempt,
+                            dcas=report.dcas_score,
+                        )
+                        # 记录诊断结果（若上一次有诊断）
+                        if last_diagnosis_event_id:
+                            self.metric_collector.record_diagnosis_outcome(
+                                last_diagnosis_event_id, succeeded=True
+                            )
+                            last_diagnosis_event_id = None
+                        self.metric_collector.record_section_first_pass(
+                            section_id, passed_on_first_try=(attempt == 0)
+                        )
+                        consecutive_failures_this_section = 0
+                        last_purge_succeeded = False
+                        current_idx += 1
+                        break
+
                     # 验证失败：MRSD 诊断
+                    last_failure_reason = "validator_unknown"
                     consecutive_failures_this_section += 1
                     diagnosis = self.mrsd.diagnose(
                         report=report,
@@ -262,9 +264,6 @@ class SelfCorrectingOrchestrator:
                         ),
                         recent_section_failure_tiers=[],
                     )
-
-                    # 记录诊断结果
-                    self.run_logger.log_diagnosis(section_id, attempt + 1, diagnosis)
 
                     # 记录诊断事件
                     diag_event_id = self.metric_collector.record_diagnosis(
@@ -301,27 +300,13 @@ class SelfCorrectingOrchestrator:
                     # 执行修复
                     if diagnosis.repair_scope == "partial_rollback":
                         # 回退策略：需要 MetaState 门控
-                        rollback_allowed = self.meta_state.gate_action("allow_rollback")
-                        self.run_logger.log_meta_state_gate(
-                            section_id=section_id,
-                            action_name="allow_rollback",
-                            granted=rollback_allowed,
-                            reason=(
-                                f"remaining_budget={self.meta_state.remaining_rollback_budget}"
-                                f"  contamination={self.meta_state.contamination_risk_score:.2f}"
-                            ),
-                        )
                         if (
-                            not rollback_allowed
+                            not self.meta_state.gate_action("allow_rollback")
                             or rollback_count >= self.MAX_ROLLBACKS
                             or not diagnosis.should_rollback()
                         ):
                             self.logger.info("回退被门控或超限，降级为 local_rewrite")
                             self._update_dsl_injection_strengthen(state)
-                            self.run_logger.log_repair_action(
-                                section_id, attempt + 1, "local_rewrite（回退降级）",
-                                {"reason": "rollback_denied_or_exceeds_limit"}
-                            )
                             continue
 
                         target = diagnosis.target_section
@@ -355,20 +340,12 @@ class SelfCorrectingOrchestrator:
                                     - (section_queue.index(target) if target in section_queue else 0)
                                 ),
                             )
-                            self.run_logger.log_repair_action(
-                                section_id, attempt + 1, "partial_rollback",
-                                {"target_section": target, "rollback_count": rollback_count}
-                            )
                             consecutive_failures_this_section = 0
                             current_idx = section_queue.index(target)
                             rolled_back = True
                             break
                         else:
                             self.logger.warning("回退执行失败，降级为 local_rewrite")
-                            self.run_logger.log_repair_action(
-                                section_id, attempt + 1, "local_rewrite（回退失败降级）",
-                                {"target": target, "reason": "rollback_execution_failed"}
-                            )
                             continue
 
                     elif diagnosis.repair_scope == "memory_purge":
@@ -390,10 +367,6 @@ class SelfCorrectingOrchestrator:
                             triggered_by_confidence=diagnosis.confidence,
                             succeeded=last_purge_succeeded,
                             extra_llm_calls=0,
-                        )
-                        self.run_logger.log_repair_action(
-                            section_id, attempt + 1, "memory_purge",
-                            {"purged_count": len(purged), "succeeded": last_purge_succeeded}
                         )
                         continue
 
@@ -424,55 +397,53 @@ class SelfCorrectingOrchestrator:
                             succeeded=False,  # 后续验证后更新
                             extra_llm_calls=1,
                         )
-                        self.run_logger.log_repair_action(
-                            section_id, attempt + 1, "local_rewrite",
-                            {
-                                "strengthen_dsl_injection": diagnosis.decoding_config.strengthen_dsl_injection,
-                                "trigger_section_intent_revision": diagnosis.decoding_config.trigger_section_intent_revision,
-                                "next_temperature": f"{self._get_temperature(consecutive_failures_this_section):.2f}",
-                            }
-                        )
                         continue
 
-            else:
-                # 超过最大重试次数：降级接受
-                if not rolled_back:
-                    self.logger.warning(
-                        "section=%s 超过最大重试次数，以最后一次内容降级继续", section_id
-                    )
-                    fallback_content = content if content is not None else f"[{section_id} 生成失败]"
-                    fallback_decision = decision
+                else:
+                    # 超过最大重试次数：降级接受最后一次的版本
+                    if not rolled_back:
+                        reason_code = last_failure_reason or "validator_unknown"
+                        self.logger.warning(
+                            "degraded_acceptance: section=%s attempts=%d reason=%s",
+                            section_id,
+                            self.MAX_RETRIES_PER_SECTION,
+                            reason_code,
+                        )
+                        if self.run_logger is not None:
+                            self.run_logger.log_section_degraded(
+                                section_id,
+                                self.MAX_RETRIES_PER_SECTION,
+                                reason_code,
+                            )
+                        fallback_content = content if content is not None else f"[{section_id} 生成失败]"
+                        fallback_decision = decision
 
-                    generated_content[section_id] = fallback_content
-                    state.generated_sections.append(section_id)
-                    state.section_snippets[section_id] = fallback_content[:300]
-                    state.section_summaries[section_id] = fallback_content[:500]
-                    state.update_progress()
-                    if fallback_decision:
-                        self.dtg.add_decision(fallback_decision)
+                        generated_content[section_id] = fallback_content
+                        state.generated_sections.append(section_id)
+                        state.section_snippets[section_id] = fallback_content[:300]
+                        state.section_summaries[section_id] = fallback_content[:500]
+                        state.update_progress()
+                        if fallback_decision:
+                            self.dtg.add_decision(fallback_decision)
 
-                    last_issues = report.issues if report else []
-                    self.correction_log.add_failure(section_id, last_issues)
-                    state.flagged_issues.append(f"{section_id}：降级内容（验证未通过）")
-                    self.metric_collector.record_section_first_pass(section_id, False)
-                    consecutive_failures_this_section = 0
-                    current_idx += 1
+                        last_issues = report.issues if report else []
+                        self.correction_log.add_failure(section_id, last_issues)
+                        state.flagged_issues.append(f"{section_id}：降级内容（验证未通过）")
+                        self.metric_collector.record_section_first_pass(section_id, False)
+                        consecutive_failures_this_section = 0
+                        current_idx += 1
 
-                    # 记录节降级
-                    self.run_logger.log_section_degraded(section_id, self.MAX_RETRIES_PER_SECTION)
+            # 组装最终文本
+            final_text = self._assemble_text(outline, generated_content)
+            self._print_summary()
+            self.run_logger.log_run_summary(
+                self.correction_log.get_statistics(),
+                self.meta_state,
+            )
 
-        # 组装最终文本
-        final_text = self._assemble_text(outline, generated_content)
-        self._print_summary()
-
-        # 记录运行汇总，关闭日志
-        self.run_logger.log_run_summary(
-            correction_stats=self.correction_log.get_statistics(),
-            meta_state=self.meta_state,
-        )
-        self.run_logger.close()
-
-        return final_text, self.dtg.decision_log, self.correction_log
+            return final_text, self.dtg.decision_log, self.correction_log
+        finally:
+            self.run_logger.close()
 
     # ------------------------------------------------------------------
     # 第一阶段：规划
@@ -544,6 +515,7 @@ class SelfCorrectingOrchestrator:
             return SectionIntent.create(
                 section_id=section_id,
                 local_goal=f"完成 {section_title} 的内容生成",
+                scope_boundary=f"本节仅限于 {section_title}，不得涉及后续章节内容",
                 open_loops_to_advance=[],
                 commitments_to_maintain=[],
                 risks_to_avoid=[],
@@ -562,7 +534,7 @@ class SelfCorrectingOrchestrator:
         section_id: str,
         section_queue: List[str],
         current_idx: int,
-    ) -> List:
+    ) -> None:
         """
         更新 GenerationState 的 DSL 注入文本
 
@@ -575,9 +547,6 @@ class SelfCorrectingOrchestrator:
             section_id: 当前节 ID
             section_queue: 全局节列表
             current_idx: 当前节序号（0-based）
-
-        返回值：
-            List：本次注入的 LedgerEntry 列表（供 run_logger 记录）
         """
         injectable = self.dsl.get_injectable_entries(
             target_section_idx=current_idx,
@@ -596,7 +565,9 @@ class SelfCorrectingOrchestrator:
             )
         else:
             state.dsl_injection = ""
-        return injectable
+
+        if getattr(self, "run_logger", None) is not None:
+            self.run_logger.log_dsl_injection(section_id, injectable)
 
     def _update_dsl_injection_strengthen(self, state: GenerationState) -> None:
         """
@@ -656,7 +627,7 @@ class SelfCorrectingOrchestrator:
         self.correction_log.add_success(section_id, attempt + 1)
 
         # 提取承诺并写入 DSL
-        new_entries: List = []
+        new_entries: List[Any] = []
         try:
             new_entries = self.commitment_extractor.extract(
                 section_content=content,
@@ -691,21 +662,30 @@ class SelfCorrectingOrchestrator:
             memory_trust_level=self.meta_state.memory_trust_level,
         )
 
-        # 记录节成功（含新增 DSL 条目）
-        self.run_logger.log_section_success(
-            section_id=section_id,
-            total_attempts=attempt + 1,
-            dcas=dcas,
-            new_entries=new_entries,
-            total_active_entries=len(active),
-            memory_trust=self.meta_state.memory_trust_level,
-        )
+        if self.run_logger is not None:
+            self.run_logger.log_section_success(
+                section_id=section_id,
+                total_attempts=attempt + 1,
+                dcas=dcas,
+                new_entries=new_entries,
+                total_active_entries=len(active),
+                memory_trust=self.meta_state.memory_trust_level,
+            )
 
+        self._log_postprocess_skipped(section_id)
         self._print_success(section_id, attempt + 1, dcas)
 
     # ------------------------------------------------------------------
     # 回退
     # ------------------------------------------------------------------
+
+    def _log_postprocess_skipped(self, section_id: str) -> None:
+        """记录 postprocess 默认关闭的原因。"""
+        reason = "feature_disabled_by_default"
+        self.logger.info("postprocess_skipped: section=%s reason=%s", section_id, reason)
+        if getattr(self, "run_logger", None) is not None:
+            self.run_logger.log_postprocess_skipped(section_id, reason)
+
 
     def _execute_rollback(
         self,

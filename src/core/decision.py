@@ -98,3 +98,52 @@ class Decision:
     def get_reference_count(self) -> int:
         """获取引用数（用于错误定位算法）"""
         return len(self.referenced_sections)
+
+
+# ============================================================================
+# Structured Output Schema（用于 LangChain 和 LLM API 的原生结构化输出）
+# ============================================================================
+
+try:
+    from pydantic import BaseModel, Field
+    
+    class GenerationDecisionSchema(BaseModel):
+        """
+        生成决策的结构化输出 Schema
+        
+        功能：
+            用于 LangChain 的 with_structured_output() 和 OpenAI/Claude 原生 JSON schema 模式。
+            LLM API 会直接校验输出满足此 schema，解析失败率接近 0%。
+        
+        字段：
+            decision: 本节的核心写作决策
+            reasoning: 推理过程和依据
+            expected_effect: 预期达到的叙事效果
+            confidence: 置信度（0.0 到 1.0）
+            content: 纯叙事正文（禁止包含元信息）
+            referenced_section_ids: 引用的前文节点 ID 列表（可选）
+        """
+        decision: str = Field(
+            description="本节的核心写作决策（简要说明做什么）"
+        )
+        reasoning: str = Field(
+            description="推理过程（为什么这样写，可引用前文节点 ID）"
+        )
+        expected_effect: str = Field(
+            description="预期达到的叙事效果（本节完成后的故事状态）"
+        )
+        confidence: float = Field(
+            ge=0.0, le=1.0,
+            description="置信度：0.0 到 1.0 之间的浮点数"
+        )
+        content: str = Field(
+            description="纯叙事正文，禁止包含节ID、字数统计、XML标签或任何元信息"
+        )
+        referenced_section_ids: List[str] = Field(
+            default_factory=list,
+            description="引用的前文节点 ID 列表，如 ['sec1', 'sec2']"
+        )
+
+except ImportError:
+    # 如果 pydantic 不可用，定义一个占位符
+    GenerationDecisionSchema = None

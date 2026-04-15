@@ -46,3 +46,16 @@ outputs/
 .DS_Store
 Thumbs.db
 *~
+debug.md
+plan.md
+research.md
+
+# ===========================================
+# 内部说明 / 临时文档（不上传）
+# ===========================================
+AGENT.md
+CLAUDE.md
+HOTFIX_THINKING_MODELS.md
+HOTFIX_V2_RESPONSE_FORMAT.md
+STRUCTURED_OUTPUT_MIGRATION.md
+change.md

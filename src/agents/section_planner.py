@@ -11,7 +11,7 @@
 """
 from __future__ import annotations
 
-import re
+import json
 from typing import Dict, List, Optional
 
 from ..core.plan import SectionIntent
@@ -33,12 +33,12 @@ class SectionPlanner:
 
     关键实现细节：
         温度固定 0.3（规划阶段需要保守确定性）。
-        max_tokens 512（局部计划不需要长输出）。
-        LLM 以 XML 格式输出 SectionIntent 字段，解析失败时返回保守默认值。
+        max_tokens 32768（放宽上限，防止长上下文导致截断）。
+        LLM 输出 JSON 结构描述局部计划，解析失败时返回保守默认值。
     """
 
     _TEMPERATURE = 0.3
-    _MAX_TOKENS = 512
+    _MAX_TOKENS = 32768
 
     def __init__(self, llm_client: LLMClient, dtg_store: DTGStore):
         self._llm = llm_client
@@ -59,7 +59,7 @@ class SectionPlanner:
 
         功能：
             1. 构建规划 prompt，调用 LLM 生成结构化局部计划
-            2. 解析 XML 格式输出为 SectionIntent
+            2. 解析 JSON 格式输出为 SectionIntent
             3. 将 SectionIntent 注册为 DTG 的 intent_node（建立 DERIVED_FROM 边）
 
         参数：
@@ -89,6 +89,13 @@ class SectionPlanner:
             prompt,
             temperature=self._TEMPERATURE,
             max_tokens=self._MAX_TOKENS,
+            strip_think=True,
+            allow_think_only_fallback=False,
+            log_meta={
+                "component": "SectionPlanner",
+                "section_id": section_id,
+                "intent_title": section_title,
+            },
         )
 
         intent = self._parse_intent(
@@ -140,7 +147,7 @@ class SectionPlanner:
 
         return (
             "根据以下信息，为即将生成的章节制定局部计划。"
-            "请严格按照 XML 格式输出，不要任何额外文字。\n\n"
+            "请只输出一个 JSON 对象，不要 markdown 代码块、不要 XML、不要额外解释。\n\n"
             f"任务目标：{task_description}\n"
             f"本节大纲职责：{section_title}\n\n"
             f"{dsl_block}"
@@ -150,13 +157,16 @@ class SectionPlanner:
             "2. 如果故事中存在主要冲突，本节应推进该冲突，但不得在本节内完整解决；"
             "除非本节大纲明确标注为结局节。\n"
             "3. 已完成章节中已处理的内容不应在本节重复叙述。\n\n"
-            "输出格式：\n"
-            "<local_goal>本节需要实现的具体目标，不超过 50 字</local_goal>\n"
-            "<scope_boundary>本节明确不应涉及的内容（避免越界），不超过 30 字</scope_boundary>\n"
-            "<open_loops_to_advance>本节应推进的未闭合线索，用分号分隔，无则填「无」</open_loops_to_advance>\n"
-            "<commitments_to_maintain>本节必须维护的承诺，用分号分隔，无则填「无」</commitments_to_maintain>\n"
-            "<risks_to_avoid>本节需避免的高风险冲突，用分号分隔，无则填「无」</risks_to_avoid>\n"
-            "<success_criteria>本节通过验证的最低标准（1-2 条），用分号分隔</success_criteria>"
+            "输出格式（严格 JSON）：\n"
+            "{\n"
+            "  \"local_goal\": \"...\",\n"
+            "  \"scope_boundary\": \"...\",\n"
+            "  \"open_loops_to_advance\": [\"...\"],\n"
+            "  \"commitments_to_maintain\": [\"...\"],\n"
+            "  \"risks_to_avoid\": [\"...\"],\n"
+            "  \"success_criteria\": [\"...\"]\n"
+            "}\n"
+            "若无内容，数组字段必须返回 []，不要写 \"无\"；不要输出 markdown 代码块。"
         )
 
     def _parse_intent(
@@ -182,22 +192,25 @@ class SectionPlanner:
         返回值：
             SectionIntent 实例
         """
-        def extract(tag: str) -> str:
-            m = re.search(rf"<{tag}>(.*?)</{tag}>", raw, re.DOTALL)
-            return m.group(1).strip() if m else ""
+        payload = self._extract_json_object(raw)
+        if not payload:
+            return self._build_default_intent(section_id, source_dsl_entry_ids, dsl_trust_at_generation)
 
-        def split_list(text: str) -> List[str]:
-            if not text or text == "无":
-                return []
-            return [item.strip() for item in text.split("；") if item.strip() and item.strip() != "无"]
+        data = self._safe_parse_intent_json(payload)
+        if data is None:
+            return self._build_default_intent(section_id, source_dsl_entry_ids, dsl_trust_at_generation)
 
-        local_goal = extract("local_goal") or f"完成 {section_id} 节的内容生成"
-        scope_boundary = extract("scope_boundary") or ""
-        open_loops = split_list(extract("open_loops_to_advance"))
-        commitments = split_list(extract("commitments_to_maintain"))
-        risks = split_list(extract("risks_to_avoid"))
-        criteria_raw = extract("success_criteria")
-        success_criteria = split_list(criteria_raw) or ["内容符合节目标，无严重约束违反"]
+        def _norm_list(value) -> List[str]:
+            if isinstance(value, list):
+                return [str(item).strip() for item in value if str(item).strip()]
+            return []
+
+        local_goal = str(data.get("local_goal", "")).strip() or f"完成 {section_id} 节的内容生成"
+        scope_boundary = str(data.get("scope_boundary", "")).strip()
+        open_loops = _norm_list(data.get("open_loops_to_advance"))
+        commitments = _norm_list(data.get("commitments_to_maintain"))
+        risks = _norm_list(data.get("risks_to_avoid"))
+        success_criteria = _norm_list(data.get("success_criteria")) or ["内容符合节目标，无严重约束违反"]
 
         return SectionIntent.create(
             section_id=section_id,
@@ -207,6 +220,58 @@ class SectionPlanner:
             commitments_to_maintain=commitments,
             risks_to_avoid=risks,
             success_criteria=success_criteria,
+            source_dsl_entry_ids=source_dsl_entry_ids,
+            dsl_trust_at_generation=dsl_trust_at_generation,
+        )
+
+    def _extract_json_object(self, raw: str) -> Optional[str]:
+        """提取首个合法 JSON 对象文本，失败返回 None"""
+        if not raw:
+            return None
+        raw = raw.strip()
+        # 先尝试整体解析
+        try:
+            json.loads(raw)
+            return raw
+        except Exception:
+            pass
+
+        start = raw.find("{")
+        if start == -1:
+            return None
+        depth = 0
+        for idx in range(start, len(raw)):
+            ch = raw[idx]
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    return raw[start:idx + 1]
+        return None
+
+    def _safe_parse_intent_json(self, payload: str) -> Optional[Dict]:
+        """解析 JSON，失败返回 None"""
+        try:
+            return json.loads(payload)
+        except json.JSONDecodeError:
+            return None
+
+    def _build_default_intent(
+        self,
+        section_id: str,
+        source_dsl_entry_ids: List[str],
+        dsl_trust_at_generation: float,
+    ) -> SectionIntent:
+        """构造保守默认 SectionIntent"""
+        return SectionIntent.create(
+            section_id=section_id,
+            local_goal=f"完成 {section_id} 节的内容生成",
+            scope_boundary="",
+            open_loops_to_advance=[],
+            commitments_to_maintain=[],
+            risks_to_avoid=[],
+            success_criteria=["内容符合节目标，无严重约束违反"],
             source_dsl_entry_ids=source_dsl_entry_ids,
             dsl_trust_at_generation=dsl_trust_at_generation,
         )

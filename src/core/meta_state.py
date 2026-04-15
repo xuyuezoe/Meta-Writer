@@ -205,6 +205,25 @@ class MetaState:
                 + 0.3 × recent_same_tier_failure_rate
                 + 0.3 × (1 - memory_trust_level)
             CRS < 0.3 时 BCP 可以短路；CRS >= 0.3 时进入轻量溯源
+
+        三个风险因子的设计逻辑：
+
+        1.low_trust_ref_ratio (40% 权重)：
+
+            表示当前节生成时引用的 DSL 条目中，低信任度条目的比例
+            核心指标：直接反映当前生成依赖的约束质量
+            如果大量使用不可信约束，生成内容很可能受污染
+        2.recent_same_tier_failure_rate (30% 权重)：
+
+        表示最近几节中相同错误层级的失败频率
+        模式识别：如果近期频繁出现同类型错误，可能存在系统性污染
+        避免将偶然失败误判为污染
+        3.(1.0 - memory_trust_level) (30% 权重)：
+
+        DSL 整体信任度的倒数
+        全局污染指示：如果整个 DSL 都不太可信，那么局部污染风险更高
+
+        通过综合这三个因子，MetaState 能够动态评估当前节的上游污染风险，从而指导是否需要启用更严格的修复策略（如强化 DSL 注入）或直接拒绝修复操作（如拒绝回退）。
         """
         self.contamination_risk_score = (
             0.4 * low_trust_ref_ratio
