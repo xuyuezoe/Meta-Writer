@@ -1,0 +1,7 @@
+{
+  "open_ended_qa": 0.45,
+  "summarization": 0.48,
+  "planning": 0.43,
+  "writing": 0.40,
+  "analysis": 0.44
+}
