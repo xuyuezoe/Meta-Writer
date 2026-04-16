@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import unittest
+from types import SimpleNamespace
 
 import main
 
@@ -79,6 +80,20 @@ class MainCliTests(unittest.TestCase):
                 "logical_coherence": 0.8,
             },
         )
+
+    def test_configure_benchmark_runtime_disables_dsl_relation_llm(self) -> None:
+        orchestrator = SimpleNamespace(dsl=SimpleNamespace(_llm_client="sentinel"))
+
+        main._configure_benchmark_runtime("metabench_med_s001", orchestrator)
+
+        self.assertIsNone(orchestrator.dsl._llm_client)
+
+    def test_configure_regular_runtime_keeps_dsl_relation_llm(self) -> None:
+        orchestrator = SimpleNamespace(dsl=SimpleNamespace(_llm_client="sentinel"))
+
+        main._configure_benchmark_runtime("survey_paper", orchestrator)
+
+        self.assertEqual(orchestrator.dsl._llm_client, "sentinel")
 
 
 if __name__ == "__main__":

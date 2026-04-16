@@ -233,6 +233,19 @@ class LLMClient:
             return ["openai_chat", "anthropic_messages"]
         return ["anthropic_messages", "openai_chat"]
 
+    def _should_attempt_response_format(self) -> bool:
+        """
+        判断当前模型和网关是否值得先尝试 response_format。
+
+        设计目的：
+            在自定义网关上跑非 OpenAI 家族模型时，`response_format` 常常会稳定失败，
+            然后又退回到普通生成，额外制造一批无意义的 503 请求。
+            这里提前跳过高风险路径，让真实 benchmark 更接近“稳定调用”。
+        """
+        if not self.base_url:
+            return True
+        return self._looks_like_openai_model()
+
     def _retry_delay(self, round_index: int) -> float:
         """
         指数退避，给网关恢复时间。
@@ -766,6 +779,20 @@ class LLMClient:
         import json as stdlib_json
 
         log_meta = dict(log_meta or {})
+
+        if not self._should_attempt_response_format():
+            self.logger.info(
+                "skip response_format for model=%s base_url=%s and use fallback structured generation",
+                self.model,
+                self.base_url,
+            )
+            return self._generate_structured_fallback(
+                prompt,
+                schema,
+                temperature,
+                max_tokens,
+                log_meta,
+            )
 
         try:
             response = self._call_openai_chat(

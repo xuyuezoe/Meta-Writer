@@ -66,24 +66,27 @@ class SelfCorrectingOrchestrator:
         llm_client,
         memory_path: str = "./sessions",
         session_name: str = "session",
+        output_dir: str = "./outputs",
     ):
         """
         初始化自我修正协调器
 
         功能：
             创建并连接所有子组件，MetaState 初始化为信任状态。
+            同时把 output_dir 传给 RunLogger，保证主入口与运行日志落盘目录一致。
 
         参数：
             llm_client: LLM 客户端实例
             memory_path: DTG 存储路径
             session_name: 会话名称
+            output_dir: 输出目录（运行日志和相关工件的统一落盘位置）
         """
         self.dtg              = DTGStore(memory_path, session_name=session_name)
         self.meta_state       = MetaState()
         self.dsl              = DiscourseLedger(llm_client=llm_client)
         self.console          = Console()
         self.logger           = logging.getLogger(__name__)
-        self.run_logger       = RunLogger(output_dir="./outputs", session_name=session_name)
+        self.run_logger       = RunLogger(output_dir=output_dir, session_name=session_name)
 
         llm_client.attach_run_logger(self.run_logger)
 
@@ -877,20 +880,23 @@ class SelfCorrectingOrchestrator:
     def _print_section_start(
         self, section_id: str, title: str, idx: int, total: int
     ) -> None:
+        # 目的：
+        #   Windows 上常见的 gbk 控制台无法稳定输出 ▶ / — 等字符。
+        #   这里统一改用 ASCII，避免真实 benchmark 运行因为打印阶段报编码错而中断。
         self.console.print(
-            f"\n[bold blue]▶ [{idx+1}/{total}] {section_id}[/bold blue] — {title}"
+            f"\n[bold blue][{idx+1}/{total}] {section_id}[/bold blue] - {title}"
         )
 
     def _print_success(self, section_id: str, attempt: int, dcas: float) -> None:
         attempt_str = f"(第 {attempt} 次)" if attempt > 1 else "(一次通过)"
         self.console.print(
-            f"  [green]✓ {section_id} 通过 {attempt_str} DCAS={dcas:.3f}[/green]"
+            f"  [green][OK] {section_id} 通过 {attempt_str} DCAS={dcas:.3f}[/green]"
         )
 
     def _print_failure(self, section_id: str, attempt: int, diagnosis, report) -> None:
         issues_str = " | ".join(i.description[:40] for i in report.issues[:3])
         self.console.print(
-            f"  [yellow]✗ {section_id} 第 {attempt} 次失败 → "
+            f"  [yellow][FAIL] {section_id} 第 {attempt} 次失败 -> "
             f"{diagnosis.repair_scope}({diagnosis.error_tier.value}/"
             f"{diagnosis.error_source.value})[/yellow]\n"
             f"    [dim]{issues_str}[/dim]"

@@ -19,6 +19,44 @@ from typing import Dict, List, Union, cast
 
 BENCHMARK_ROOT: Path = Path(__file__).resolve().parent.parent / "metabench"
 SAMPLES_PATH: Path = BENCHMARK_ROOT / "examples" / "samples.jsonl"
+DOCUMENT_LEVEL_CONSTRAINT_PREFIX = "整篇要求："
+
+
+def _mark_document_level_constraint(requirement: str) -> str:
+    """给整篇级 benchmark 约束打上统一前缀。
+
+    设计目的：
+        benchmark 样本里的字数、整体结构、must_include 和周期性要求本质上都是
+        “整篇输出”约束，而不是单个 section 的即时校验条件。
+        这里显式加前缀，是为了让生成主流程仍然能看到这些要求，同时让
+        section 级 validator 可以稳定识别并跳过误判。
+    """
+    return f"{DOCUMENT_LEVEL_CONSTRAINT_PREFIX}{requirement}"
+
+
+def _extract_paragraph_blocks(text: str) -> List[str]:
+    """从最终生成文本中提取可用于 benchmark 评估的正文段落。
+
+    设计目的：
+        Meta-Writer 会在最终输出里插入 `##` 标题和 `---` 分隔线来保留章节结构。
+        如果直接按非空行切段，这些装配标记会污染段落计数和位置约束判断，
+        导致 benchmark 评分被 markdown 外壳而不是正文内容干扰。
+    """
+    normalized_text = text.replace("\r\n", "\n").strip()
+    if normalized_text == "":
+        return []
+
+    paragraph_blocks: List[str] = []
+    for raw_block in normalized_text.split("\n\n"):
+        block = raw_block.strip()
+        if block == "" or block == "---":
+            continue
+
+        if block.startswith("## "):
+            continue
+
+        paragraph_blocks.append(block)
+    return paragraph_blocks
 
 
 def _read_jsonl_rows(file_path: Path) -> List[Dict[str, object]]:
@@ -233,11 +271,21 @@ def load_benchmark_task(task_id: str) -> Dict[str, object]:
         checklist_list = cast(List[object], checklist_object)
 
         constraints: List[str] = [
-            f"目标长度约 {required_length_words} 字",
-            f"正文至少形成 {expected_blocks} 个自然段，整体写成综述型长文而非简报或提纲",
-            "写作风格应接近 survey paper：先界定范围，再做分类、比较、综合，最后讨论局限性与未来工作",
-            *[f"必须覆盖：{item}" for item in must_include],
-            *[f"周期性要求：{item}" for item in periodic_requirements],
+            _mark_document_level_constraint(f"目标长度约 {required_length_words} 字"),
+            _mark_document_level_constraint(
+                f"正文至少形成 {expected_blocks} 个自然段，整体写成综述型长文而非简报或提纲"
+            ),
+            _mark_document_level_constraint(
+                "写作风格应接近 survey paper：先界定范围，再做分类、比较、综合，最后讨论局限性与未来工作"
+            ),
+            *[
+                _mark_document_level_constraint(f"必须覆盖：{item}")
+                for item in must_include
+            ],
+            *[
+                _mark_document_level_constraint(f"周期性要求：{item}")
+                for item in periodic_requirements
+            ],
         ]
 
         reference: Dict[str, object] = {
@@ -351,12 +399,11 @@ def evaluate_output(
         for item in proxy_questions
         if _contains_keyword(normalized_text, str(item["answer"]))
     ]
-    paragraph_blocks = [
-        block.strip() for block in normalized_text.splitlines() if block.strip() != ""
-    ]
+    paragraph_blocks = _extract_paragraph_blocks(normalized_text)
+    body_text = "\n\n".join(paragraph_blocks)
     sentence_count = sum(
         1
-        for part in normalized_text.replace("！", "。").replace("？", "。").split("。")
+        for part in body_text.replace("！", "。").replace("？", "。").split("。")
         if part.strip() != ""
     )
 

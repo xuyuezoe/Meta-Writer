@@ -312,6 +312,24 @@ def _print_run_summary(
     print(f"\n运行摘要：{summary_file}")
 
 
+def _configure_benchmark_runtime(task_name: str, orchestrator: object) -> None:
+    """按任务类型调整运行时开销较高但非 benchmark 核心的能力。
+
+    设计目的：
+        benchmark 样本需要验证的是 `main.py` 真入口、真实 API 调用、正文生成链路
+        与最终 `evaluate_output()` 是否打通，而不是把大量配套的 DSL 关系抽取请求
+        也一并压到单条样本上。
+        对 `metabench_*` 任务，这里关闭 DSL 条目之间的额外 LLM 关系判断，
+        这样仍保留条目写入、注入、validator 和最终评分，但避免单样本在收尾阶段
+        因成百上千次 pairwise relation 调用而长时间阻塞。
+    """
+    if _extract_benchmark_task_id(task_name) is None:
+        return
+
+    if hasattr(orchestrator, "dsl") and hasattr(orchestrator.dsl, "_llm_client"):
+        orchestrator.dsl._llm_client = None
+
+
 def _run_single_task(
     task_name: str,
     runtime_settings: Dict[str, str | None],
@@ -354,6 +372,7 @@ def _run_single_task(
         session_name=session_name,
         output_dir=str(output_dir),
     )
+    _configure_benchmark_runtime(task_name, orchestrator)
 
     final_text, _decisions, correction_log = orchestrator.generate_with_self_correction(
         task=task_description,

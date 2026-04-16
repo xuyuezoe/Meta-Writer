@@ -21,6 +21,8 @@ import logging
 import re
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
+from examples.benchmark_template import DOCUMENT_LEVEL_CONSTRAINT_PREFIX
+
 from ..core.decision import Decision
 from ..core.meta_state import MetaState
 from ..core.state import GenerationState
@@ -402,6 +404,13 @@ class OnlineValidator:
         """
         c_lower = constraint.lower()
         content_lower = content.lower()
+
+        # 规则0：benchmark 适配器显式标记为“整篇要求”的约束不在 section 级拦截
+        # 目的：
+        #   这些约束本来就是给整篇输出用的，如果在单节即时校验里逐条拦截，
+        #   会把“研究范围”“局限性”这类全文锚点错误地压到 sec2/sec3 上。
+        if constraint.startswith(DOCUMENT_LEVEL_CONSTRAINT_PREFIX):
+            return True, None
 
         # 规则1：字数/篇幅类 → 整篇目标，单节直接通过
         if re.search(r'\d+\s*[字词]|字数|篇幅|字以内|字左右|字以上', constraint):
