@@ -418,7 +418,7 @@ class SelfCorrectingOrchestrator:
                                 self.MAX_RETRIES_PER_SECTION,
                                 reason_code,
                             )
-                        fallback_content = content if content is not None else f"[{section_id} 生成失败]"
+                        fallback_content = self._coerce_degraded_section_content(content)
                         fallback_decision = decision
 
                         generated_content[section_id] = fallback_content
@@ -431,7 +431,9 @@ class SelfCorrectingOrchestrator:
 
                         last_issues = report.issues if report else []
                         self.correction_log.add_failure(section_id, last_issues)
-                        state.flagged_issues.append(f"{section_id}：降级内容（验证未通过）")
+                        state.flagged_issues.append(
+                            f"{section_id}: degraded content accepted after validation failure"
+                        )
                         self.metric_collector.record_section_first_pass(section_id, False)
                         consecutive_failures_this_section = 0
                         current_idx += 1
@@ -499,7 +501,7 @@ class SelfCorrectingOrchestrator:
         )
 
         if is_revision and revision_reason:
-            task_with_reason = f"{task}\n\n（修订原因：{revision_reason}）"
+            task_with_reason = f"{task}\n\n(Revision reason: {revision_reason})"
         else:
             task_with_reason = task
 
@@ -517,12 +519,12 @@ class SelfCorrectingOrchestrator:
             self.logger.warning("SectionPlanner 异常，使用默认 intent：%s", e)
             return SectionIntent.create(
                 section_id=section_id,
-                local_goal=f"完成 {section_title} 的内容生成",
-                scope_boundary=f"本节仅限于 {section_title}，不得涉及后续章节内容",
+                local_goal=f"Complete the content for {section_title}",
+                scope_boundary=f"This section must stay within {section_title} and must not cover later sections",
                 open_loops_to_advance=[],
                 commitments_to_maintain=[],
                 risks_to_avoid=[],
-                success_criteria=["内容符合节目标，无严重约束违反"],
+                success_criteria=["The content matches the section goal and does not violate major constraints."],
                 source_dsl_entry_ids=dsl_entry_ids,
                 dsl_trust_at_generation=memory_trust,
             )
@@ -580,7 +582,7 @@ class SelfCorrectingOrchestrator:
             在当前 dsl_injection 基础上追加强调说明。
         """
         if state.dsl_injection:
-            state.dsl_injection = "【重要】以下话语状态约束必须严格遵守：\n" + state.dsl_injection
+            state.dsl_injection = "[Important] Strictly follow the DSL state constraints below:\n" + state.dsl_injection
 
     # ------------------------------------------------------------------
     # 成功处理
@@ -860,9 +862,13 @@ class SelfCorrectingOrchestrator:
         """
         parts = []
         for section_id, title in outline.items():
-            content = generated_content.get(section_id, f"[{section_id} 内容缺失]")
+            content = generated_content.get(section_id, "")
             parts.append(f"## {title}\n\n{content}")
         return "\n\n---\n\n".join(parts)
+
+    def _coerce_degraded_section_content(self, content: Optional[str]) -> str:
+        """Normalize degraded section content so final text never includes failure placeholders."""
+        return content.strip() if content is not None else ""
 
     # ------------------------------------------------------------------
     # Rich 打印
@@ -871,9 +877,9 @@ class SelfCorrectingOrchestrator:
     def _print_header(self, task: str, outline: Dict[str, str]) -> None:
         self.console.print(Panel(
             f"[bold cyan]MetaWriter v4.0[/bold cyan]\n"
-            f"任务：{task}\n"
-            f"章节数：{len(outline)}",
-            title="开始生成",
+            f"Task: {task}\n"
+            f"Sections: {len(outline)}",
+            title="Generation Start",
             border_style="cyan",
         ))
 
@@ -888,15 +894,15 @@ class SelfCorrectingOrchestrator:
         )
 
     def _print_success(self, section_id: str, attempt: int, dcas: float) -> None:
-        attempt_str = f"(第 {attempt} 次)" if attempt > 1 else "(一次通过)"
+        attempt_str = f"(attempt {attempt})" if attempt > 1 else "(first pass)"
         self.console.print(
-            f"  [green][OK] {section_id} 通过 {attempt_str} DCAS={dcas:.3f}[/green]"
+            f"  [green][OK] {section_id} passed {attempt_str} DCAS={dcas:.3f}[/green]"
         )
 
     def _print_failure(self, section_id: str, attempt: int, diagnosis, report) -> None:
         issues_str = " | ".join(i.description[:40] for i in report.issues[:3])
         self.console.print(
-            f"  [yellow][FAIL] {section_id} 第 {attempt} 次失败 -> "
+            f"  [yellow][FAIL] {section_id} failed on attempt {attempt} -> "
             f"{diagnosis.repair_scope}({diagnosis.error_tier.value}/"
             f"{diagnosis.error_source.value})[/yellow]\n"
             f"    [dim]{issues_str}[/dim]"
@@ -906,13 +912,13 @@ class SelfCorrectingOrchestrator:
         stats = self.correction_log.get_statistics()
         metric_summary = self.metric_collector.compute_repair_efficiency()
         self.console.print(Panel(
-            f"总节数：{stats['total_sections']}   "
-            f"一次通过率：{stats['success_rate_first_try']:.0%}   "
-            f"重试：{stats['total_retries']} 次   "
-            f"回退：{stats['total_rollbacks']} 次   "
-            f"失败：{stats['total_failures']} 节\n"
-            f"False Rollback Rate：{metric_summary.get('false_rollback_rate', 'N/A')}   "
-            f"DSL 信任度：{self.meta_state.memory_trust_level:.3f}",
-            title="[bold green]生成完成[/bold green]",
+            f"Sections: {stats['total_sections']}   "
+            f"First-pass rate: {stats['success_rate_first_try']:.0%}   "
+            f"Retries: {stats['total_retries']}   "
+            f"Rollbacks: {stats['total_rollbacks']}   "
+            f"Failed sections: {stats['total_failures']}\n"
+            f"False Rollback Rate: {metric_summary.get('false_rollback_rate', 'N/A')}   "
+            f"DSL Trust Level: {self.meta_state.memory_trust_level:.3f}",
+            title="[bold green]Generation Complete[/bold green]",
             border_style="green",
         ))

@@ -130,9 +130,9 @@ class Generator:
                 decision = Decision(
                     timestamp=int(time.time()),
                     decision_id="",
-                    decision=structured_output.decision or "结构化决策提供",
-                    reasoning=structured_output.reasoning or "结构化推理提供",
-                    expected_effect=structured_output.expected_effect or "完成当前节的基本正文生成",
+                    decision=structured_output.decision or "Structured decision provided",
+                    reasoning=structured_output.reasoning or "Structured reasoning provided",
+                    expected_effect=structured_output.expected_effect or "Deliver the core body text for the current section",
                     confidence=structured_output.confidence if structured_output.confidence is not None else 0.8,
                     referenced_sections=self._resolve_section_references(
                         structured_output.referenced_section_ids, state
@@ -229,33 +229,33 @@ class Generator:
             str：完整 prompt 字符串
         """
         state_desc = state.to_prompt()
-        truncated = recent_content[-self.RECENT_CONTENT_LIMIT:] if recent_content else "（无）"
+        truncated = recent_content[-self.RECENT_CONTENT_LIMIT:] if recent_content else "(none)"
 
         intent_block = ""
         scope_warning = ""
         if section_intent is not None:
             intent_block = f"\n{section_intent.to_prompt_text()}\n"
             scope_warning = (
-                "\n【叙事范围强制约束】"
-                "本节只负责上述局部计划中的目标，严禁提前完整解决主要冲突或推进属于后续章节的情节。"
-                "本节结束时故事必须仍有未解决的张力留待后续章节处理。\n"
+                "\n[Scope boundary]"
+                " This section must handle only the goals in the section intent above. "
+                "Do not fully resolve the main conflict early or advance material that belongs to later sections. "
+                "When this section ends, unresolved tension should still remain for later sections.\n"
             )
 
         return (
-            "你是一个长文本生成系统。\n"
-            f"\n当前状态：\n{state_desc}"
+            "You are a long-form writing system.\n"
+            f"\nCurrent state:\n{state_desc}"
             f"{intent_block}"
             f"{scope_warning}"
-            f"\n最近内容：\n{truncated}"
-            f"\n\n当前任务：\n{task}"
-            "\n\n要求：请按照以下结构化格式提供你的响应。"
-            "返回一个 JSON 对象，包含以下字段："
-            "\n- decision: 本节的核心写作决策（字符串）"
-            "\n- reasoning: 推理过程和依据（字符串，可引用前文节点ID）"
-            "\n- expected_effect: 预期达到的叙事效果（字符串）"
-            "\n- confidence: 置信度数字，0.0 到 1.0 之间"
-            "\n- content: 纯叙事正文（字符串，禁止包含节ID、字数统计或任何元信息）"
-            "\n- referenced_section_ids: 引用的前文节点 ID 列表，如 ['sec1', 'sec2']（数组，可为空）"
+            f"\nRecent content:\n{truncated}"
+            f"\n\nCurrent task:\n{task}"
+            "\n\nReturn a JSON object with the following fields:"
+            "\n- decision: the core writing decision for this section"
+            "\n- reasoning: the reasoning behind that decision, optionally citing earlier section IDs"
+            "\n- expected_effect: the effect this section should achieve"
+            "\n- confidence: a number between 0.0 and 1.0"
+            "\n- content: the clean body text only, with no section IDs, word counts, or metadata"
+            "\n- referenced_section_ids: a list of cited earlier section IDs such as ['sec1', 'sec2']"
         )
 
     # ------------------------------------------------------------------
@@ -290,7 +290,7 @@ class Generator:
         fallback_content = self._extract_fallback_content(response)
         if fallback_content:
             decision = self._build_fallback_decision(state, section_intent, response)
-            self.logger.warning("fallback_decision_used: 使用正文兜底构造决策")
+            self.logger.warning("fallback_decision_used: constructed a fallback decision from body text")
             return fallback_content, decision
 
         raise ValueError("protocol_parse_failure: 无法提取正文")
@@ -320,7 +320,12 @@ class Generator:
         text = re.sub(r'<ref\s+id="[^"]*">.*?</ref>', '', text, flags=re.DOTALL)
 
         # 第三阶段：移除末尾的字数统计行
-        text = re.sub(r'\n*[字字数数]+[：:]\s*\d+[字]?\s*$', '', text.strip())
+        text = re.sub(
+            r'\n*(?:[字字数数]+|word count)[：:]\s*\d+[字]?\s*$',
+            '',
+            text.strip(),
+            flags=re.IGNORECASE,
+        )
 
         return text.strip()
 
@@ -343,9 +348,9 @@ class Generator:
         decision = Decision(
             timestamp=int(time.time()),
             decision_id="",
-            decision=decision_text or "结构化决策缺失，采用正文直出",
-            reasoning=reasoning or "模型未提供可解析的结构化推理",
-            expected_effect=expected_effect or "完成当前节的基本正文生成",
+            decision=decision_text or "Structured decision missing; using direct body text",
+            reasoning=reasoning or "The model did not provide parseable structured reasoning",
+            expected_effect=expected_effect or "Deliver the core body text for the current section",
             confidence=confidence,
             referenced_sections=referenced_sections,
             target_section=state.current_section,
@@ -418,9 +423,9 @@ class Generator:
         confidence: Optional[float] = None,
     ) -> Decision:
         """构造兜底决策对象，保证流程可继续"""
-        goal_hint = section_intent.local_goal if section_intent else f"完成 {state.current_section} 的内容"
-        decision_text = decision_text or "结构化决策缺失，采用正文直出"
-        reasoning = reasoning or "模型未提供可解析的结构化推理"
+        goal_hint = section_intent.local_goal if section_intent else f"Complete the content for {state.current_section}"
+        decision_text = decision_text or "Structured decision missing; using direct body text"
+        reasoning = reasoning or "The model did not provide parseable structured reasoning"
         expected_effect = expected_effect or goal_hint
         confidence = confidence if confidence is not None else 0.5
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import unittest
 
 from examples.benchmark_template import (
@@ -21,6 +22,25 @@ class BenchmarkTemplateTests(unittest.TestCase):
                 isinstance(item, str)
                 and item.startswith(DOCUMENT_LEVEL_CONSTRAINT_PREFIX)
                 for item in constraints
+            )
+        )
+        self.assertIn("language", config)
+        self.assertEqual(config["language"], "en")
+
+    def test_benchmark_task_is_english(self) -> None:
+        config = build_benchmark_task_config("med_s001")
+        task = config["task"]
+        reference = config["reference"]
+
+        self.assertIsInstance(task, str)
+        self.assertNotRegex(task, r"[\u4e00-\u9fff]")
+        self.assertIn("English", task)
+        self.assertIsInstance(reference, dict)
+        self.assertEqual(reference["language"], "en")
+        self.assertTrue(
+            all(
+                not re.search(r"[\u4e00-\u9fff]", item)
+                for item in reference["constraints"]["must_include"]
             )
         )
 

@@ -1,7 +1,7 @@
 """
-MetaWriter 项目入口。
+MetaWriter entry point.
 
-用法：
+Usage:
     python main.py
     python main.py --task survey_paper
     python main.py --task-id med_s010
@@ -40,41 +40,41 @@ BENCHMARK_TASK_PREFIX = "metabench_"
 
 def _parse_args() -> argparse.Namespace:
     """解析命令行参数。"""
-    parser = argparse.ArgumentParser(description="运行 MetaWriter 任务或 benchmark 样本")
+    parser = argparse.ArgumentParser(description="Run a MetaWriter task or benchmark sample")
     parser.add_argument(
         "-t",
         "--task",
         "--task-name",
         dest="task_name",
         type=str,
-        help="指定已注册任务名，例如 survey_paper、argumentative_essay 或 metabench_med_s010",
+        help="Run a registered task such as survey_paper, argumentative_essay, or metabench_med_s010",
     )
     parser.add_argument(
         "--task-id",
         type=str,
-        help="指定 benchmark 样本 ID，例如 med_s010",
+        help="Run a benchmark sample by ID, for example med_s010",
     )
     parser.add_argument(
         "--all",
         action="store_true",
-        help="批量运行全部 benchmark 样本，并对真实生成结果逐条评估",
+        help="Run all benchmark samples in batch mode and score each generated result",
     )
     parser.add_argument(
         "--list-tasks",
         action="store_true",
-        help="列出当前可用任务并退出",
+        help="List available tasks and exit",
     )
     parser.add_argument(
         "--print-response",
         action="store_true",
-        help="在终端打印完整生成文本；默认仅打印预览",
+        help="Print the full generated text in the terminal; otherwise only a preview is shown",
     )
     args = parser.parse_args()
 
     if args.all and (args.task_name or args.task_id):
-        parser.error("--all 不能与 --task/--task-name 或 --task-id 同时使用")
+        parser.error("--all cannot be combined with --task/--task-name or --task-id")
     if args.task_name and args.task_id:
-        parser.error("--task/--task-name 不能与 --task-id 同时使用")
+        parser.error("--task/--task-name cannot be combined with --task-id")
 
     return args
 
@@ -122,12 +122,12 @@ def _print_available_tasks() -> None:
     ]
     benchmark_task_ids = list_benchmark_task_ids()
 
-    print("可用普通任务：")
+    print("Available regular tasks:")
     for task_name in regular_tasks:
         print(f"  - {task_name}")
 
-    print("\n可用 benchmark 样本：")
-    print(f"  共 {len(benchmark_task_ids)} 个，可通过 --task-id 直接运行，例如：")
+    print("\nAvailable benchmark samples:")
+    print(f"  {len(benchmark_task_ids)} samples available. You can run one directly with --task-id, for example:")
     print("  python main.py --task-id med_s010")
     print("  python -m main --task-id med_s010")
     print("  python main.py --all")
@@ -138,7 +138,7 @@ def _load_runtime_settings() -> Dict[str, str | None]:
     load_dotenv(override=True)
     api_key = os.getenv("API_KEY")
     if not api_key:
-        raise EnvironmentError("请在 .env 文件中设置 API_KEY")
+        raise EnvironmentError("Please set API_KEY in the .env file")
 
     return {
         "api_key": api_key,
@@ -166,13 +166,13 @@ def _load_task_config(task_name: str) -> Dict[str, object]:
     """从任务注册表加载任务配置。"""
     if task_name not in TASK_REGISTRY:
         available_tasks = sorted(TASK_REGISTRY.keys())
-        raise KeyError(f"未知任务 '{task_name}'。可用任务：{available_tasks}")
+        raise KeyError(f"Unknown task '{task_name}'. Available tasks: {available_tasks}")
 
     config = TASK_REGISTRY[task_name]()
     required_fields = ("task", "constraints", "outline", "session_name")
     for field_name in required_fields:
         if field_name not in config:
-            raise KeyError(f"任务配置缺少字段：{field_name}")
+            raise KeyError(f"Task configuration is missing required field: {field_name}")
     return config
 
 
@@ -224,16 +224,16 @@ def _print_task_header(
 ) -> None:
     """打印任务基本信息。"""
     print("=" * 60)
-    print(f"MetaWriter | 任务：{task_name}")
+    print(f"MetaWriter | Task: {task_name}")
     benchmark_task_id = _extract_benchmark_task_id(task_name)
     if benchmark_task_id is not None:
-        print(f"Benchmark 样本：{benchmark_task_id}")
+        print(f"Benchmark sample: {benchmark_task_id}")
     print("=" * 60)
-    print(f"\n任务描述：{task_description}")
-    print(f"约束数量：{len(constraints)}")
+    print(f"\nTask description: {task_description}")
+    print(f"Constraint count: {len(constraints)}")
     for constraint in constraints:
         print(f"  - {constraint}")
-    print(f"\n大纲（{len(outline)} 个 section）：")
+    print(f"\nOutline ({len(outline)} sections):")
     for section_id, title in outline.items():
         print(f"  [{section_id}] {title}")
     print()
@@ -254,62 +254,62 @@ def _print_run_summary(
 ) -> None:
     """打印单次运行摘要。"""
     print("\n" + "=" * 60)
-    print("修正统计")
+    print("Correction Statistics")
     print("=" * 60)
-    print(f"  总 section 数：   {correction_stats['total_sections']}")
+    print(f"  Total sections:    {correction_stats['total_sections']}")
     print(
-        f"  首次成功：        {correction_stats['success_first_try']} "
+        f"  First-pass wins:   {correction_stats['success_first_try']} "
         f"({correction_stats['success_rate_first_try']:.1%})"
     )
-    print(f"  总重试次数：      {correction_stats['total_retries']}")
-    print(f"  总回退次数：      {correction_stats['total_rollbacks']}")
-    print(f"  彻底失败节数：    {correction_stats['total_failures']}")
-    print(f"  平均尝试次数：    {correction_stats['avg_attempts']:.2f}")
+    print(f"  Total retries:     {correction_stats['total_retries']}")
+    print(f"  Total rollbacks:   {correction_stats['total_rollbacks']}")
+    print(f"  Failed sections:   {correction_stats['total_failures']}")
+    print(f"  Avg attempts:      {correction_stats['avg_attempts']:.2f}")
 
     if correction_stats["total_rollbacks"] > 0:
-        print(f"  平均回退距离：    {correction_stats['avg_rollback_distance']:.1f} sections")
+        print(f"  Avg rollback span: {correction_stats['avg_rollback_distance']:.1f} sections")
 
     retry_by_action = correction_stats.get("retry_by_action", {})
     if isinstance(retry_by_action, dict) and retry_by_action:
-        print("\n策略使用分布：")
+        print("\nRepair Strategy Distribution:")
         for action, count in sorted(retry_by_action.items(), key=lambda item: -item[1]):
-            print(f"  {action}: {count} 次")
+            print(f"  {action}: {count} times")
 
-    print("\nDTG 统计：")
-    print(f"  决策总数：        {dtg_stats['total_decisions']}")
-    print(f"  意图节点数：      {dtg_stats['total_intent_nodes']}")
-    print(f"  平均置信度：      {dtg_stats['avg_confidence']:.3f}")
-    print(f"  平均引用数/决策： {dtg_stats['avg_references_per_decision']:.2f}")
-    print(f"  累计回退次数：    {dtg_stats['rollback_count']}")
+    print("\nDTG Statistics:")
+    print(f"  Total decisions:   {dtg_stats['total_decisions']}")
+    print(f"  Intent nodes:      {dtg_stats['total_intent_nodes']}")
+    print(f"  Avg confidence:    {dtg_stats['avg_confidence']:.3f}")
+    print(f"  Avg refs/decision: {dtg_stats['avg_references_per_decision']:.2f}")
+    print(f"  Rollback count:    {dtg_stats['rollback_count']}")
 
     g2 = metric_summary.get("g2_repair_efficiency", {})
     g3 = metric_summary.get("g3_memory_effectiveness", {})
-    print("\n评估指标：")
-    print(f"  首次通过率：      {g2.get('first_pass_rate', 'N/A')}")
-    print(f"  DSL 活跃条目数：  {g3.get('final_active_entries', 'N/A')}")
+    print("\nMetrics:")
+    print(f"  First-pass rate:   {g2.get('first_pass_rate', 'N/A')}")
+    print(f"  Active DSL items:  {g3.get('final_active_entries', 'N/A')}")
     if "memory_trust_level" in g3:
-        print(f"  DSL 信任度：      {g3['memory_trust_level']}")
+        print(f"  DSL trust level:   {g3['memory_trust_level']}")
 
-    print("\nLLM 统计：")
-    print(f"  总 token 数：     {llm_stats['total_tokens']:,}")
-    print(f"  请求次数：        {llm_stats['request_count']}")
+    print("\nLLM Statistics:")
+    print(f"  Total tokens:      {llm_stats['total_tokens']:,}")
+    print(f"  Request count:     {llm_stats['request_count']}")
 
     if benchmark_evaluation is not None:
-        print("\nBenchmark 评估：")
+        print("\nBenchmark Evaluation:")
         print(json.dumps(benchmark_evaluation, ensure_ascii=False, indent=2))
 
     if print_response:
         print("\n" + "=" * 60)
-        print(f"完整生成文本 | {task_name}")
+        print(f"Full Generated Text | {task_name}")
         print("=" * 60)
         print(final_text)
     elif show_preview:
         print("\n" + "=" * 60)
-        print("生成文本预览（前 500 字符）")
+        print("Generated Text Preview (first 500 characters)")
         print("=" * 60)
         print(final_text[:500] + ("..." if len(final_text) > 500 else ""))
 
-    print(f"\n运行摘要：{summary_file}")
+    print(f"\nRun summary: {summary_file}")
 
 
 def _run_single_task(
@@ -398,7 +398,7 @@ def _run_single_task(
                 "reason": "generation_degraded",
                 "details": {
                     "total_failures": correction_stats["total_failures"],
-                    "message": "存在生成失败 section，占位文本不纳入正式 benchmark 评分。",
+                    "message": "One or more sections failed generation, so degraded sections are excluded from formal benchmark scoring.",
                 },
             }
         benchmark_eval_file = output_dir / f"{session_name}_benchmark_eval.json"
@@ -502,13 +502,13 @@ def main() -> None:
     try:
         task_names = _resolve_requested_task_names(args)
     except Exception as exc:
-        print(f"参数错误：{exc}")
+        print(f"Argument error: {exc}")
         return
 
     try:
         runtime_settings = _load_runtime_settings()
     except Exception as exc:
-        print(f"环境配置错误：{exc}")
+        print(f"Environment configuration error: {exc}")
         return
 
     output_dir = Path("./outputs")
@@ -543,7 +543,7 @@ def main() -> None:
                 "traceback": traceback.format_exc(),
             }
             batch_results.append(error_result)
-            print(f"\n运行失败：{task_name}")
+            print(f"\nRun failed: {task_name}")
             print(error_result["traceback"])
             if not is_batch_mode:
                 return
@@ -554,21 +554,21 @@ def main() -> None:
         _write_json(batch_summary_file, batch_summary)
 
         print("\n" + "=" * 60)
-        print("Benchmark 批量运行完成")
+        print("Benchmark Batch Run Complete")
         print("=" * 60)
-        print(f"总任务数：{batch_summary['task_count']}")
-        print(f"成功数：  {batch_summary['success_count']}")
-        print(f"降级数：  {batch_summary['degraded_count']}")
-        print(f"失败数：  {batch_summary['failure_count']}")
+        print(f"Total tasks: {batch_summary['task_count']}")
+        print(f"Completed:   {batch_summary['success_count']}")
+        print(f"Degraded:    {batch_summary['degraded_count']}")
+        print(f"Failed:      {batch_summary['failure_count']}")
         average_scores = batch_summary["average_benchmark_scores"]
         if average_scores:
-            print(f"ECS 均值： {average_scores['entity_consistency_score']}")
-            print(f"LC 均值：  {average_scores['logical_coherence']}")
-            print(f"CVR 均值： {average_scores['constraint_violation_rate']}")
-        print(f"\n批量摘要：{batch_summary_file}")
+            print(f"Average ECS: {average_scores['entity_consistency_score']}")
+            print(f"Average LC:  {average_scores['logical_coherence']}")
+            print(f"Average CVR: {average_scores['constraint_violation_rate']}")
+        print(f"\nBatch summary: {batch_summary_file}")
 
         if batch_failed:
-            print("\n批量运行中存在失败任务，请检查上面的 traceback 和 summary。")
+            print("\nSome tasks failed during the batch run. Check the tracebacks and summaries above.")
 
 
 if __name__ == "__main__":

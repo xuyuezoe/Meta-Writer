@@ -135,29 +135,28 @@ class SectionPlanner:
             str：完整 prompt 字符串
         """
         summaries_block = (
-            f"已完成章节摘要：\n{section_summaries}\n\n"
+            f"Completed section summaries:\n{section_summaries}\n\n"
             if section_summaries
             else ""
         )
         dsl_block = (
-            f"当前话语状态（按显著性筛选的前 8 条）：\n{dsl_context}\n\n"
+            f"Current DSL state (top 8 entries by salience):\n{dsl_context}\n\n"
             if dsl_context
             else ""
         )
 
         return (
-            "根据以下信息，为即将生成的章节制定局部计划。"
-            "请只输出一个 JSON 对象，不要 markdown 代码块、不要 XML、不要额外解释。\n\n"
-            f"任务目标：{task_description}\n"
-            f"本节大纲职责：{section_title}\n\n"
+            "Create a local plan for the section that will be written next. "
+            "Output only one JSON object. Do not use markdown code fences, XML, or extra explanation.\n\n"
+            f"Task goal: {task_description}\n"
+            f"Section responsibility: {section_title}\n\n"
             f"{dsl_block}"
             f"{summaries_block}"
-            "【重要原则】\n"
-            "1. 本节局部计划必须严格限定在本节大纲职责范围内，不得规划属于后续章节的内容。\n"
-            "2. 如果故事中存在主要冲突，本节应推进该冲突，但不得在本节内完整解决；"
-            "除非本节大纲明确标注为结局节。\n"
-            "3. 已完成章节中已处理的内容不应在本节重复叙述。\n\n"
-            "输出格式（严格 JSON）：\n"
+            "[Important principles]\n"
+            "1. Keep the local plan strictly inside this section's responsibility; do not plan material that belongs to later sections.\n"
+            "2. If there is a main conflict, this section may advance it but must not fully resolve it unless the outline explicitly marks this section as the ending.\n"
+            "3. Do not repeat content that has already been handled in completed sections.\n\n"
+            "Output format (strict JSON):\n"
             "{\n"
             "  \"local_goal\": \"...\",\n"
             "  \"scope_boundary\": \"...\",\n"
@@ -166,7 +165,7 @@ class SectionPlanner:
             "  \"risks_to_avoid\": [\"...\"],\n"
             "  \"success_criteria\": [\"...\"]\n"
             "}\n"
-            "若无内容，数组字段必须返回 []，不要写 \"无\"；不要输出 markdown 代码块。"
+            "If a list field is empty, return []. Do not write \"none\". Do not output markdown code fences."
         )
 
     def _parse_intent(
@@ -205,12 +204,12 @@ class SectionPlanner:
                 return [str(item).strip() for item in value if str(item).strip()]
             return []
 
-        local_goal = str(data.get("local_goal", "")).strip() or f"完成 {section_id} 节的内容生成"
+        local_goal = str(data.get("local_goal", "")).strip() or f"Complete the content for section {section_id}"
         scope_boundary = str(data.get("scope_boundary", "")).strip()
         open_loops = _norm_list(data.get("open_loops_to_advance"))
         commitments = _norm_list(data.get("commitments_to_maintain"))
         risks = _norm_list(data.get("risks_to_avoid"))
-        success_criteria = _norm_list(data.get("success_criteria")) or ["内容符合节目标，无严重约束违反"]
+        success_criteria = _norm_list(data.get("success_criteria")) or ["The content matches the section goal and does not violate major constraints."]
 
         return SectionIntent.create(
             section_id=section_id,
@@ -266,12 +265,12 @@ class SectionPlanner:
         """构造保守默认 SectionIntent"""
         return SectionIntent.create(
             section_id=section_id,
-            local_goal=f"完成 {section_id} 节的内容生成",
+            local_goal=f"Complete the content for section {section_id}",
             scope_boundary="",
             open_loops_to_advance=[],
             commitments_to_maintain=[],
             risks_to_avoid=[],
-            success_criteria=["内容符合节目标，无严重约束违反"],
+            success_criteria=["The content matches the section goal and does not violate major constraints."],
             source_dsl_entry_ids=source_dsl_entry_ids,
             dsl_trust_at_generation=dsl_trust_at_generation,
         )

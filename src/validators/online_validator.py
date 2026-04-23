@@ -21,7 +21,7 @@ import logging
 import re
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
-from examples.benchmark_template import DOCUMENT_LEVEL_CONSTRAINT_PREFIX
+from examples.benchmark_template import is_document_level_constraint
 
 from ..core.decision import Decision
 from ..core.meta_state import MetaState
@@ -162,7 +162,7 @@ class OnlineValidator:
                 issues.append(Issue(
                     type="constraint",
                     severity=IssueSeverity.MAJOR.value,
-                    description=f"违反约束：{v}",
+                    description=f"Constraint violated: {v}",
                     location=section_id,
                 ))
             constraint_passed = not bool(constraint_violations)
@@ -212,7 +212,7 @@ class OnlineValidator:
                     type="alignment",
                     severity=severity,
                     description=(
-                        f"决策-内容对齐度不足（DCAS={dcas_score:.3f} < {self.THRESHOLD_DCAS}）"
+                        f"Decision-content alignment is too low (DCAS={dcas_score:.3f} < {self.THRESHOLD_DCAS})"
                     ),
                     location=section_id,
                 ))
@@ -309,13 +309,13 @@ class OnlineValidator:
             issues.append(Issue(
                 type="format",
                 severity=IssueSeverity.MAJOR.value,
-                description=f"内容过短（{char_count} 字符 < {self._MIN_CHARS}）",
+                description=f"Content is too short ({char_count} characters < {self._MIN_CHARS})",
             ))
         elif char_count > self._MAX_CHARS:
             issues.append(Issue(
                 type="format",
                 severity=IssueSeverity.MINOR.value,
-                description=f"内容过长（{char_count} 字符 > {self._MAX_CHARS}）",
+                description=f"Content is too long ({char_count} characters > {self._MAX_CHARS})",
             ))
 
         leftover_tags = re.findall(
@@ -325,7 +325,7 @@ class OnlineValidator:
             issues.append(Issue(
                 type="format",
                 severity=IssueSeverity.CRITICAL.value,
-                description=f"内容包含残留 XML 标签：{set(leftover_tags)}",
+                description=f"Content still contains XML tags: {set(leftover_tags)}",
             ))
 
         return issues
@@ -409,15 +409,15 @@ class OnlineValidator:
         # 目的：
         #   这些约束本来就是给整篇输出用的，如果在单节即时校验里逐条拦截，
         #   会把“研究范围”“局限性”这类全文锚点错误地压到 sec2/sec3 上。
-        if constraint.startswith(DOCUMENT_LEVEL_CONSTRAINT_PREFIX):
+        if is_document_level_constraint(constraint):
             return True, None
 
         # 规则1：字数/篇幅类 → 整篇目标，单节直接通过
-        if re.search(r'\d+\s*[字词]|字数|篇幅|字以内|字左右|字以上', constraint):
+        if re.search(r'\d+\s*(?:[字词]|words?)|字数|篇幅|字以内|字左右|字以上|length|paragraph', constraint, re.IGNORECASE):
             return True, None
 
         # 规则2：情节/事件类 → 故事整体要求，单节不强制
-        if re.search(r'包含|必须包含|需要包含|出现|发生|有一个|存在|结局|结尾|必须有|要有', c_lower):
+        if re.search(r'包含|必须包含|需要包含|出现|发生|有一个|存在|结局|结尾|必须有|要有|include|appear|mention|ending|conclusion', c_lower):
             return True, None
 
         # 规则3：实体/属性类 → 提取关键实体，在内容中命中即通过
@@ -427,10 +427,11 @@ class OnlineValidator:
 
         # 规则4：LLM 兜底（无法判断也需显式返回 UNKNOWN）
         prompt = (
-            "判断章节内容是否直接违反下列约束。只回答 true 或 false，"
-            "true=满足，false=违反，不要解释，也不要添加其他文字。\n\n"
-            f"约束：{constraint}\n"
-            f"内容：{content[:400]}\n"
+            "Decide whether the section content directly violates the constraint below. "
+            "Reply with only true or false. true means satisfied; false means violated. "
+            "Do not add explanations or extra text.\n\n"
+            f"Constraint: {constraint}\n"
+            f"Content: {content[:400]}\n"
         )
         try:
             response = self.llm.generate(
@@ -616,12 +617,13 @@ class OnlineValidator:
 
         context_hint = "\n".join(prev_snippets)
         prompt = (
-            "检查新内容与已有章节是否存在明确矛盾或叙事重复。"
-            "使用 JSON 回复，例如 {\"entity_consistency\": true, ...}，"
-            "字段分别为 entity_consistency / timeline_consistency / setting_consistency / narrative_progress。"
-            "true=通过，false=存在问题，不要输出 markdown 代码块或额外文本。\n\n"
-            f"已有章节片段：\n{context_hint}\n\n"
-            f"新生成内容：{content[:500]}"
+            "Check whether the new content contains clear contradictions or narrative repetition "
+            "relative to the existing sections. Reply with JSON such as "
+            "{\"entity_consistency\": true, ...}. The required fields are "
+            "entity_consistency, timeline_consistency, setting_consistency, and narrative_progress. "
+            "Use true for pass and false for an issue. Do not output markdown code fences or extra text.\n\n"
+            f"Existing section snippets:\n{context_hint}\n\n"
+            f"New content:\n{content[:500]}"
         )
 
         issues: List[Issue] = []
@@ -638,10 +640,10 @@ class OnlineValidator:
                 },
             )
             checks = {
-                "entity_consistency":   ("实体属性矛盾",   IssueSeverity.MINOR.value),
-                "timeline_consistency": ("时间线不连贯",   IssueSeverity.MINOR.value),
-                "setting_consistency":  ("设定前后冲突",   IssueSeverity.MINOR.value),
-                "narrative_progress":   ("叙事重复已有章节", IssueSeverity.MINOR.value),
+                "entity_consistency":   ("Entity attributes are inconsistent",   IssueSeverity.MINOR.value),
+                "timeline_consistency": ("Timeline is not coherent",   IssueSeverity.MINOR.value),
+                "setting_consistency":  ("Setting conflicts with earlier sections",   IssueSeverity.MINOR.value),
+                "narrative_progress":   ("Narrative progress repeats earlier sections", IssueSeverity.MINOR.value),
             }
             flags = self._parse_consistency_flags(response, list(checks.keys()))
             for tag, (label, severity) in checks.items():
