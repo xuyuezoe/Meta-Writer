@@ -50,7 +50,7 @@ python main.py --all
 python -m main --task-id med_s010
 ```
 
-默认情况下，`python main.py` / `python -m main` 会运行 `metabench_med_s001`，也就是正式 benchmark 主链路中的一个样本，方便直接做真实链路烟雾验证。
+默认情况下，`python main.py` / `python -m main` 会直接运行完整的 metabench 批量任务，也就是与 `--all` 相同的正式 benchmark 主链路。
 
 ### 5. 查看结果
 
