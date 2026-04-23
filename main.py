@@ -32,9 +32,8 @@ from examples.tasks import TASK_REGISTRY
 
 
 # 目的：
-#   保持 `python main.py` 无参数时也能直接走正式 benchmark 主链路，
-#   让团队做烟雾验证时优先验证真实接入，而不是退回到早期 demo。
-TASK_NAME = os.getenv("TASK_NAME", "metabench_med_s001")
+#   保持 `python main.py` 无参数时直接跑完整 benchmark 主链路，
+#   让默认入口与正式批量评测行为保持一致。
 BENCHMARK_TASK_PREFIX = "metabench_"
 
 
@@ -98,9 +97,12 @@ def _extract_benchmark_task_id(task_name: str) -> str | None:
 def _resolve_requested_task_names(args: argparse.Namespace) -> List[str]:
     """根据 CLI 参数解析实际要运行的任务名列表。"""
     benchmark_task_ids = list_benchmark_task_ids()
+    benchmark_task_names = [
+        _benchmark_task_name(task_id) for task_id in benchmark_task_ids
+    ]
 
     if args.all:
-        return [_benchmark_task_name(task_id) for task_id in benchmark_task_ids]
+        return benchmark_task_names
 
     if args.task_id:
         if args.task_id not in benchmark_task_ids:
@@ -110,7 +112,7 @@ def _resolve_requested_task_names(args: argparse.Namespace) -> List[str]:
     if args.task_name:
         return [args.task_name]
 
-    return [TASK_NAME]
+    return benchmark_task_names
 
 
 def _print_available_tasks() -> None:
