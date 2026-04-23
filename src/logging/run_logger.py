@@ -300,6 +300,83 @@ class RunLogger:
         self._write(f"[POSTPROCESS] 节 {section_id} 跳过后处理，原因：{reason}")
         self._write("")
 
+    def log_dsl_relation_stats(
+        self,
+        section_id: str,
+        new_entries: int,
+        stats: Dict[str, Any],
+    ) -> None:
+        """记录 section 级 DSL 关系判断统计。"""
+        time_cost_ms = int(stats.get("time_cost_ms", 0))
+        self._write("[DSL RELATION]")
+        self._write(f"  section={section_id}")
+        self._write(f"  new_entries={new_entries}")
+        self._write(f"  raw_pairs_checked={stats.get('raw_pairs_checked', 0)}")
+        self._write(f"  pairs_dedup_skipped={stats.get('pairs_dedup_skipped', 0)}")
+        self._write(f"  pairs_prefilter_none={stats.get('pairs_prefilter_none', 0)}")
+        self._write(f"  pairs_cache_hit={stats.get('pairs_cache_hit', 0)}")
+        self._write(f"  pairs_enqueued={stats.get('pairs_enqueued', 0)}")
+        self._write(f"  pairs_sent_to_llm={stats.get('pairs_sent_to_llm', 0)}")
+        self._write(f"  pairs_none_llm={stats.get('pairs_none_llm', 0)}")
+        self._write(f"  pairs_supports={stats.get('pairs_supports', 0)}")
+        self._write(f"  pairs_conflicts={stats.get('pairs_conflicts', 0)}")
+        self._write(f"  pairs_resolves={stats.get('pairs_resolves', 0)}")
+        self._write(f"  remaining_queue={stats.get('remaining_queue', 0)}")
+        self._write(f"  time_cost={time_cost_ms / 1000.0:.2f}s")
+        self._write("")
+
+    def log_dsl_gate_pair(
+        self,
+        section_id: str,
+        source_id: str,
+        target_id: str,
+        keep: bool,
+        gate_score: float,
+        signals: Dict[str, Any],
+        note: str,
+        source_type: str = "-",
+        target_type: str = "-",
+        source_content: str = "",
+        target_content: str = "",
+    ) -> None:
+        """记录门一对单个 pair 的判定过程。"""
+        self._write("[DSL GATE]")
+        self._write(f"  section={section_id}")
+        self._write(f"  source_id={source_id}")
+        self._write(f"  source_type={source_type}")
+        self._write(f"  source_content={source_content}")
+        self._write(f"  target_id={target_id}")
+        self._write(f"  target_type={target_type}")
+        self._write(f"  target_content={target_content}")
+        self._write(f"  decision={'keep' if keep else 'drop'}")
+        self._write(f"  gate_score={gate_score:.3f}")
+        try:
+            serialized = json.dumps(signals, ensure_ascii=False, sort_keys=True)
+        except Exception:
+            serialized = str(signals)
+        self._write(f"  signals={serialized}")
+        self._write(f"  note={note}")
+        self._write("")
+
+    def log_dsl_relation_result(
+        self,
+        section_id: str,
+        source_id: str,
+        target_id: str,
+        relation_type: str,
+        confidence: float,
+        applied: bool,
+    ) -> None:
+        """记录门二对单个 pair 的关系结果。"""
+        self._write("[DSL RESULT]")
+        self._write(f"  section={section_id}")
+        self._write(f"  source_id={source_id}")
+        self._write(f"  target_id={target_id}")
+        self._write(f"  relation_type={relation_type}")
+        self._write(f"  confidence={confidence:.3f}")
+        self._write(f"  applied={'yes' if applied else 'no'}")
+        self._write("")
+
     # ------------------------------------------------------------------
     # 尝试级别日志
     # ------------------------------------------------------------------

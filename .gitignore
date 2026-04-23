@@ -25,6 +25,7 @@ ENV/
 .idea/
 .vscode/
 .claude/
+.codex
 *.swp
 *.swo
 
@@ -39,6 +40,7 @@ ENV/
 # 运行时由代码自动创建，无需纳入版本管理
 sessions/
 outputs/
+metabench/output/
 
 # ===========================================
 # OS
@@ -59,3 +61,12 @@ HOTFIX_THINKING_MODELS.md
 HOTFIX_V2_RESPONSE_FORMAT.md
 STRUCTURED_OUTPUT_MIGRATION.md
 change.md
+change_lan.md
+dsl_change.md
+
+# ===========================================
+# 测试 / 覆盖率缓存
+# ===========================================
+.pytest_cache/
+.coverage
+htmlcov/

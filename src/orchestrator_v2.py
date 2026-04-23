@@ -60,30 +60,36 @@ class SelfCorrectingOrchestrator:
     MAX_RETRIES_PER_SECTION = 3
     MAX_ROLLBACKS = 5
     DCAS_THRESHOLD = 0.6
+    DSL_RELATION_MAX_PAIRS_PER_SECTION = 8
+    DSL_RELATION_BATCH_SIZE = 4
+    DSL_RELATION_MIN_CONFIDENCE = 0.5
 
     def __init__(
         self,
         llm_client,
         memory_path: str = "./sessions",
         session_name: str = "session",
+        output_dir: str = "./outputs",
     ):
         """
         初始化自我修正协调器
 
         功能：
             创建并连接所有子组件，MetaState 初始化为信任状态。
+            同时把 output_dir 传给 RunLogger，保证主入口与运行日志落盘目录一致。
 
         参数：
             llm_client: LLM 客户端实例
             memory_path: DTG 存储路径
             session_name: 会话名称
+            output_dir: 输出目录（运行日志和相关工件的统一落盘位置）
         """
         self.dtg              = DTGStore(memory_path, session_name=session_name)
         self.meta_state       = MetaState()
-        self.dsl              = DiscourseLedger(llm_client=llm_client)
         self.console          = Console()
         self.logger           = logging.getLogger(__name__)
-        self.run_logger       = RunLogger(output_dir="./outputs", session_name=session_name)
+        self.run_logger       = RunLogger(output_dir=output_dir, session_name=session_name)
+        self.dsl              = DiscourseLedger(llm_client=llm_client, run_logger=self.run_logger)
 
         llm_client.attach_run_logger(self.run_logger)
 
@@ -640,6 +646,14 @@ class SelfCorrectingOrchestrator:
         except Exception as e:
             self.logger.warning("承诺提取失败（跳过）：%s", e)
 
+        relation_stats = self.dsl.process_pending_relations(
+            section_id=section_id,
+            max_pairs=self.DSL_RELATION_MAX_PAIRS_PER_SECTION,
+            batch_size=self.DSL_RELATION_BATCH_SIZE,
+            confidence_threshold=self.DSL_RELATION_MIN_CONFIDENCE,
+        )
+        self._log_dsl_relation_stats(section_id, len(new_entries), relation_stats)
+
         # 更新 DSL 稳定性
         self.dsl.update_entry_stability(section_id, state.generated_sections)
 
@@ -685,6 +699,48 @@ class SelfCorrectingOrchestrator:
         self.logger.info("postprocess_skipped: section=%s reason=%s", section_id, reason)
         if getattr(self, "run_logger", None) is not None:
             self.run_logger.log_postprocess_skipped(section_id, reason)
+
+    def _log_dsl_relation_stats(
+        self,
+        section_id: str,
+        new_entries: int,
+        stats: Dict[str, Any],
+    ) -> None:
+        """输出 section 级 DSL 关系统计。"""
+        time_cost_ms = int(stats.get("time_cost_ms", 0))
+        self.logger.info(
+            "[DSL RELATION]\n"
+            "  section=%s\n"
+            "  new_entries=%s\n"
+            "  raw_pairs_checked=%s\n"
+            "  pairs_dedup_skipped=%s\n"
+            "  pairs_prefilter_none=%s\n"
+            "  pairs_cache_hit=%s\n"
+            "  pairs_enqueued=%s\n"
+            "  pairs_sent_to_llm=%s\n"
+            "  pairs_none_llm=%s\n"
+            "  pairs_supports=%s\n"
+            "  pairs_conflicts=%s\n"
+            "  pairs_resolves=%s\n"
+            "  remaining_queue=%s\n"
+            "  time_cost=%.2fs",
+            section_id,
+            new_entries,
+            stats.get("raw_pairs_checked", 0),
+            stats.get("pairs_dedup_skipped", 0),
+            stats.get("pairs_prefilter_none", 0),
+            stats.get("pairs_cache_hit", 0),
+            stats.get("pairs_enqueued", 0),
+            stats.get("pairs_sent_to_llm", 0),
+            stats.get("pairs_none_llm", 0),
+            stats.get("pairs_supports", 0),
+            stats.get("pairs_conflicts", 0),
+            stats.get("pairs_resolves", 0),
+            stats.get("remaining_queue", 0),
+            time_cost_ms / 1000.0,
+        )
+        if getattr(self, "run_logger", None) is not None:
+            self.run_logger.log_dsl_relation_stats(section_id, new_entries, stats)
 
 
     def _execute_rollback(
@@ -877,20 +933,23 @@ class SelfCorrectingOrchestrator:
     def _print_section_start(
         self, section_id: str, title: str, idx: int, total: int
     ) -> None:
+        # 目的：
+        #   Windows 上常见的 gbk 控制台无法稳定输出 ▶ / — 等字符。
+        #   这里统一改用 ASCII，避免真实 benchmark 运行因为打印阶段报编码错而中断。
         self.console.print(
-            f"\n[bold blue]▶ [{idx+1}/{total}] {section_id}[/bold blue] — {title}"
+            f"\n[bold blue][{idx+1}/{total}] {section_id}[/bold blue] - {title}"
         )
 
     def _print_success(self, section_id: str, attempt: int, dcas: float) -> None:
         attempt_str = f"(第 {attempt} 次)" if attempt > 1 else "(一次通过)"
         self.console.print(
-            f"  [green]✓ {section_id} 通过 {attempt_str} DCAS={dcas:.3f}[/green]"
+            f"  [green][OK] {section_id} 通过 {attempt_str} DCAS={dcas:.3f}[/green]"
         )
 
     def _print_failure(self, section_id: str, attempt: int, diagnosis, report) -> None:
         issues_str = " | ".join(i.description[:40] for i in report.issues[:3])
         self.console.print(
-            f"  [yellow]✗ {section_id} 第 {attempt} 次失败 → "
+            f"  [yellow][FAIL] {section_id} 第 {attempt} 次失败 -> "
             f"{diagnosis.repair_scope}({diagnosis.error_tier.value}/"
             f"{diagnosis.error_source.value})[/yellow]\n"
             f"    [dim]{issues_str}[/dim]"

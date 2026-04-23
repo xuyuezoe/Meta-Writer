@@ -12,9 +12,11 @@
 """
 from __future__ import annotations
 
+import json
+import logging
 import re
 import time
-from typing import Dict, List, Optional, Set, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple
 
 from ..core.ledger import (
     CommitmentType,
@@ -22,7 +24,8 @@ from ..core.ledger import (
     EntryRelation,
     LedgerEntry,
 )
-from ..utils.llm_client import LLMClient
+if TYPE_CHECKING:
+    from ..utils.llm_client import LLMClient
 
 
 class DiscourseLedger:
@@ -32,27 +35,23 @@ class DiscourseLedger:
     功能：
         1. 管理 LedgerEntry 对象的生命周期（写入、撤销、解析、更新稳定性）
         2. 维护 EntryRelation 图，支持级联撤销、冲突传播、OPEN_LOOP 自动闭合
-        3. 在入账前用候选剪枝规则（R1-R4）过滤候选对，再触发 LLM 关系判断
+        3. 在 section 级别批量处理关系判断，避免逐 pair 同步阻塞
         4. 运行时计算每条可注入条目的 salience_score，返回前 K 条用于 prompt 注入
         5. 支持整节回退（rollback）和精确记忆清除（purge）
-
-    参数：
-        llm_client: 用于关系提取的 LLM 客户端（可为 None，关系提取退化为规则模式）
-        max_inject_entries: 每次注入的最大条目数（默认 8）
-
-    关键实现细节：
-        关系提取只对 COMMITMENT 和 OPEN_LOOP 类型执行。
-        HYPOTHESIS 类型不注入 prompt。
-        salience_score 运行时计算，不静态存储在 LedgerEntry 中。
     """
 
     def __init__(
         self,
         llm_client: Optional[LLMClient] = None,
         max_inject_entries: int = 8,
+        candidate_score_threshold: float = 1.0,
+        run_logger=None,
     ):
         self._llm_client = llm_client
         self.max_inject_entries = max_inject_entries
+        self.candidate_score_threshold = candidate_score_threshold
+        self._run_logger = run_logger
+        self.logger = logging.getLogger(__name__)
 
         # 主存储：entry_id → LedgerEntry
         self._entries: Dict[str, LedgerEntry] = {}
@@ -66,30 +65,28 @@ class DiscourseLedger:
         # 历史失败关联：entry_id → 失败次数（用于 salience failure_history 因子）
         self._failure_associations: Dict[str, int] = {}
 
+        # section 内待处理关系队列
+        self._pending_relation_pairs: List[Tuple[str, str]] = []
+        self._pending_relation_keys: Set[Tuple[str, str]] = set()
+        self._relation_result_cache: Dict[Tuple[str, str], Tuple[str, float]] = {}
+
+        self._relation_stats_total = self._new_relation_stats()
+        self._relation_stats_window = self._new_relation_stats()
+
     # ------------------------------------------------------------------
     # 第一阶段：条目写入
     # ------------------------------------------------------------------
 
     def add_entry(self, entry: LedgerEntry) -> List[str]:
         """
-        写入新账本条目，并触发关系提取（如适用）
+        写入新账本条目，并为关系层生成候选与入队。
 
         功能：
             1. 写入前检测与现有条目的 conflicts 关系
             2. 写入条目
-            3. 若类型为 COMMITMENT 或 OPEN_LOOP，对候选对执行关系提取
-            4. 若新条目与某 OPEN_LOOP 存在 resolves 关系，自动闭合
-
-        参数：
-            entry: 待写入的账本条目
-
-        返回值：
-            List[str]：写入过程中检测到的冲突描述列表（空列表表示无冲突）
-
-        关键实现细节：
-            冲突检测使用已有 conflicts 关系扫描，不额外触发 LLM。
+            3. 若类型为 COMMITMENT 或 OPEN_LOOP，对候选对执行预筛与入队
+            4. 不在 add_entry() 中触发 LLM 关系判断
         """
-        # 第一步：冲突检测（扫描现有 conflicts 关系）
         conflict_warnings: List[str] = []
         existing_conflicts = self._find_existing_conflicts(entry)
         for conflicting_id in existing_conflicts:
@@ -99,34 +96,77 @@ class DiscourseLedger:
                     f"新条目与 [{conflicting_id}] 存在冲突：{conflicting.content[:60]}"
                 )
 
-        # 第二步：写入
         self._entries[entry.entry_id] = entry
         self._relations.setdefault(entry.entry_id, [])
         self._relations_by_target.setdefault(entry.entry_id, [])
 
-        # 第三步：关系提取（仅 COMMITMENT 和 OPEN_LOOP）
         if entry.commitment_type in (CommitmentType.COMMITMENT, CommitmentType.OPEN_LOOP):
-            candidates = self._get_relation_candidates(entry)
-            for candidate_id in candidates:
-                self._extract_relation(entry.entry_id, candidate_id)
+            for eid, existing in self._entries.items():
+                if eid == entry.entry_id or not existing.is_active():
+                    continue
+                self._bump_relation_stat("raw_pairs_checked")
+                keep, gate_score, signals = self._gate_relation_pair(entry, existing)
+                source_id, target_id = self._canonicalize_pair_direction(entry.entry_id, eid)
+                pair_key = self._make_pair_key(source_id, target_id)
 
-        # 第四步：检查此条目是否自动闭合某个 OPEN_LOOP
-        self._check_resolves_open_loops(entry)
+                if pair_key in self._pending_relation_keys:
+                    self._bump_relation_stat("pairs_dedup_skipped")
+                    self._log_gate_decision(
+                        section_id=entry.source_section,
+                        source_id=source_id,
+                        target_id=target_id,
+                        keep=False,
+                        gate_score=gate_score,
+                        signals=signals,
+                        note="dedup_skipped",
+                    )
+                    continue
+
+                if pair_key in self._relation_result_cache:
+                    self._bump_relation_stat("pairs_cache_hit")
+                    cached = self._relation_result_cache[pair_key]
+                    self._log_gate_decision(
+                        section_id=entry.source_section,
+                        source_id=source_id,
+                        target_id=target_id,
+                        keep=False,
+                        gate_score=gate_score,
+                        signals=signals,
+                        note=f"cache_hit:{cached[0]}@{cached[1]:.2f}",
+                    )
+                    continue
+
+                if keep:
+                    self._pending_relation_pairs.append((source_id, target_id))
+                    self._pending_relation_keys.add(pair_key)
+                    self._bump_relation_stat("pairs_enqueued")
+                    self._log_gate_decision(
+                        section_id=entry.source_section,
+                        source_id=source_id,
+                        target_id=target_id,
+                        keep=True,
+                        gate_score=gate_score,
+                        signals=signals,
+                        note="enqueued",
+                    )
+                else:
+                    self._relation_result_cache[pair_key] = ("none_prefilter", 1.0)
+                    self._bump_relation_stat("pairs_prefilter_none")
+                    self._log_gate_decision(
+                        section_id=entry.source_section,
+                        source_id=source_id,
+                        target_id=target_id,
+                        keep=False,
+                        gate_score=gate_score,
+                        signals=signals,
+                        note="none_prefilter",
+                    )
 
         return conflict_warnings
 
     def _find_existing_conflicts(self, new_entry: LedgerEntry) -> List[str]:
         """
-        扫描现有关系图，找到与 new_entry 内容可能冲突的条目 ID
-
-        功能：
-            使用 R1（关键词重叠）快速筛选候选，再检查已有 conflicts 边。
-
-        参数：
-            new_entry: 待入账的新条目
-
-        返回值：
-            List[str]：与新条目存在 conflicts 关系的现有条目 ID 列表
+        扫描现有关系图，找到与 new_entry 内容可能冲突的条目 ID。
         """
         new_keywords = self._extract_keywords(new_entry.content)
         conflicting: List[str] = []
@@ -143,167 +183,346 @@ class DiscourseLedger:
         return conflicting
 
     # ------------------------------------------------------------------
-    # 第二阶段：候选剪枝与关系提取
+    # 第二阶段：候选召回、预筛与批处理
     # ------------------------------------------------------------------
 
-    def _get_relation_candidates(self, entry: LedgerEntry) -> List[str]:
+    def _get_type_pair_bonus(self, a: LedgerEntry, b: LedgerEntry) -> float:
+        if a.commitment_type == CommitmentType.COMMITMENT and b.commitment_type == CommitmentType.OPEN_LOOP:
+            return 1.0
+        if a.commitment_type == CommitmentType.OPEN_LOOP and b.commitment_type == CommitmentType.COMMITMENT:
+            return 1.0
+        if a.commitment_type == CommitmentType.COMMITMENT and b.commitment_type == CommitmentType.COMMITMENT:
+            return 0.5
+        return 0.0
+
+    def _make_pair_key(self, a: str, b: str) -> Tuple[str, str]:
+        return tuple(sorted((a, b)))
+
+    def _canonicalize_pair_direction(self, a: str, b: str) -> Tuple[str, str]:
         """
-        使用 R1-R4 规则筛选与 entry 可能存在关系的候选条目 ID
+        统一关系判定方向。
 
-        功能：
-            在触发 LLM 判断之前，用纯规则方法降低候选集规模，节省 LLM 开销。
-
-        候选剪枝规则（满足任一即进入候选集）：
-            R1 关键词重叠：Jaccard > 0.2
-            R2 实体重叠：共享至少一个大写词（简单命名实体近似）
-            R3 时间临近：introduced_at 相差不超过 2 节（以秒估算，每节约 60s）
-            R4 同线索关联：两条目均引用同一 OPEN_LOOP 的 entry_id
-
-        参数：
-            entry: 当前待判断的新条目
-
-        返回值：
-            List[str]：进入 LLM 关系判断的候选条目 ID 列表（不包含 entry 自身）
+        说明：
+            该方向不是纯语义方向，而是语义规则与流水线时序规则的组合。
+            当前主要目标是稳定可计算，而不是构建绝对语义真图。
         """
-        entry_keywords = self._extract_keywords(entry.content)
-        entry_entities = self._extract_entities(entry.content)
-        candidates: Set[str] = set()
+        entry_a = self._entries.get(a)
+        entry_b = self._entries.get(b)
+        if not entry_a or not entry_b:
+            return a, b
 
-        for eid, existing in self._entries.items():
-            if eid == entry.entry_id or not existing.is_active():
-                continue
+        if (
+            entry_a.commitment_type == CommitmentType.COMMITMENT
+            and entry_b.commitment_type == CommitmentType.OPEN_LOOP
+        ):
+            return a, b
+        if (
+            entry_a.commitment_type == CommitmentType.OPEN_LOOP
+            and entry_b.commitment_type == CommitmentType.COMMITMENT
+        ):
+            return b, a
+        return a, b
 
-            # R1：关键词重叠
-            existing_keywords = self._extract_keywords(existing.content)
-            if self._jaccard(entry_keywords, existing_keywords) > 0.2:
-                candidates.add(eid)
-                continue
+    def _gate_relation_pair(
+        self,
+        new_entry: LedgerEntry,
+        existing_entry: LedgerEntry,
+    ) -> Tuple[bool, float, Dict[str, float]]:
+        new_text = new_entry.content.strip()
+        existing_text = existing_entry.content.strip()
+        if self._is_too_short_noise_pair(new_text, existing_text):
+            return False, 0.0, {
+                "term_overlap_score": 0.0,
+                "term_score": 0.0,
+                "type_bonus": 0.0,
+                "hard_drop": 1.0,
+                "hard_drop_short": 1.0,
+                "hard_drop_template": 0.0,
+            }
+        if self._is_template_noise_pair(new_text, existing_text):
+            return False, 0.0, {
+                "term_overlap_score": 0.0,
+                "term_score": 0.0,
+                "type_bonus": 0.0,
+                "hard_drop": 1.0,
+                "hard_drop_short": 0.0,
+                "hard_drop_template": 1.0,
+            }
 
-            # R2：实体重叠
-            existing_entities = self._extract_entities(existing.content)
-            if entry_entities & existing_entities:
-                candidates.add(eid)
-                continue
+        term_overlap_score = self._compute_term_overlap_score(new_text, existing_text)
+        if term_overlap_score >= 0.5:
+            term_score = 2.0
+        elif term_overlap_score >= 0.25:
+            term_score = 1.0
+        elif term_overlap_score >= 0.1:
+            term_score = 0.5
+        else:
+            term_score = 0.0
+        type_bonus = self._get_type_pair_bonus(new_entry, existing_entry)
+        gate_score = term_score + type_bonus
+        keep = gate_score >= self.candidate_score_threshold
+        if (
+            keep
+            and new_entry.commitment_type == CommitmentType.COMMITMENT
+            and existing_entry.commitment_type == CommitmentType.COMMITMENT
+            and term_score < 1.0
+        ):
+            keep = False
+        return keep, gate_score, {
+            "term_overlap_score": round(term_overlap_score, 3),
+            "term_score": term_score,
+            "type_bonus": type_bonus,
+            "hard_drop": 0.0,
+            "hard_drop_short": 0.0,
+            "hard_drop_template": 0.0,
+        }
 
-            # R3：时间临近（2节 ≈ 120秒）
-            if abs(entry.introduced_at - existing.introduced_at) <= 120:
-                candidates.add(eid)
-                continue
-
-            # R4：同线索关联（共享同一 OPEN_LOOP 引用）
-            if (
-                entry.commitment_type == CommitmentType.OPEN_LOOP
-                and existing.commitment_type == CommitmentType.OPEN_LOOP
-            ):
-                candidates.add(eid)
-
-        return list(candidates)
-
-    def _extract_relation(self, source_id: str, target_id: str) -> None:
-        """
-        对两个候选条目执行关系判断（LLM 或规则降级）
-
-        功能：
-            若 LLM 客户端可用，调用 LLM 判断 supports/conflicts/resolves 关系；
-            否则跳过（无关系写入）。
-
-        参数：
-            source_id: 来源条目 ID（新条目）
-            target_id: 目标条目 ID（现有候选条目）
-
-        关键实现细节：
-            LLM prompt 要求以 JSON 格式返回 relation_type 和 confidence。
-            仅接受 confidence >= 0.5 的关系，低置信度输出直接丢弃。
-        """
-        if self._llm_client is None:
-            return
-
+    def _score_pending_pair_priority(self, source_id: str, target_id: str) -> float:
         source = self._entries.get(source_id)
         target = self._entries.get(target_id)
         if not source or not target:
+            return float("-inf")
+
+        priority = 0.0
+        if (
+            source.commitment_type == CommitmentType.COMMITMENT
+            and target.commitment_type == CommitmentType.OPEN_LOOP
+        ):
+            priority += 2.0
+
+        priority += self._compute_term_overlap_score(source.content, target.content) * 2.0
+        priority -= self._generic_phrase_penalty(source.content)
+        priority -= self._generic_phrase_penalty(target.content)
+
+        if abs(source.introduced_at - target.introduced_at) <= 120:
+            priority += 0.3
+
+        return priority
+
+    def _build_batch_relation_prompt(self, pairs: List[Tuple[str, str]]) -> str:
+        lines = [
+            "判断以下多对叙事承诺之间的关系。",
+            "每对独立判断，只允许四种 relation_type：supports、conflicts、resolves、none。",
+            "resolves 仅当 target 是 open_loop 时有效。",
+            "只根据给定两条 DSL 内容做最保守判断，不得自行补充背景。",
+            "只有关系明确时才输出 supports、conflicts 或 resolves；不确定时输出 none。",
+            "只允许返回 JSON 数组，不允许任何解释文本，不允许 markdown 代码块。",
+            "每个对象必须包含 source_id、target_id、relation_type、confidence。",
+            "",
+            "待判断 pairs：",
+        ]
+
+        for source_id, target_id in pairs:
+            source = self._entries.get(source_id)
+            target = self._entries.get(target_id)
+            if not source or not target:
+                continue
+            lines.extend(
+                [
+                    f"- source_id: {source_id}",
+                    f"  source_type: {source.commitment_type.value}",
+                    f'  source_content: "{source.content}"',
+                    f"- target_id: {target_id}",
+                    f"  target_type: {target.commitment_type.value}",
+                    f'  target_content: "{target.content}"',
+                    "",
+                ]
+            )
+
+        lines.append(
+            '输出示例：[{"source_id":"...","target_id":"...","relation_type":"none","confidence":0.0}]'
+        )
+        return "\n".join(lines)
+
+    def _parse_batch_relation_json(
+        self,
+        raw: str,
+    ) -> List[Tuple[str, str, str, float]]:
+        payload = raw.strip()
+        if payload.startswith("```"):
+            payload = re.sub(r"^```[a-zA-Z0-9_+-]*\n?", "", payload)
+            payload = re.sub(r"\n?```$", "", payload).strip()
+
+        parsed = json.loads(payload)
+        if not isinstance(parsed, list):
+            raise ValueError("batch relation output is not a list")
+
+        results: List[Tuple[str, str, str, float]] = []
+        for item in parsed:
+            if not isinstance(item, dict):
+                raise ValueError("batch relation item is not an object")
+            source_id = str(item["source_id"])
+            target_id = str(item["target_id"])
+            relation_type = str(item["relation_type"])
+            confidence = float(item["confidence"])
+            results.append((source_id, target_id, relation_type, confidence))
+        return results
+
+    def _apply_relation_result(
+        self,
+        source_id: str,
+        target_id: str,
+        relation_type: str,
+        confidence: float,
+        confidence_threshold: float,
+    ) -> None:
+        if relation_type not in {"supports", "conflicts", "resolves"}:
             return
 
-        prompt = (
-            "判断以下两条叙事承诺之间的关系，只能输出 JSON，不要任何解释。\n\n"
-            f'条目A："{source.content}"\n'
-            f'条目B："{target.content}"\n\n'
-            "输出格式：\n"
-            '{"relation_type": "supports"|"conflicts"|"resolves"|"none", "confidence": 0.0~1.0}\n\n'
-            "语义说明：\n"
-            "  supports：A 为 B 提供依据或强化 B\n"
-            "  conflicts：A 与 B 相互矛盾\n"
-            "  resolves：A 闭合了 B 的悬念或承诺（仅当 B 是 open_loop 时有效）\n"
-            "  none：无明显关系"
+        if confidence < confidence_threshold:
+            return
+
+        relation = EntryRelation(
+            source_id=source_id,
+            target_id=target_id,
+            relation_type=relation_type,
+            confidence=confidence,
         )
+        self._relations.setdefault(source_id, []).append(relation)
+        self._relations_by_target.setdefault(target_id, []).append(relation)
 
-        try:
-            raw = self._llm_client.generate(prompt, temperature=0.0, max_tokens=32768)
-            parsed = self._parse_relation_json(raw)
-            if not parsed:
-                return
-            relation_type, confidence = parsed
-            if relation_type == "none" or confidence < 0.5:
-                return
+        if relation_type == "resolves":
+            target = self._entries.get(target_id)
+            source = self._entries.get(source_id)
+            if (
+                source is not None
+                and target is not None
+                and target.commitment_type == CommitmentType.OPEN_LOOP
+            ):
+                target.is_resolved = True
+                target.resolved_in = source.source_section
 
-            relation = EntryRelation(
-                source_id=source_id,
-                target_id=target_id,
-                relation_type=relation_type,
-                confidence=confidence,
-            )
-            self._relations[source_id].append(relation)
-            self._relations_by_target[target_id].append(relation)
-
-            # resolves 关系：自动闭合目标 OPEN_LOOP
-            if relation_type == "resolves":
-                target_entry = self._entries.get(target_id)
-                if target_entry and target_entry.commitment_type == CommitmentType.OPEN_LOOP:
-                    target_entry.is_resolved = True
-                    target_entry.resolved_in = source.source_section
-
-        except Exception:
-            # LLM 调用失败时静默跳过，不影响主流程
-            pass
-
-    def _parse_relation_json(self, raw: str) -> Optional[Tuple[str, float]]:
+    def process_pending_relations(
+        self,
+        section_id: Optional[str] = None,
+        max_pairs: int = 8,
+        batch_size: int = 4,
+        confidence_threshold: float = 0.5,
+    ) -> Dict[str, int | float]:
         """
-        从 LLM 输出中解析关系类型和置信度
-
-        参数：
-            raw: LLM 原始输出字符串
-
-        返回值：
-            Tuple[str, float] 或 None（解析失败时）
+        批量处理待判定关系，返回本节统计。
         """
-        import json as _json
-        try:
-            obj = _json.loads(raw.strip())
-            relation_type = obj.get("relation_type", "none")
-            confidence = float(obj.get("confidence", 0.0))
-            if relation_type in ("supports", "conflicts", "resolves", "none"):
-                return relation_type, confidence
-        except Exception:
-            pass
-        # 降级：正则提取
-        m = re.search(r'"relation_type"\s*:\s*"(\w+)"', raw)
-        m2 = re.search(r'"confidence"\s*:\s*([0-9.]+)', raw)
-        if m and m2:
-            return m.group(1), float(m2.group(1))
-        return None
+        start_time = time.time()
+        section_stats = dict(self._relation_stats_window)
+        section_stats.setdefault("processed", 0)
+        section_stats.setdefault("skipped", 0)
 
-    def _check_resolves_open_loops(self, new_entry: LedgerEntry) -> None:
-        """
-        检查 new_entry 是否通过现有 resolves 关系自动闭合某个 OPEN_LOOP
+        valid_pairs: List[Tuple[str, str]] = []
+        for source_id, target_id in self._pending_relation_pairs:
+            source = self._entries.get(source_id)
+            target = self._entries.get(target_id)
+            if not source or not target or not source.is_active() or not target.is_active():
+                section_stats["skipped"] += 1
+                continue
+            valid_pairs.append((source_id, target_id))
 
-        参数：
-            new_entry: 刚写入的新条目
-        """
-        for rel in self._relations.get(new_entry.entry_id, []):
-            if rel.relation_type == "resolves":
-                target = self._entries.get(rel.target_id)
-                if target and target.commitment_type == CommitmentType.OPEN_LOOP:
-                    target.is_resolved = True
-                    target.resolved_in = new_entry.source_section
+        if self._llm_client is None:
+            section_stats["processed"] = 0
+            section_stats["skipped"] += len(valid_pairs)
+            self._pending_relation_pairs = []
+            self._pending_relation_keys.clear()
+            section_stats["remaining_queue"] = 0
+            section_stats["time_cost_ms"] = int((time.time() - start_time) * 1000)
+            self._reset_relation_stats_window()
+            return section_stats
+
+        ranked_pairs = sorted(
+            valid_pairs,
+            key=lambda pair: self._score_pending_pair_priority(pair[0], pair[1]),
+            reverse=True,
+        )
+        selected_pairs = ranked_pairs[:max_pairs]
+        remaining_pairs = ranked_pairs[max_pairs:]
+
+        self._pending_relation_pairs = remaining_pairs
+        self._pending_relation_keys = {
+            self._make_pair_key(source_id, target_id)
+            for source_id, target_id in remaining_pairs
+        }
+
+        processed_keys = {self._make_pair_key(source_id, target_id) for source_id, target_id in selected_pairs}
+
+        for batch_start in range(0, len(selected_pairs), max(1, batch_size)):
+            batch_pairs = selected_pairs[batch_start: batch_start + max(1, batch_size)]
+            if not batch_pairs:
+                continue
+
+            prompt = self._build_batch_relation_prompt(batch_pairs)
+            section_stats["pairs_sent_to_llm"] += len(batch_pairs)
+
+            try:
+                raw = self._llm_client.generate(
+                    prompt,
+                    temperature=0.0,
+                    max_tokens=32768,
+                    log_meta={
+                        "component": "DSLRelation",
+                        "section_id": section_id,
+                        "batch_size": len(batch_pairs),
+                    },
+                )
+                batch_results = self._parse_batch_relation_json(raw)
+            except Exception:
+                for source_id, target_id in batch_pairs:
+                    self._relation_result_cache[self._make_pair_key(source_id, target_id)] = ("none_llm", 0.0)
+                    section_stats["pairs_none_llm"] += 1
+                continue
+
+            expected_pairs = {
+                (source_id, target_id): self._make_pair_key(source_id, target_id)
+                for source_id, target_id in batch_pairs
+            }
+            seen_pairs: Set[Tuple[str, str]] = set()
+
+            for source_id, target_id, relation_type, confidence in batch_results:
+                pair = (source_id, target_id)
+                if pair not in expected_pairs:
+                    continue
+
+                seen_pairs.add(pair)
+                pair_key = expected_pairs[pair]
+                if relation_type not in {"supports", "conflicts", "resolves", "none"}:
+                    relation_type = "none"
+                    confidence = 0.0
+
+                if relation_type == "none":
+                    self._relation_result_cache[pair_key] = ("none_llm", confidence)
+                    section_stats["pairs_none_llm"] += 1
+                    self._log_relation_result(section_id, source_id, target_id, relation_type, confidence, False)
+                    continue
+
+                self._relation_result_cache[pair_key] = (relation_type, confidence)
+                applied = confidence >= confidence_threshold
+                self._log_relation_result(section_id, source_id, target_id, relation_type, confidence, applied)
+                if confidence >= confidence_threshold:
+                    self._apply_relation_result(
+                        source_id=source_id,
+                        target_id=target_id,
+                        relation_type=relation_type,
+                        confidence=confidence,
+                        confidence_threshold=confidence_threshold,
+                    )
+                    stat_key = f"pairs_{relation_type}"
+                    if stat_key in section_stats:
+                        section_stats[stat_key] += 1
+
+            missing_pairs = set(expected_pairs.keys()) - seen_pairs
+            for source_id, target_id in missing_pairs:
+                self._relation_result_cache[self._make_pair_key(source_id, target_id)] = ("none_llm", 0.0)
+                section_stats["pairs_none_llm"] += 1
+
+        section_stats["processed"] = len(selected_pairs)
+        section_stats["remaining_queue"] = len(self._pending_relation_pairs)
+        section_stats["time_cost_ms"] = int((time.time() - start_time) * 1000)
+
+        for key in self._relation_stats_total:
+            self._relation_stats_total[key] += int(section_stats.get(key, 0))
+
+        for pair_key in processed_keys:
+            self._pending_relation_keys.discard(pair_key)
+
+        self._reset_relation_stats_window()
+        return section_stats
 
     # ------------------------------------------------------------------
     # 第三阶段：生命周期管理
@@ -311,22 +530,13 @@ class DiscourseLedger:
 
     def revoke_entry(self, entry_id: str, revoked_by_section: str) -> None:
         """
-        撤销指定条目，并触发级联 trust_level 衰减
-
-        功能：
-            1. 标记条目为 revoked
-            2. 对所有 supports(entry_id, B) 的 B 降低 trust_level（衰减 0.2）
-
-        参数：
-            entry_id: 被撤销的条目 ID
-            revoked_by_section: 触发撤销的节 ID
+        撤销指定条目，并触发级联 trust_level 衰减。
         """
         entry = self._entries.get(entry_id)
         if not entry:
             return
         entry.revoke(revoked_by_section)
 
-        # 级联：所有 supports(entry_id, B) 的 B 降低 trust_level
         for rel in self._relations.get(entry_id, []):
             if rel.relation_type == "supports":
                 downstream = self._entries.get(rel.target_id)
@@ -335,14 +545,7 @@ class DiscourseLedger:
 
     def update_entry_stability(self, section_id: str, all_sections_so_far: List[str]) -> None:
         """
-        在每节生成后更新所有活跃条目的稳定性分数
-
-        功能：
-            遍历所有活跃条目，计算自引入以来经过的无冲突节数，调用 update_stability()。
-
-        参数：
-            section_id: 刚完成生成的节 ID
-            all_sections_so_far: 已完成生成的所有节 ID 列表（按顺序）
+        在每节生成后更新所有活跃条目的稳定性分数。
         """
         for entry in self._entries.values():
             if not entry.is_active():
@@ -353,16 +556,12 @@ class DiscourseLedger:
             cur_idx = all_sections_so_far.index(section_id) if section_id in all_sections_so_far else src_idx
             passed_sections = max(0, cur_idx - src_idx)
             entry.update_stability(passed_sections)
-            # 将当前节加入 support_span
             if section_id not in entry.support_span:
                 entry.support_span.append(section_id)
 
     def record_failure_association(self, entry_ids: List[str]) -> None:
         """
-        记录一批条目与当前验证失败的关联（用于 salience 的 failure_history 因子）
-
-        参数：
-            entry_ids: 与当前失败关联的条目 ID 列表
+        记录一批条目与当前验证失败的关联（用于 salience 的 failure_history 因子）。
         """
         for eid in entry_ids:
             self._failure_associations[eid] = self._failure_associations.get(eid, 0) + 1
@@ -377,18 +576,7 @@ class DiscourseLedger:
         section_queue: List[str],
     ) -> List[str]:
         """
-        整节回退：清除在 cutoff_section_id 之后引入的所有条目
-
-        功能：
-            删除 source_section 在 section_queue 中位于 cutoff_section_id 之后的条目。
-            对 stability_score > 0.7 的被清除条目发出警告。
-
-        参数：
-            cutoff_section_id: 保留至此节（含）的最后一节 ID
-            section_queue: 全局节顺序列表
-
-        返回值：
-            List[str]：被清除的高稳定性条目内容警告列表
+        整节回退：清除在 cutoff_section_id 之后引入的所有条目。
         """
         if cutoff_section_id not in section_queue:
             return []
@@ -413,17 +601,27 @@ class DiscourseLedger:
             self._relations_by_target.pop(eid, None)
             self._failure_associations.pop(eid, None)
 
-        # 清理关系图中指向被删除条目的引用
         for eid in list(self._relations.keys()):
-            self._relations[eid] = [
-                r for r in self._relations[eid]
-                if r.target_id not in to_remove
-            ]
+            self._relations[eid] = [r for r in self._relations[eid] if r.target_id not in to_remove]
         for eid in list(self._relations_by_target.keys()):
-            self._relations_by_target[eid] = [
-                r for r in self._relations_by_target[eid]
-                if r.source_id not in to_remove
+            self._relations_by_target[eid] = [r for r in self._relations_by_target[eid] if r.source_id not in to_remove]
+
+        if to_remove:
+            removed_ids = set(to_remove)
+            self._pending_relation_pairs = [
+                (source_id, target_id)
+                for source_id, target_id in self._pending_relation_pairs
+                if source_id not in removed_ids and target_id not in removed_ids
             ]
+            self._pending_relation_keys = {
+                self._make_pair_key(source_id, target_id)
+                for source_id, target_id in self._pending_relation_pairs
+            }
+            self._relation_result_cache = {
+                pair_key: result
+                for pair_key, result in self._relation_result_cache.items()
+                if pair_key[0] not in removed_ids and pair_key[1] not in removed_ids
+            }
 
         return warnings
 
@@ -433,19 +631,7 @@ class DiscourseLedger:
         conflict_description: str,
     ) -> List[str]:
         """
-        精确记忆清除（对应 state_level 错误）
-
-        功能：
-            找到 source_section == contaminated_section 且 commitment_type == FACT
-            且内容与 conflict_description 语义相关（关键词重叠）的条目，
-            撤销这些条目并触发级联 trust_level 衰减。
-
-        参数：
-            contaminated_section: 疑似被污染的节 ID
-            conflict_description: 矛盾描述（用于关键词匹配）
-
-        返回值：
-            List[str]：被撤销的条目 ID 列表
+        精确记忆清除（对应 state_level 错误）。
         """
         conflict_keywords = self._extract_keywords(conflict_description)
         purged: List[str] = []
@@ -477,24 +663,7 @@ class DiscourseLedger:
         target_section_id: str,
     ) -> List[LedgerEntry]:
         """
-        获取用于 prompt 注入的账本条目（按 salience 排序取前 K 条）
-
-        功能：
-            1. 筛选可注入类型（FACT / COMMITMENT / OPEN_LOOP / STYLE_POLICY）
-            2. 过滤非活跃条目
-            3. 计算每条的 salience_score
-            4. 返回前 max_inject_entries 条
-
-        参数：
-            target_section_idx: 目标节在全局大纲中的序号（0-based）
-            total_sections: 全局大纲总节数
-            recent_decision_ids: 最近 2 个决策引用的条目 ID 集合
-            historical_failure_entry_ids: 历史上关联过验证失败的条目 ID 集合
-            outline: 全局大纲 {section_id: section_title}
-            target_section_id: 目标节 ID
-
-        返回值：
-            List[LedgerEntry]：按 salience_score 降序排列的可注入条目列表
+        获取用于 prompt 注入的账本条目（按 salience 排序取前 K 条）。
         """
         injectable_types = {
             CommitmentType.FACT,
@@ -538,64 +707,37 @@ class DiscourseLedger:
         target_keywords: Set[str],
     ) -> float:
         """
-        计算单条账本条目的 salience_score（运行时计算，不静态存储）
-
-        因子：
-            1. time_relevance    ：OPEN_LOOP 随时间指数增加（越久未闭合越显著）；
-                                  其他类型随时间线性衰减（用目标节相对位置估计）
-            2. reference_recency ：最近 2 个决策引用过此条目 → +0.3
-            3. failure_history   ：此条目曾关联过验证失败 → +0.3
-            4. commitment_urgency：COMMITMENT 类型在最后 2 节时权重急剧升高
-            5. outline_match     ：内容关键词与目标节大纲标题的 Jaccard 相似度
-
-        参数：
-            entry: 待评分条目
-            target_section_idx: 目标节序号（0-based）
-            total_sections: 总节数
-            recent_ids_set: 最近 2 决策引用的条目 ID 集合
-            failure_ids_set: 历史失败关联的条目 ID 集合
-            target_keywords: 目标节标题关键词集合
-
-        返回值：
-            float：综合显著性分数 [0.0, 2.0+]（绝对值无意义，用于相对排序）
+        计算单条账本条目的 salience_score（运行时计算，不静态存储）。
         """
-        # 因子1：time_relevance
         if total_sections > 1:
             relative_pos = target_section_idx / (total_sections - 1)
         else:
             relative_pos = 1.0
 
         if entry.commitment_type == CommitmentType.OPEN_LOOP and not entry.is_resolved:
-            time_relevance = 1.0 + relative_pos * 2.0   # 越晚未闭合越显著
+            time_relevance = 1.0 + relative_pos * 2.0
         else:
-            time_relevance = max(0.1, 1.0 - relative_pos * 0.5)  # 线性衰减
+            time_relevance = max(0.1, 1.0 - relative_pos * 0.5)
 
-        # 因子2：reference_recency
         reference_recency = 0.3 if entry.entry_id in recent_ids_set else 0.0
+        failure_history = 0.3 if entry.entry_id in failure_ids_set else 0.0
 
-        # 因子3：failure_history
-        failure_count = self._failure_associations.get(entry.entry_id, 0)
-        failure_history = 0.3 if failure_count > 0 else 0.0
-
-        # 因子4：commitment_urgency（最后2节时，COMMITMENT 急剧增加）
         commitment_urgency = 0.0
         if entry.commitment_type == CommitmentType.COMMITMENT:
             remaining = total_sections - 1 - target_section_idx
             if remaining <= 2:
-                commitment_urgency = 1.0 - remaining * 0.4  # 最后1节=0.6，最后2节=0.2
+                commitment_urgency = 1.0 - remaining * 0.4
 
-        # 因子5：outline_match
         entry_keywords = self._extract_keywords(entry.content)
         outline_match = self._jaccard(entry_keywords, target_keywords) if target_keywords else 0.0
 
-        salience = (
+        return (
             time_relevance
             + reference_recency
             + failure_history
             + commitment_urgency
             + outline_match
         )
-        return salience
 
     # ------------------------------------------------------------------
     # 第六阶段：统计查询
@@ -603,10 +745,7 @@ class DiscourseLedger:
 
     def compute_memory_trust_level(self) -> float:
         """
-        计算当前 DSL 整体可信度（所有活跃条目 trust_level 的均值）
-
-        返回值：
-            float：[0.0, 1.0]，活跃条目为空时返回 1.0
+        计算当前 DSL 整体可信度（所有活跃条目 trust_level 的均值）。
         """
         active_entries = [e for e in self._entries.values() if e.is_active()]
         if not active_entries:
@@ -614,15 +753,12 @@ class DiscourseLedger:
         return sum(e.trust_level for e in active_entries) / len(active_entries)
 
     def get_active_entries(self) -> List[LedgerEntry]:
-        """返回所有活跃条目"""
         return [e for e in self._entries.values() if e.is_active()]
 
     def get_entry(self, entry_id: str) -> Optional[LedgerEntry]:
-        """按 ID 查询条目"""
         return self._entries.get(entry_id)
 
     def get_open_loops(self) -> List[LedgerEntry]:
-        """返回所有未闭合的 OPEN_LOOP 条目"""
         return [
             e for e in self._entries.values()
             if e.commitment_type == CommitmentType.OPEN_LOOP
@@ -631,14 +767,12 @@ class DiscourseLedger:
         ]
 
     def get_low_trust_entry_ids(self, threshold: float = 0.5) -> List[str]:
-        """返回 trust_level 低于阈值的活跃条目 ID 列表"""
         return [
             eid for eid, entry in self._entries.items()
             if entry.is_active() and entry.trust_level < threshold
         ]
 
     def to_dict(self) -> Dict:
-        """序列化为字典（用于持久化和日志）"""
         return {
             "entries": {eid: e.to_dict() for eid, e in self._entries.items()},
             "relations": {
@@ -653,60 +787,204 @@ class DiscourseLedger:
     # 工具方法
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def _extract_keywords(text: str) -> Set[str]:
-        """
-        从文本中提取关键词（过滤停用词和短词）
-
-        参数：
-            text: 输入文本
-
-        返回值：
-            Set[str]：关键词集合（小写）
-        """
-        stop_words = {
-            "的", "了", "是", "在", "和", "与", "或", "有", "一", "不",
-            "也", "都", "但", "他", "她", "它", "我", "你", "们", "对",
-            "the", "a", "an", "is", "are", "was", "were", "be", "been",
-            "and", "or", "but", "in", "on", "at", "to", "for", "of", "with",
+    def _new_relation_stats(self) -> Dict[str, int]:
+        return {
+            "raw_pairs_checked": 0,
+            "pairs_enqueued": 0,
+            "pairs_dedup_skipped": 0,
+            "pairs_prefilter_none": 0,
+            "pairs_cache_hit": 0,
+            "pairs_sent_to_llm": 0,
+            "pairs_none_llm": 0,
+            "pairs_supports": 0,
+            "pairs_conflicts": 0,
+            "pairs_resolves": 0,
         }
-        words = re.findall(r"[\u4e00-\u9fa5]+|[a-zA-Z]{3,}", text.lower())
-        return {w for w in words if w not in stop_words and len(w) >= 2}
+
+    def _reset_relation_stats_window(self) -> None:
+        self._relation_stats_window = self._new_relation_stats()
+
+    def _bump_relation_stat(self, key: str, amount: int = 1) -> None:
+        if key in self._relation_stats_window:
+            self._relation_stats_window[key] += amount
+
+    def _log_gate_decision(
+        self,
+        section_id: str,
+        source_id: str,
+        target_id: str,
+        keep: bool,
+        gate_score: float,
+        signals: Dict[str, float],
+        note: str,
+    ) -> None:
+        if self._run_logger is not None:
+            source = self._entries.get(source_id)
+            target = self._entries.get(target_id)
+            self._run_logger.log_dsl_gate_pair(
+                section_id=section_id,
+                source_id=source_id,
+                target_id=target_id,
+                keep=keep,
+                gate_score=gate_score,
+                signals=signals,
+                note=note,
+                source_type=source.commitment_type.value if source is not None else "-",
+                target_type=target.commitment_type.value if target is not None else "-",
+                source_content=(source.content[:80] if source is not None else ""),
+                target_content=(target.content[:80] if target is not None else ""),
+            )
+
+    def _log_relation_result(
+        self,
+        section_id: Optional[str],
+        source_id: str,
+        target_id: str,
+        relation_type: str,
+        confidence: float,
+        applied: bool,
+    ) -> None:
+        if self._run_logger is not None:
+            self._run_logger.log_dsl_relation_result(
+                section_id=section_id or "-",
+                source_id=source_id,
+                target_id=target_id,
+                relation_type=relation_type,
+                confidence=confidence,
+                applied=applied,
+            )
 
     @staticmethod
-    def _extract_entities(text: str) -> Set[str]:
-        """
-        从文本中提取简单命名实体（大写词或中文专有词近似）
+    def _normalize_text(text: str) -> str:
+        return re.sub(r"\s+", " ", text.strip().lower())
 
-        参数：
-            text: 输入文本
+    @classmethod
+    def _extract_char_ngrams(cls, text: str) -> Set[str]:
+        stop_ngrams = {"以及", "或者", "因此", "但是", "如果", "需要", "进行", "相关", "问题", "内容", "部分"}
+        normalized = cls._normalize_text(text)
+        chunks = re.findall(r"[\u4e00-\u9fff]+", normalized)
+        ngrams: Set[str] = set()
+        for chunk in chunks:
+            if len(chunk) < 2:
+                continue
+            for size in range(2, 7):
+                if len(chunk) < size:
+                    continue
+                for idx in range(0, len(chunk) - size + 1):
+                    piece = chunk[idx: idx + size]
+                    if piece in stop_ngrams:
+                        continue
+                    ngrams.add(piece)
+        return ngrams
 
-        返回值：
-            Set[str]：命名实体集合
-        """
-        # 英文：连续大写开头的词
-        english_entities = set(re.findall(r"\b[A-Z][a-zA-Z]{2,}\b", text))
-        # 中文：引号内的词组（简单近似）
-        chinese_entities = set(re.findall('\u300c([^\u300d]{2,8})\u300d|\u201c([^\u201d]{2,8})\u201d', text))
-        flat_chinese: Set[str] = set()
-        for match in chinese_entities:
-            for part in match:
-                if part:
-                    flat_chinese.add(part)
-        return english_entities | flat_chinese
+    @classmethod
+    def _extract_keyword_tokens(cls, text: str) -> Set[str]:
+        normalized = cls._normalize_text(text)
+        tokens: Set[str] = set()
+        chinese_chunks = re.findall(r"[\u4e00-\u9fff]{2,}", normalized)
+        stop_chunks = {
+            "提供参考框架",
+            "系统梳理",
+            "持续贯彻",
+            "作为主线",
+            "可操作路径",
+            "研究者",
+            "临床工作者",
+            "后续章节",
+            "系统性比较",
+        }
+        for chunk in chinese_chunks:
+            trimmed = chunk[:12]
+            if 2 <= len(trimmed) <= 12 and trimmed not in stop_chunks:
+                tokens.add(trimmed)
+            if len(chunk) > 6:
+                for size in range(3, 7):
+                    if len(chunk) < size:
+                        continue
+                    for idx in range(0, len(chunk) - size + 1):
+                        piece = chunk[idx: idx + size]
+                        if piece in stop_chunks:
+                            continue
+                        tokens.add(piece)
+
+        english_terms = re.findall(r"\b[a-z]{2,}(?:-[a-z]{2,})?\b", normalized)
+        tokens.update(english_terms)
+
+        acronyms = re.findall(r"\b[a-z0-9]{2,8}\b", normalized)
+        for token in acronyms:
+            if any(ch.isdigit() for ch in token) or token.isupper():
+                tokens.add(token)
+
+        year_or_range = re.findall(r"\b\d{1,4}(?:-\d{1,4})?(?:年|版)?\b", text)
+        tokens.update(year_or_range)
+        return {token for token in tokens if token}
+
+    @classmethod
+    def _extract_keywords(cls, text: str) -> Set[str]:
+        return cls._extract_keyword_tokens(text)
+
+    @staticmethod
+    def _overlap_ratio(set_a: Set[str], set_b: Set[str]) -> float:
+        if not set_a or not set_b:
+            return 0.0
+        intersection = len(set_a & set_b)
+        denominator = min(len(set_a), len(set_b))
+        return intersection / denominator if denominator > 0 else 0.0
+
+    @classmethod
+    def _compute_term_overlap_score(cls, source_text: str, target_text: str) -> float:
+        char_overlap = cls._overlap_ratio(
+            cls._extract_char_ngrams(source_text),
+            cls._extract_char_ngrams(target_text),
+        )
+        keyword_overlap = cls._overlap_ratio(
+            cls._extract_keyword_tokens(source_text),
+            cls._extract_keyword_tokens(target_text),
+        )
+        high = max(char_overlap, keyword_overlap)
+        low = min(char_overlap, keyword_overlap)
+        return min(1.0, high + 0.15 * low)
+
+    @classmethod
+    def _is_too_short_noise_pair(cls, source_text: str, target_text: str) -> bool:
+        return len(source_text.strip()) < 6 and len(target_text.strip()) < 6
+
+    @classmethod
+    def _is_template_noise_text(cls, text: str) -> bool:
+        normalized = cls._normalize_text(text)
+        if not normalized:
+            return True
+        if re.fullmatch(r"[\W_]+", normalized):
+            return True
+        if re.fullmatch(r"[0-9]+(?:\.[0-9]+)?", normalized):
+            return True
+        return normalized in {"如下所示", "见前文", "待补充", "待完善", "详见上文", "同上"}
+
+    @classmethod
+    def _is_template_noise_pair(cls, source_text: str, target_text: str) -> bool:
+        return cls._is_template_noise_text(source_text) and cls._is_template_noise_text(target_text)
+
+    @classmethod
+    def _generic_phrase_penalty(cls, text: str) -> float:
+        normalized = cls._normalize_text(text)
+        generic_phrases = {
+            "提供参考框架",
+            "系统梳理",
+            "持续关注",
+            "后续章节",
+            "详细比较",
+            "深化分析",
+            "可操作",
+            "重要议题",
+        }
+        penalty = 0.0
+        for phrase in generic_phrases:
+            if phrase in normalized:
+                penalty += 0.4
+        return penalty
 
     @staticmethod
     def _jaccard(set_a: Set[str], set_b: Set[str]) -> float:
-        """
-        计算两个集合的 Jaccard 相似度
-
-        参数：
-            set_a: 集合 A
-            set_b: 集合 B
-
-        返回值：
-            float：Jaccard 相似度 [0.0, 1.0]
-        """
         if not set_a and not set_b:
             return 0.0
         intersection = len(set_a & set_b)
