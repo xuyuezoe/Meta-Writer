@@ -106,7 +106,7 @@ def _resolve_requested_task_names(args: argparse.Namespace) -> List[str]:
 
     if args.task_id:
         if args.task_id not in benchmark_task_ids:
-            raise ValueError(f"未知 benchmark task_id: {args.task_id}")
+            raise ValueError(f"Unknown benchmark task_id: {args.task_id}")
         return [_benchmark_task_name(args.task_id)]
 
     if args.task_name:
@@ -331,12 +331,12 @@ def _run_single_task(
 
     constraints_object = config["constraints"]
     if not isinstance(constraints_object, list):
-        raise TypeError("task_config.constraints 必须是列表")
+        raise TypeError("task_config.constraints must be a list")
     constraints = [str(item) for item in constraints_object]
 
     outline_object = config["outline"]
     if not isinstance(outline_object, dict):
-        raise TypeError("task_config.outline 必须是字典")
+        raise TypeError("task_config.outline must be a dictionary")
     outline = {str(section_id): str(title) for section_id, title in outline_object.items()}
 
     task_description = str(config["task"])
