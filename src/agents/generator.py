@@ -104,7 +104,7 @@ class Generator:
                 strict=False,  # 不需要 strict 模式，因为 schema 本身就是强约束
             )
             self.logger.debug(
-                "第 %d 次尝试生成，section=%s temp=%.2f",
+                "Generator attempt %d section=%s temp=%.2f",
                 attempt + 1,
                 section_id,
                 actual_temp,
@@ -130,9 +130,9 @@ class Generator:
                 decision = Decision(
                     timestamp=int(time.time()),
                     decision_id="",
-                    decision=structured_output.decision or "结构化决策提供",
-                    reasoning=structured_output.reasoning or "结构化推理提供",
-                    expected_effect=structured_output.expected_effect or "完成当前节的基本正文生成",
+                    decision=structured_output.decision or "Provide the core writing move for this section.",
+                    reasoning=structured_output.reasoning or "Use the available state and prior sections consistently.",
+                    expected_effect=structured_output.expected_effect or "Deliver a coherent draft for the current section.",
                     confidence=structured_output.confidence if structured_output.confidence is not None else 0.8,
                     referenced_sections=self._resolve_section_references(
                         structured_output.referenced_section_ids, state
@@ -148,7 +148,7 @@ class Generator:
                     )
 
                 self.logger.info(
-                    "生成成功 [尝试 %d] section=%s confidence=%.2f",
+                    "Generation succeeded [attempt %d] section=%s confidence=%.2f",
                     attempt + 1,
                     section_id,
                     decision.confidence,
@@ -157,10 +157,10 @@ class Generator:
 
             except (ValueError, TypeError, RuntimeError) as e:
                 last_error = e
-                self.logger.warning("第 %d 次调用失败：%s", attempt + 1, e)
+                self.logger.warning("Generator call failed at retry %d: %s", attempt + 1, e)
 
         raise RuntimeError(
-            f"生成失败：经过 {self.MAX_RETRIES} 次重试仍无法获得结构化输出。最后错误：{last_error}"
+            f"Generation failed after {self.MAX_RETRIES} retries. Last error: {last_error}"
         )
 
     # ------------------------------------------------------------------
@@ -229,33 +229,35 @@ class Generator:
             str：完整 prompt 字符串
         """
         state_desc = state.to_prompt()
-        truncated = recent_content[-self.RECENT_CONTENT_LIMIT:] if recent_content else "（无）"
+        truncated = recent_content[-self.RECENT_CONTENT_LIMIT:] if recent_content else "(none)"
 
         intent_block = ""
         scope_warning = ""
         if section_intent is not None:
             intent_block = f"\n{section_intent.to_prompt_text()}\n"
             scope_warning = (
-                "\n【叙事范围强制约束】"
-                "本节只负责上述局部计划中的目标，严禁提前完整解决主要冲突或推进属于后续章节的情节。"
-                "本节结束时故事必须仍有未解决的张力留待后续章节处理。\n"
+                "\n[Scope Constraint] "
+                "This section may only execute the local plan above. "
+                "Do not fully resolve the main conflict early and do not advance plot beats that belong to later sections. "
+                "Leave unresolved tension for later sections unless this section is explicitly the ending.\n"
             )
 
         return (
-            "你是一个长文本生成系统。\n"
-            f"\n当前状态：\n{state_desc}"
+            "You are a long-form writing system.\n"
+            "All natural-language fields must be written in English.\n"
+            "In particular, decision, reasoning, expected_effect, and content must be English.\n"
+            f"\nCurrent state:\n{state_desc}"
             f"{intent_block}"
             f"{scope_warning}"
-            f"\n最近内容：\n{truncated}"
-            f"\n\n当前任务：\n{task}"
-            "\n\n要求：请按照以下结构化格式提供你的响应。"
-            "返回一个 JSON 对象，包含以下字段："
-            "\n- decision: 本节的核心写作决策（字符串）"
-            "\n- reasoning: 推理过程和依据（字符串，可引用前文节点ID）"
-            "\n- expected_effect: 预期达到的叙事效果（字符串）"
-            "\n- confidence: 置信度数字，0.0 到 1.0 之间"
-            "\n- content: 纯叙事正文（字符串，禁止包含节ID、字数统计或任何元信息）"
-            "\n- referenced_section_ids: 引用的前文节点 ID 列表，如 ['sec1', 'sec2']（数组，可为空）"
+            f"\nRecent content:\n{truncated}"
+            f"\n\nCurrent task:\n{task}"
+            "\n\nReturn one JSON object with these fields:"
+            "\n- decision: the core writing decision for this section"
+            "\n- reasoning: the rationale for that decision, optionally referencing prior section IDs"
+            "\n- expected_effect: the narrative effect this section should achieve"
+            "\n- confidence: a numeric confidence value between 0.0 and 1.0"
+            "\n- content: narrative prose only, with no section IDs, token counts, or meta commentary"
+            "\n- referenced_section_ids: a list of prior section IDs such as ['sec1', 'sec2'], or []"
         )
 
     # ------------------------------------------------------------------
@@ -276,7 +278,7 @@ class Generator:
             }
             return self._finalize_decision(fields, state)
         except ValueError as strict_err:
-            self.logger.warning("protocol_parse_failure(strict)：%s", strict_err)
+            self.logger.warning("protocol_parse_failure(strict): %s", strict_err)
 
         try:
             fields = {
@@ -285,15 +287,15 @@ class Generator:
             }
             return self._finalize_decision(fields, state)
         except ValueError as loose_err:
-            self.logger.warning("protocol_parse_failure(loose)：%s", loose_err)
+            self.logger.warning("protocol_parse_failure(loose): %s", loose_err)
 
         fallback_content = self._extract_fallback_content(response)
         if fallback_content:
             decision = self._build_fallback_decision(state, section_intent, response)
-            self.logger.warning("fallback_decision_used: 使用正文兜底构造决策")
+            self.logger.warning("fallback_decision_used: built decision from visible content")
             return fallback_content, decision
 
-        raise ValueError("protocol_parse_failure: 无法提取正文")
+        raise ValueError("protocol_parse_failure: unable to extract content")
 
     def _sanitize_content(self, content: str) -> str:
         """
@@ -320,7 +322,7 @@ class Generator:
         text = re.sub(r'<ref\s+id="[^"]*">.*?</ref>', '', text, flags=re.DOTALL)
 
         # 第三阶段：移除末尾的字数统计行
-        text = re.sub(r'\n*[字字数数]+[：:]\s*\d+[字]?\s*$', '', text.strip())
+        text = re.sub(r'\n*(?:word count|words?|characters?|chars?)[：:]\s*\d+\s*$', '', text.strip(), flags=re.IGNORECASE)
 
         return text.strip()
 
@@ -332,20 +334,20 @@ class Generator:
         confidence_str = fields["confidence"].strip()
         content = self._sanitize_content(fields["content"])
         if not content:
-            raise ValueError("protocol_parse_failure: content 为空")
+            raise ValueError("protocol_parse_failure: empty content")
 
         try:
             confidence = float(confidence_str)
         except ValueError as e:
-            raise ValueError(f"confidence 字段无法解析为浮点数：'{confidence_str}'") from e
+            raise ValueError(f"confidence field is not a valid float: '{confidence_str}'") from e
 
         referenced_sections = self._extract_references(reasoning)
         decision = Decision(
             timestamp=int(time.time()),
             decision_id="",
-            decision=decision_text or "结构化决策缺失，采用正文直出",
-            reasoning=reasoning or "模型未提供可解析的结构化推理",
-            expected_effect=expected_effect or "完成当前节的基本正文生成",
+            decision=decision_text or "Use the generated content as the section's primary move.",
+            reasoning=reasoning or "No structured reasoning was available, so the visible content was used directly.",
+            expected_effect=expected_effect or "Deliver a coherent draft for the current section.",
             confidence=confidence,
             referenced_sections=referenced_sections,
             target_section=state.current_section,
@@ -358,7 +360,7 @@ class Generator:
         pattern = rf"<{tag}>(.*?)</{tag}>"
         match = re.search(pattern, text, re.DOTALL)
         if not match:
-            raise ValueError(f"protocol_parse_failure: 缺少 <{tag}> 标签")
+            raise ValueError(f"protocol_parse_failure: missing <{tag}> tag")
         return match.group(1).strip()
 
     def _extract_tag_loose(self, text: str, tag: str) -> str:
@@ -371,12 +373,12 @@ class Generator:
         start_token = f"<{tag}>"
         start = text.find(start_token)
         if start == -1:
-            raise ValueError(f"protocol_parse_failure: 缺少 {start_token}")
+            raise ValueError(f"protocol_parse_failure: missing {start_token}")
         start += len(start_token)
         if tag == "content":
             snippet = text[start:].strip()
             if not snippet:
-                raise ValueError("protocol_parse_failure: content 空白")
+                raise ValueError("protocol_parse_failure: blank content")
             return snippet
 
         remainder = text[start:]
@@ -390,7 +392,7 @@ class Generator:
                 next_idx = pos
         snippet = remainder[:next_idx].strip()
         if not snippet:
-            raise ValueError(f"protocol_parse_failure: <{tag}> 内容缺失")
+            raise ValueError(f"protocol_parse_failure: missing content for <{tag}>")
         return snippet
 
     def _extract_fallback_content(self, text: str) -> str:
@@ -417,10 +419,10 @@ class Generator:
         expected_effect: Optional[str] = None,
         confidence: Optional[float] = None,
     ) -> Decision:
-        """构造兜底决策对象，保证流程可继续"""
-        goal_hint = section_intent.local_goal if section_intent else f"完成 {state.current_section} 的内容"
-        decision_text = decision_text or "结构化决策缺失，采用正文直出"
-        reasoning = reasoning or "模型未提供可解析的结构化推理"
+        """Construct a fallback decision so the pipeline can continue."""
+        goal_hint = section_intent.local_goal if section_intent else f"Draft the content for section {state.current_section}."
+        decision_text = decision_text or "Use the generated content as the section's primary move."
+        reasoning = reasoning or "No structured reasoning was available, so the visible content was used directly."
         expected_effect = expected_effect or goal_hint
         confidence = confidence if confidence is not None else 0.5
 

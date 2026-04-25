@@ -45,7 +45,7 @@ class DiscourseLedgerTests(unittest.TestCase):
         )
 
     def test_overlap_ratio_uses_intersection_over_min_size(self) -> None:
-        ratio = DiscourseLedger._overlap_ratio({"低资源环境", "真实世界研究"}, {"低资源环境"})
+        ratio = DiscourseLedger._overlap_ratio({"low-resource", "real-world"}, {"low-resource"})
         self.assertEqual(ratio, 1.0)
 
     def test_default_gate_threshold_is_tuned_for_runtime_recall(self) -> None:
@@ -57,14 +57,14 @@ class DiscourseLedgerTests(unittest.TestCase):
         new = self._entry(
             "new",
             CommitmentType.COMMITMENT,
-            "针对低资源环境开展真实世界研究以补强证据链",
+            "Run real-world studies in low-resource settings to strengthen the evidence base",
             "s2",
             110,
         )
         old = self._entry(
             "old",
             CommitmentType.OPEN_LOOP,
-            "低资源环境真实世界研究证据仍待补强",
+            "Evidence from real-world studies in low-resource settings remains insufficient",
             "s1",
             100,
         )
@@ -81,14 +81,14 @@ class DiscourseLedgerTests(unittest.TestCase):
         new = self._entry(
             "new",
             CommitmentType.COMMITMENT,
-            "适应证边界的界定应更加明确地标注证据等级与适用条件",
+            "Clarify indication boundaries with explicit evidence grades and use conditions",
             "s2",
             110,
         )
         old = self._entry(
             "old",
             CommitmentType.OPEN_LOOP,
-            "适应证边界与证据稀疏条件下的适用范围仍待澄清",
+            "The valid scope under sparse evidence and indication boundaries remains unclear",
             "s1",
             100,
         )
@@ -106,14 +106,14 @@ class DiscourseLedgerTests(unittest.TestCase):
         new = self._entry(
             "new",
             CommitmentType.COMMITMENT,
-            "适应证边界的界定应更加明确地标注证据等级与适用条件",
+            "Clarify dosing guidance with explicit evidence grades",
             "s2",
             110,
         )
         old = self._entry(
             "old",
             CommitmentType.COMMITMENT,
-            "适应证边界需要在证据稀疏条件下明确标注适用范围",
+            "The monitoring schedule should define the valid scope under sparse evidence",
             "s1",
             100,
         )
@@ -126,8 +126,8 @@ class DiscourseLedgerTests(unittest.TestCase):
 
     def test_gate_relation_pair_drops_double_short_noise(self) -> None:
         ledger = DiscourseLedger()
-        new = self._entry("new", CommitmentType.COMMITMENT, "待补充", "s2", 110)
-        old = self._entry("old", CommitmentType.OPEN_LOOP, "见前文", "s1", 100)
+        new = self._entry("new", CommitmentType.COMMITMENT, "tbd", "s2", 110)
+        old = self._entry("old", CommitmentType.OPEN_LOOP, "see above", "s1", 100)
 
         keep, gate_score, signals = ledger._gate_relation_pair(new, old)
 
@@ -141,14 +141,14 @@ class DiscourseLedgerTests(unittest.TestCase):
         old = self._entry(
             "old",
             CommitmentType.OPEN_LOOP,
-            "低资源环境真实世界研究证据仍待补强",
+            "Evidence from real-world studies in low-resource settings remains insufficient",
             "s1",
             100,
         )
         new = self._entry(
             "new",
             CommitmentType.COMMITMENT,
-            "针对低资源环境开展真实世界研究以补强证据链",
+            "Run real-world studies in low-resource settings to strengthen the evidence base",
             "s2",
             110,
         )
@@ -230,8 +230,8 @@ class DiscourseLedgerTests(unittest.TestCase):
             ]
         )
         ledger = DiscourseLedger(llm_client=llm, candidate_score_threshold=1.5)
-        a = self._entry("a", CommitmentType.COMMITMENT, "低资源环境真实世界研究路径需要补强", "s1", 100)
-        b = self._entry("b", CommitmentType.COMMITMENT, "针对低资源环境开展真实世界研究以补强路径", "s2", 110)
+        a = self._entry("a", CommitmentType.COMMITMENT, "The low-resource real-world evidence pathway needs reinforcement", "s1", 100)
+        b = self._entry("b", CommitmentType.COMMITMENT, "Run real-world studies in low-resource settings to reinforce the pathway", "s2", 110)
 
         ledger.add_entry(a)
         ledger.add_entry(b)
@@ -332,21 +332,21 @@ class DiscourseLedgerTests(unittest.TestCase):
         generic = self._entry(
             "generic",
             CommitmentType.COMMITMENT,
-            "后续章节将对这些问题做详细比较并提供参考框架",
+            "Future sections will provide a framework and offer a detailed comparison of these issues",
             "s1",
             100,
         )
         specific = self._entry(
             "specific",
             CommitmentType.COMMITMENT,
-            "适应证边界需要在证据稀疏条件下明确标注适用范围",
+            "Indication boundaries should define the valid scope under sparse evidence",
             "s1",
             101,
         )
         loop = self._entry(
             "loop",
             CommitmentType.OPEN_LOOP,
-            "适应证边界与证据稀疏条件下的适用范围仍待澄清",
+            "The valid scope under sparse evidence and indication boundaries remains unclear",
             "s2",
             110,
         )

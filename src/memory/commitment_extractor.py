@@ -105,29 +105,30 @@ class CommitmentExtractor:
         返回值：
             str：完整 prompt 字符串
         """
-        context_block = f"已有内容摘要：\n{existing_summary}\n\n" if existing_summary else ""
+        context_block = f"Existing summary:\n{existing_summary}\n\n" if existing_summary else ""
         return (
-            "你是一个叙事分析助手。请从以下文本中提取所有话语承诺对象，"
-            "以 JSON 数组格式输出，不要添加任何解释。\n\n"
+            "You are a narrative analysis assistant. Extract all discourse commitments from the text below. "
+            "Return a JSON array only, with no explanation.\n\n"
             f"{context_block}"
-            f"当前节内容：\n{section_content}\n\n"
-            "每个承诺对象格式如下：\n"
+            f"Current section content:\n{section_content}\n\n"
+            "Each item must use this schema:\n"
             "{\n"
-            '  "content": "承诺的简洁描述（不超过60字）",\n'
+            '  "content": "A concise English description of the commitment, under 60 words",\n'
             '  "commitment_type": "fact"|"commitment"|"open_loop"|"hypothesis"|"style_policy",\n'
             '  "constraint_type": "immutable"|"stateful"|"soft"\n'
             "}\n\n"
-            "类型说明：\n"
-            "  fact         — 已确立的客观事实（人物特征、世界设定等）\n"
-            "  commitment   — 对后文的明确承诺（角色行动、情节走向等）\n"
-            "  open_loop    — 未解决的悬念或未完成的线索\n"
-            "  hypothesis   — 角色的猜测或推断（不约束后文，不注入 prompt）\n"
-            "  style_policy — 全局风格要求（叙事视角、语气、格式等）\n\n"
-            "约束强度说明：\n"
-            "  immutable — 叙事上不可逆的设定（角色身份、世界规则、已发生事件等），后续节不得矛盾\n"
-            "  stateful  — 可随情节推进合法演变的状态（位置、关系、情绪等），更新须前后连贯\n"
-            "  soft      — 风格偏好或非核心细节，可酌情调整\n\n"
-            "输出 JSON 数组，无其他内容："
+            "Type definitions:\n"
+            "  fact         - established facts such as character traits, world rules, and completed events\n"
+            "  commitment   - explicit commitments about later narrative moves, actions, or outcomes\n"
+            "  open_loop    - unresolved questions, tensions, or unfinished threads\n"
+            "  hypothesis   - guesses or inferences that should not constrain later sections\n"
+            "  style_policy - global style requirements such as perspective, tone, or formatting\n\n"
+            "Constraint strength definitions:\n"
+            "  immutable - narratively irreversible information that later sections must not contradict\n"
+            "  stateful  - states that may evolve lawfully but must remain coherent over time\n"
+            "  soft      - stylistic preferences or non-core details that may be adjusted\n\n"
+            "All content values must be in English.\n"
+            "Return the JSON array only:"
         )
 
     def _parse_output(self, raw: str) -> List[dict]:

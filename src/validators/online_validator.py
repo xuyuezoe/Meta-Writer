@@ -137,16 +137,16 @@ class OnlineValidator:
             issues.extend(format_issues)
             format_passed = not bool(format_issues)
             char_count = len(content.strip())
-            format_details = f"长度={char_count}字符"
+            format_details = f"length={char_count} chars"
             if format_issues:
                 format_details += "  " + " | ".join(i.description for i in format_issues)
-            self.logger.debug("格式检查完成，发现 %d 个问题", len(format_issues))
+            self.logger.debug("Format check completed with %d issues", len(format_issues))
         except Exception as e:
-            self.logger.warning("格式检查异常（跳过）：%s", e)
-            format_details = f"异常跳过：{e}"
+            self.logger.warning("Format check failed and was skipped: %s", e)
+            format_details = f"skipped_due_to_exception: {e}"
         if self.run_logger is not None:
             self.run_logger.log_validation_result(
-                section_id, attempt, "格式检查", format_passed, format_details
+                section_id, attempt, "Format", format_passed, format_details
             )
 
         # 第二层：约束检查
@@ -162,24 +162,28 @@ class OnlineValidator:
                 issues.append(Issue(
                     type="constraint",
                     severity=IssueSeverity.MAJOR.value,
-                    description=f"违反约束：{v}",
+                    description=f"Constraint violated: {v}",
                     location=section_id,
                 ))
             constraint_passed = not bool(constraint_violations)
             total_c = len(state.global_constraints)
             passed_c = total_c - len(constraint_violations)
-            detail_parts = [f"{passed_c}/{total_c} 条通过"]
+            detail_parts = [f"{passed_c}/{total_c} passed"]
             if constraint_unknowns:
-                detail_parts.append(f"未知 {len(constraint_unknowns)} 条")
-            constraint_details = "，".join(detail_parts)
-            self.logger.debug("约束检查完成，违反 %d 条，未知 %d 条", len(constraint_violations), len(constraint_unknowns))
+                detail_parts.append(f"{len(constraint_unknowns)} unknown")
+            constraint_details = ", ".join(detail_parts)
+            self.logger.debug(
+                "Constraint check completed with %d violations and %d unknown results",
+                len(constraint_violations),
+                len(constraint_unknowns),
+            )
         except Exception as e:
             constraint_details = f"validator_exception: {e}"
-            self.logger.warning("约束检查异常（跳过）：%s", e)
+            self.logger.warning("Constraint check failed and was skipped: %s", e)
             constraint_unknowns = list(state.global_constraints)
         if self.run_logger is not None:
             self.run_logger.log_validation_result(
-                section_id, attempt, "约束检查", constraint_passed, constraint_details
+                section_id, attempt, "Constraints", constraint_passed, constraint_details
             )
             if constraint_unknowns:
                 self.run_logger.log_validation_note(
@@ -189,7 +193,7 @@ class OnlineValidator:
                 )
         if constraint_unknowns:
             self.logger.warning(
-                "constraint_unknown: %d 条（section=%s）",
+                "constraint_unknown: %d items (section=%s)",
                 len(constraint_unknowns),
                 section_id,
             )
@@ -201,7 +205,7 @@ class OnlineValidator:
             alignment_result = self.alignment_scorer.compute_dcas(decision, content)
             dcas_score = alignment_result.get("dcas", 1.0)
             dcas_passed = dcas_score >= self.THRESHOLD_DCAS
-            dcas_details = f"score={dcas_score:.3f}  (阈值={self.THRESHOLD_DCAS})"
+            dcas_details = f"score={dcas_score:.3f} (threshold={self.THRESHOLD_DCAS})"
             if dcas_score < self.THRESHOLD_DCAS:
                 severity = (
                     IssueSeverity.CRITICAL.value
@@ -212,19 +216,19 @@ class OnlineValidator:
                     type="alignment",
                     severity=severity,
                     description=(
-                        f"决策-内容对齐度不足（DCAS={dcas_score:.3f} < {self.THRESHOLD_DCAS}）"
+                        f"Decision-content alignment is too low (DCAS={dcas_score:.3f} < {self.THRESHOLD_DCAS})"
                     ),
                     location=section_id,
                 ))
-            self.logger.debug("对齐度检查完成，DCAS=%.3f", dcas_score)
+            self.logger.debug("Alignment check completed with DCAS=%.3f", dcas_score)
         except Exception as e:
-            self.logger.warning("对齐度检查异常（跳过）：%s", e)
+            self.logger.warning("Alignment check failed and was skipped: %s", e)
             dcas_score = 0.5
             dcas_passed = False
-            dcas_details = f"异常跳过：{e}"
+            dcas_details = f"skipped_due_to_exception: {e}"
         if self.run_logger is not None:
             self.run_logger.log_validation_result(
-                section_id, attempt, "对齐度(DCAS)", dcas_passed, dcas_details
+                section_id, attempt, "Alignment (DCAS)", dcas_passed, dcas_details
             )
 
         # 第四层：一致性检查
@@ -239,21 +243,21 @@ class OnlineValidator:
             consistency_passed = not bool(blocking_consistency)
             dim_count = 4
             fail_count = len(consistency_issues)
-            consistency_details = f"{dim_count - fail_count}/{dim_count} 维度通过"
-            self.logger.debug("一致性检查完成，发现 %d 个问题", len(consistency_issues))
+            consistency_details = f"{dim_count - fail_count}/{dim_count} dimensions passed"
+            self.logger.debug("Consistency check completed with %d issues", len(consistency_issues))
         except Exception as e:
-            self.logger.warning("一致性检查异常（跳过）：%s", e)
-            consistency_details = f"异常跳过：{e}"
+            self.logger.warning("Consistency check failed and was skipped: %s", e)
+            consistency_details = f"skipped_due_to_exception: {e}"
         if self.run_logger is not None:
             self.run_logger.log_validation_result(
-                section_id, attempt, "一致性检查", consistency_passed, consistency_details
+                section_id, attempt, "Consistency", consistency_passed, consistency_details
             )
 
         # MetaState 门控：验证器不稳定时，将 MAJOR 降级为 MINOR
         if not self.meta_state.gate_action("trust_validator_major"):
             issues = self._downgrade_major_to_minor(issues)
             self.logger.info(
-                "MetaState 门控：验证器不稳定（stability=%.2f），MAJOR 降级为 MINOR",
+                "MetaState gate: validator is unstable (stability=%.2f), MAJOR issues downgraded to MINOR",
                 self.meta_state.validator_stability_estimate,
             )
 
@@ -263,13 +267,13 @@ class OnlineValidator:
 
         if not passed:
             self.logger.info(
-                "验证失败 [%d blocking issues] DCAS=%.3f section=%s",
+                "Validation failed [%d blocking issues] DCAS=%.3f section=%s",
                 len(blocking_issues),
                 dcas_score,
                 section_id,
             )
         else:
-            self.logger.info("验证通过 DCAS=%.3f section=%s", dcas_score, section_id)
+            self.logger.info("Validation passed DCAS=%.3f section=%s", dcas_score, section_id)
 
         report = ValidationReport(
             passed=passed,
@@ -309,13 +313,13 @@ class OnlineValidator:
             issues.append(Issue(
                 type="format",
                 severity=IssueSeverity.MAJOR.value,
-                description=f"内容过短（{char_count} 字符 < {self._MIN_CHARS}）",
+                description=f"Content is too short ({char_count} chars < {self._MIN_CHARS})",
             ))
         elif char_count > self._MAX_CHARS:
             issues.append(Issue(
                 type="format",
                 severity=IssueSeverity.MINOR.value,
-                description=f"内容过长（{char_count} 字符 > {self._MAX_CHARS}）",
+                description=f"Content is too long ({char_count} chars > {self._MAX_CHARS})",
             ))
 
         leftover_tags = re.findall(
@@ -325,7 +329,7 @@ class OnlineValidator:
             issues.append(Issue(
                 type="format",
                 severity=IssueSeverity.CRITICAL.value,
-                description=f"内容包含残留 XML 标签：{set(leftover_tags)}",
+                description=f"Content contains leftover XML tags: {set(leftover_tags)}",
             ))
 
         return issues
@@ -413,11 +417,11 @@ class OnlineValidator:
             return True, None
 
         # 规则1：字数/篇幅类 → 整篇目标，单节直接通过
-        if re.search(r'\d+\s*[字词]|字数|篇幅|字以内|字左右|字以上', constraint):
+        if re.search(r"\b\d+\s*(?:words?|chars?|characters?)\b|word count|length|within \d+ words|around \d+ words|at least \d+ words", c_lower):
             return True, None
 
         # 规则2：情节/事件类 → 故事整体要求，单节不强制
-        if re.search(r'包含|必须包含|需要包含|出现|发生|有一个|存在|结局|结尾|必须有|要有', c_lower):
+        if re.search(r"\b(include|must include|needs to include|contain|contains|appear|appears|occur|occurs|there is|there are|ending|conclusion|must have|should have)\b", c_lower):
             return True, None
 
         # 规则3：实体/属性类 → 提取关键实体，在内容中命中即通过
@@ -427,10 +431,11 @@ class OnlineValidator:
 
         # 规则4：LLM 兜底（无法判断也需显式返回 UNKNOWN）
         prompt = (
-            "判断章节内容是否直接违反下列约束。只回答 true 或 false，"
-            "true=满足，false=违反，不要解释，也不要添加其他文字。\n\n"
-            f"约束：{constraint}\n"
-            f"内容：{content[:400]}\n"
+            "Decide whether the section content directly satisfies the constraint below. "
+            "Answer with true or false only. true means satisfied. false means violated. "
+            "Do not explain your answer.\n\n"
+            f"Constraint: {constraint}\n"
+            f"Content: {content[:400]}\n"
         )
         try:
             response = self.llm.generate(
@@ -485,14 +490,18 @@ class OnlineValidator:
             List[str]：关键实体列表（小写）
         """
         cleaned = re.sub(
-            r'主角|背景|场景|设定|故事|人物|名叫|叫做|叫|名为|是|在|位于|属于',
-            '',
-            constraint,
+            r"\b(main character|background|setting|scene|story|character|named|called|known as|is|are|in|at|located|belongs to|must|should|include|contain)\b",
+            " ",
+            constraint.lower(),
         )
-        tokens = re.split(r'[\s，。！？,.!?、\-/]+', cleaned.strip())
-        entities = [t.lower() for t in tokens if len(t) >= 2]
-        extra = [e[:2] for e in entities if len(e) >= 4]
-        return entities + extra
+        tokens = re.split(r"[\s,.;:!?()\[\]\"'/-]+", cleaned.strip())
+        stopwords = {
+            "the", "and", "for", "with", "from", "into", "that", "this", "those", "these",
+            "must", "should", "have", "has", "had", "will", "would", "could", "include",
+            "contain", "contains", "section", "story", "content", "character", "setting",
+        }
+        entities = [t for t in tokens if len(t) >= 3 and t not in stopwords]
+        return entities
 
     def _extract_json_object(self, text: str) -> Optional[str]:
         """提取首个 JSON 对象文本，失败返回 None"""
@@ -555,18 +564,18 @@ class OnlineValidator:
             return value
         if isinstance(value, str):
             lowered = value.strip().lower()
-            if lowered in {"true", "是", "通过", "一致", "有"}:
+            if lowered in {"true", "pass", "passed", "consistent", "coherent", "yes"}:
                 return True
-            if lowered in {"false", "否", "矛盾", "冲突", "重复"}:
+            if lowered in {"false", "fail", "failed", "contradiction", "conflict", "duplicate"}:
                 return False
         return None
 
     def _keyword_to_bool(self, text: str) -> Optional[bool]:
         """根据局部关键词推断布尔值"""
         lowered = text.lower()
-        if "false" in lowered or "矛盾" in lowered or "冲突" in lowered or "重复" in lowered:
+        if "false" in lowered or "contradiction" in lowered or "conflict" in lowered or "duplicate" in lowered:
             return False
-        if "true" in lowered or "一致" in lowered or "连贯" in lowered or "通过" in lowered:
+        if "true" in lowered or "consistent" in lowered or "coherent" in lowered or "pass" in lowered:
             return True
         return None
 
@@ -616,12 +625,13 @@ class OnlineValidator:
 
         context_hint = "\n".join(prev_snippets)
         prompt = (
-            "检查新内容与已有章节是否存在明确矛盾或叙事重复。"
-            "使用 JSON 回复，例如 {\"entity_consistency\": true, ...}，"
-            "字段分别为 entity_consistency / timeline_consistency / setting_consistency / narrative_progress。"
-            "true=通过，false=存在问题，不要输出 markdown 代码块或额外文本。\n\n"
-            f"已有章节片段：\n{context_hint}\n\n"
-            f"新生成内容：{content[:500]}"
+            "Check whether the new content contains clear contradictions or narrative repetition relative to the prior sections. "
+            "Reply with JSON only, for example "
+            "{\"entity_consistency\": true, \"timeline_consistency\": true, \"setting_consistency\": true, \"narrative_progress\": true}. "
+            "The fields must be entity_consistency, timeline_consistency, setting_consistency, and narrative_progress. "
+            "true means pass and false means an issue exists. Do not output markdown code fences or extra text.\n\n"
+            f"Prior section snippets:\n{context_hint}\n\n"
+            f"New content:\n{content[:500]}"
         )
 
         issues: List[Issue] = []
@@ -638,10 +648,10 @@ class OnlineValidator:
                 },
             )
             checks = {
-                "entity_consistency":   ("实体属性矛盾",   IssueSeverity.MINOR.value),
-                "timeline_consistency": ("时间线不连贯",   IssueSeverity.MINOR.value),
-                "setting_consistency":  ("设定前后冲突",   IssueSeverity.MINOR.value),
-                "narrative_progress":   ("叙事重复已有章节", IssueSeverity.MINOR.value),
+                "entity_consistency":   ("Entity inconsistency", IssueSeverity.MINOR.value),
+                "timeline_consistency": ("Timeline inconsistency",   IssueSeverity.MINOR.value),
+                "setting_consistency":  ("Setting contradiction",   IssueSeverity.MINOR.value),
+                "narrative_progress":   ("Narrative repetition of prior sections", IssueSeverity.MINOR.value),
             }
             flags = self._parse_consistency_flags(response, list(checks.keys()))
             for tag, (label, severity) in checks.items():
@@ -654,7 +664,7 @@ class OnlineValidator:
                         location=state.current_section,
                     ))
         except Exception as e:
-            self.logger.warning("一致性检查 LLM 调用失败（跳过）：%s", e)
+            self.logger.warning("Consistency LLM call failed and was skipped: %s", e)
 
         return issues
 

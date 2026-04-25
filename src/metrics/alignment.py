@@ -116,7 +116,7 @@ class AlignmentScorer:
         }
 
         self.logger.info(
-            "DCAS计算完成: coverage=%.3f consistency=%.3f effectiveness=%.3f → dcas=%.3f",
+            "DCAS computed: coverage=%.3f consistency=%.3f effectiveness=%.3f -> dcas=%.3f",
             coverage, consistency, effectiveness, dcas,
         )
         return result
@@ -148,21 +148,20 @@ class AlignmentScorer:
             三个二元组：((评分, 是否 fallback), ...)
         """
         prompt = (
-            "你是一个叙事质量评估助手，请评估生成内容的质量。\n\n"
-            f"写作决策：{decision.decision}\n"
-            f"推理过程：{decision.reasoning}\n"
-            f"预期效果：{decision.expected_effect}\n"
-            f"实际内容：{content}\n\n"
-            "请评估以下三个维度（评分范围 0.0 到 1.0）：\n"
-            "1. coverage_score（意图覆盖度）：decision 的意图在 content 中实现的程度\n"
-            "   1.0=完整实现，0.8=大部分，0.6=部分实现，0.0=完全未实现\n"
-            "2. consistency_score（逻辑一致性）：reasoning 的逻辑与 content 是否一致\n"
-            "   1.0=完全一致，0.8=基本一致，0.6=部分一致，0.0=严重矛盾\n"
-            "3. effectiveness_score（效果达成度）：content 是否达到了 expected_effect\n"
-            "   1.0=完全达到，0.8=大部分，0.6=部分达到，0.0=完全未达到\n\n"
-            "仅输出以下 JSON，将三个中文描述词替换为你的实际评分数字，不要输出任何其他内容：\n"
-            "{\"coverage_score\": 覆盖度评分, \"consistency_score\": 一致性评分, "
-            "\"effectiveness_score\": 效果评分}"
+            "You are a narrative quality evaluator. Score how well the generated content follows the decision.\n\n"
+            f"Decision: {decision.decision}\n"
+            f"Reasoning: {decision.reasoning}\n"
+            f"Expected effect: {decision.expected_effect}\n"
+            f"Generated content: {content}\n\n"
+            "Score the following dimensions on a 0.0 to 1.0 scale:\n"
+            "1. coverage_score: how fully the content implements the decision\n"
+            "   1.0=fully, 0.8=mostly, 0.6=partially, 0.0=not implemented\n"
+            "2. consistency_score: how consistent the content is with the reasoning\n"
+            "   1.0=fully consistent, 0.8=mostly consistent, 0.6=partially consistent, 0.0=strong contradiction\n"
+            "3. effectiveness_score: how fully the content achieves the expected effect\n"
+            "   1.0=fully achieved, 0.8=mostly achieved, 0.6=partially achieved, 0.0=not achieved\n\n"
+            "Return this JSON only, replacing the placeholder values with numbers:\n"
+            "{\"coverage_score\": 0.0, \"consistency_score\": 0.0, \"effectiveness_score\": 0.0}"
         )
 
         try:
@@ -179,16 +178,16 @@ class AlignmentScorer:
                 },
             )
         except Exception as e:
-            self.logger.warning("DCAS 批量评分 LLM 调用失败，全部降级：%s", e)
+            self.logger.warning("DCAS batch scoring call failed; falling back on all dimensions: %s", e)
             return (
                 (_FALLBACK_SCORE, True),
                 (_FALLBACK_SCORE, True),
                 (_FALLBACK_SCORE, True),
             )
 
-        coverage      = self._parse_json_field(response, "coverage_score",      "意图覆盖度")
-        consistency   = self._parse_json_field(response, "consistency_score",   "逻辑一致性")
-        effectiveness = self._parse_json_field(response, "effectiveness_score", "效果达成度")
+        coverage      = self._parse_json_field(response, "coverage_score", "coverage")
+        consistency   = self._parse_json_field(response, "consistency_score", "consistency")
+        effectiveness = self._parse_json_field(response, "effectiveness_score", "effectiveness")
 
         return coverage, consistency, effectiveness
 
@@ -247,8 +246,8 @@ class AlignmentScorer:
                 if 0.0 <= score <= 1.0:
                     return score, False
 
-            raise ValueError(f"无法从响应中提取字段 '{field}'")
+            raise ValueError(f"unable to extract field '{field}' from response")
 
         except Exception as e:
-            self.logger.warning("%s 评分解析失败，降级为 %.1f：%s", dimension, _FALLBACK_SCORE, e)
+            self.logger.warning("%s score parsing failed; falling back to %.2f: %s", dimension, _FALLBACK_SCORE, e)
             return _FALLBACK_SCORE, True

@@ -48,6 +48,8 @@ metabench/output/
 .DS_Store
 Thumbs.db
 *~
+/*.md
+!README.md
 debug.md
 plan.md
 research.md

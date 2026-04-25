@@ -124,24 +124,24 @@ try:
             referenced_section_ids: 引用的前文节点 ID 列表（可选）
         """
         decision: str = Field(
-            description="本节的核心写作决策（简要说明做什么）"
+            description="The core writing decision for this section"
         )
         reasoning: str = Field(
-            description="推理过程（为什么这样写，可引用前文节点 ID）"
+            description="The reasoning behind the decision, optionally referencing prior section IDs"
         )
         expected_effect: str = Field(
-            description="预期达到的叙事效果（本节完成后的故事状态）"
+            description="The narrative effect this section should achieve"
         )
         confidence: float = Field(
             ge=0.0, le=1.0,
-            description="置信度：0.0 到 1.0 之间的浮点数"
+            description="A confidence score between 0.0 and 1.0"
         )
         content: str = Field(
-            description="纯叙事正文，禁止包含节ID、字数统计、XML标签或任何元信息"
+            description="Narrative prose only, with no section IDs, counts, XML tags, or meta information"
         )
         referenced_section_ids: List[str] = Field(
             default_factory=list,
-            description="引用的前文节点 ID 列表，如 ['sec1', 'sec2']"
+            description="A list of referenced prior section IDs, such as ['sec1', 'sec2']"
         )
 
 except ImportError:

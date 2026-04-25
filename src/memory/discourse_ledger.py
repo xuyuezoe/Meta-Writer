@@ -301,15 +301,16 @@ class DiscourseLedger:
 
     def _build_batch_relation_prompt(self, pairs: List[Tuple[str, str]]) -> str:
         lines = [
-            "判断以下多对叙事承诺之间的关系。",
-            "每对独立判断，只允许四种 relation_type：supports、conflicts、resolves、none。",
-            "resolves 仅当 target 是 open_loop 时有效。",
-            "只根据给定两条 DSL 内容做最保守判断，不得自行补充背景。",
-            "只有关系明确时才输出 supports、conflicts 或 resolves；不确定时输出 none。",
-            "只允许返回 JSON 数组，不允许任何解释文本，不允许 markdown 代码块。",
-            "每个对象必须包含 source_id、target_id、relation_type、confidence。",
+            "Determine the relation for each DSL entry pair below.",
+            "Judge each pair independently.",
+            "Allowed relation_type values are supports, conflicts, resolves, and none.",
+            "Use resolves only when the target is an open_loop.",
+            "Base the answer only on the two DSL entries provided. Do not add background knowledge.",
+            "If the relation is unclear, return none.",
+            "Return a JSON array only. Do not include explanations or markdown code fences.",
+            "Each object must include source_id, target_id, relation_type, and confidence.",
             "",
-            "待判断 pairs：",
+            "Pairs to judge:",
         ]
 
         for source_id, target_id in pairs:
@@ -330,7 +331,7 @@ class DiscourseLedger:
             )
 
         lines.append(
-            '输出示例：[{"source_id":"...","target_id":"...","relation_type":"none","confidence":0.0}]'
+            'Example output: [{"source_id":"...","target_id":"...","relation_type":"none","confidence":0.0}]'
         )
         return "\n".join(lines)
 
@@ -859,64 +860,30 @@ class DiscourseLedger:
         return re.sub(r"\s+", " ", text.strip().lower())
 
     @classmethod
-    def _extract_char_ngrams(cls, text: str) -> Set[str]:
-        stop_ngrams = {"以及", "或者", "因此", "但是", "如果", "需要", "进行", "相关", "问题", "内容", "部分"}
-        normalized = cls._normalize_text(text)
-        chunks = re.findall(r"[\u4e00-\u9fff]+", normalized)
-        ngrams: Set[str] = set()
-        for chunk in chunks:
-            if len(chunk) < 2:
-                continue
-            for size in range(2, 7):
-                if len(chunk) < size:
-                    continue
-                for idx in range(0, len(chunk) - size + 1):
-                    piece = chunk[idx: idx + size]
-                    if piece in stop_ngrams:
-                        continue
-                    ngrams.add(piece)
-        return ngrams
-
-    @classmethod
     def _extract_keyword_tokens(cls, text: str) -> Set[str]:
         normalized = cls._normalize_text(text)
         tokens: Set[str] = set()
-        chinese_chunks = re.findall(r"[\u4e00-\u9fff]{2,}", normalized)
-        stop_chunks = {
-            "提供参考框架",
-            "系统梳理",
-            "持续贯彻",
-            "作为主线",
-            "可操作路径",
-            "研究者",
-            "临床工作者",
-            "后续章节",
-            "系统性比较",
+        stop_tokens = {
+            "the", "and", "for", "with", "from", "that", "this", "into", "onto", "over",
+            "under", "within", "across", "about", "after", "before", "through", "during",
+            "provide", "provides", "systematic", "systematically", "review", "analysis",
+            "future", "section", "sections", "detailed", "comparison", "important", "issue",
+            "framework", "discussion", "approach", "result", "results", "content",
         }
-        for chunk in chinese_chunks:
-            trimmed = chunk[:12]
-            if 2 <= len(trimmed) <= 12 and trimmed not in stop_chunks:
-                tokens.add(trimmed)
-            if len(chunk) > 6:
-                for size in range(3, 7):
-                    if len(chunk) < size:
-                        continue
-                    for idx in range(0, len(chunk) - size + 1):
-                        piece = chunk[idx: idx + size]
-                        if piece in stop_chunks:
-                            continue
-                        tokens.add(piece)
 
-        english_terms = re.findall(r"\b[a-z]{2,}(?:-[a-z]{2,})?\b", normalized)
-        tokens.update(english_terms)
-
-        acronyms = re.findall(r"\b[a-z0-9]{2,8}\b", normalized)
-        for token in acronyms:
-            if any(ch.isdigit() for ch in token) or token.isupper():
+        english_terms = re.findall(r"\b[a-z][a-z0-9]*(?:-[a-z0-9]+)*\b", normalized)
+        for token in english_terms:
+            if len(token) >= 3 and token not in stop_tokens:
                 tokens.add(token)
 
-        year_or_range = re.findall(r"\b\d{1,4}(?:-\d{1,4})?(?:年|版)?\b", text)
-        tokens.update(year_or_range)
+        title_acronyms = re.findall(r"\b[A-Z]{2,8}\b", text)
+        tokens.update(token.lower() for token in title_acronyms)
+
+        mixed_tokens = re.findall(r"\b[a-zA-Z]*\d+[a-zA-Z0-9-]*\b", text)
+        tokens.update(token.lower() for token in mixed_tokens if len(token) >= 2)
+
+        numeric_spans = re.findall(r"\b\d{1,4}(?:-\d{1,4})?(?:st|nd|rd|th)?\b", normalized)
+        tokens.update(numeric_spans)
         return {token for token in tokens if token}
 
     @classmethod
@@ -933,17 +900,11 @@ class DiscourseLedger:
 
     @classmethod
     def _compute_term_overlap_score(cls, source_text: str, target_text: str) -> float:
-        char_overlap = cls._overlap_ratio(
-            cls._extract_char_ngrams(source_text),
-            cls._extract_char_ngrams(target_text),
-        )
         keyword_overlap = cls._overlap_ratio(
             cls._extract_keyword_tokens(source_text),
             cls._extract_keyword_tokens(target_text),
         )
-        high = max(char_overlap, keyword_overlap)
-        low = min(char_overlap, keyword_overlap)
-        return min(1.0, high + 0.15 * low)
+        return min(1.0, keyword_overlap)
 
     @classmethod
     def _is_too_short_noise_pair(cls, source_text: str, target_text: str) -> bool:
@@ -958,7 +919,15 @@ class DiscourseLedger:
             return True
         if re.fullmatch(r"[0-9]+(?:\.[0-9]+)?", normalized):
             return True
-        return normalized in {"如下所示", "见前文", "待补充", "待完善", "详见上文", "同上"}
+        return normalized in {
+            "see above",
+            "same as above",
+            "to be added",
+            "to be completed",
+            "placeholder",
+            "tbd",
+            "n/a",
+        }
 
     @classmethod
     def _is_template_noise_pair(cls, source_text: str, target_text: str) -> bool:
@@ -968,14 +937,14 @@ class DiscourseLedger:
     def _generic_phrase_penalty(cls, text: str) -> float:
         normalized = cls._normalize_text(text)
         generic_phrases = {
-            "提供参考框架",
-            "系统梳理",
-            "持续关注",
-            "后续章节",
-            "详细比较",
-            "深化分析",
-            "可操作",
-            "重要议题",
+            "provide a framework",
+            "systematically review",
+            "future sections",
+            "detailed comparison",
+            "important issue",
+            "further analysis",
+            "practical pathway",
+            "ongoing attention",
         }
         penalty = 0.0
         for phrase in generic_phrases:
