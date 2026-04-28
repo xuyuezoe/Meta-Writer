@@ -20,6 +20,19 @@ from typing import Dict, List, Tuple
 
 from metabench.api_client import OpenAICompatibleClient
 from metabench.io_utils import read_jsonl, write_jsonl
+from metabench.local_metrics import (
+    compute_acc_once as _shared_compute_acc_once,
+    compute_acc_periodic as _shared_compute_acc_periodic,
+    compute_acc_range as _shared_compute_acc_range,
+    compute_completion_rate as _shared_compute_completion_rate,
+    compute_instruction_hits as _shared_compute_instruction_hits,
+    compute_proxy_qa as _shared_compute_proxy_qa,
+    compute_soft_instruction_hits as _shared_compute_soft_instruction_hits,
+    compute_structure_scores as _shared_compute_structure_scores,
+    contains_keyword as _shared_contains_keyword,
+    extract_soft_keywords as _shared_extract_soft_keywords,
+    split_blocks as _shared_split_blocks,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -46,37 +59,25 @@ def parse_args() -> argparse.Namespace:
 def _split_blocks(response_text: str) -> List[str]:
     """按段落切分文本块。"""
 
-    blocks = [block.strip() for block in re.split(r"\n\s*\n", response_text) if block.strip() != ""]
-    if len(blocks) == 0:
-        return [response_text.strip()]
-    return blocks
+    return _shared_split_blocks(response_text)
 
 
 def _contains_keyword(text: str, keyword: str) -> bool:
     """判断文本是否包含关键词。"""
 
-    return keyword.lower() in text.lower()
+    return _shared_contains_keyword(text, keyword)
 
 
 def _compute_completion_rate(blocks: List[str], expected_blocks: int) -> float:
     """计算结构完成率。"""
 
-    if expected_blocks <= 0:
-        raise ValueError("expected_blocks 必须大于 0")
-    completion = min(1.0, len(blocks) / expected_blocks)
-    return completion
+    return _shared_compute_completion_rate(blocks, expected_blocks)
 
 
 def _compute_acc_once(response_text: str, once_keywords: List[str]) -> float:
     """计算 once 命中率。"""
 
-    if len(once_keywords) == 0:
-        return 1.0
-    hits = 0
-    for keyword in once_keywords:
-        if _contains_keyword(response_text, keyword):
-            hits += 1
-    return hits / len(once_keywords)
+    return _shared_compute_acc_once(response_text, once_keywords)
 
 
 def _compute_acc_range(blocks: List[str], range_specs: List[Dict[str, object]]) -> float:
@@ -91,22 +92,7 @@ def _compute_acc_range(blocks: List[str], range_specs: List[Dict[str, object]]) 
     块编号按 1 开始。
     """
 
-    if len(range_specs) == 0:
-        return 1.0
-
-    hits = 0
-    for spec in range_specs:
-        keyword = str(spec["keyword"])
-        start_index = int(spec["start"])
-        end_index = int(spec["end"])
-        if start_index <= 0 or end_index <= 0 or end_index < start_index:
-            raise ValueError(f"非法 range 约束: {spec}")
-
-        target_blocks = blocks[start_index - 1 : end_index]
-        joined_text = "\n".join(target_blocks)
-        if _contains_keyword(joined_text, keyword):
-            hits += 1
-    return hits / len(range_specs)
+    return _shared_compute_acc_range(blocks, range_specs)
 
 
 def _compute_acc_periodic(blocks: List[str], periodic_specs: List[Dict[str, object]]) -> float:
@@ -120,108 +106,31 @@ def _compute_acc_periodic(blocks: List[str], periodic_specs: List[Dict[str, obje
     }
     """
 
-    if len(periodic_specs) == 0:
-        return 1.0
-
-    per_spec_scores: List[float] = []
-    for spec in periodic_specs:
-        keyword = str(spec["keyword"])
-        every = int(spec["every"])
-        start_index = int(spec["start"])
-        if every <= 0 or start_index <= 0:
-            raise ValueError(f"非法 periodic 约束: {spec}")
-
-        expected_positions: List[int] = []
-        cursor = start_index
-        while cursor <= len(blocks):
-            expected_positions.append(cursor)
-            cursor += every
-
-        if len(expected_positions) == 0:
-            per_spec_scores.append(1.0)
-            continue
-
-        hit_count = 0
-        for position in expected_positions:
-            if _contains_keyword(blocks[position - 1], keyword):
-                hit_count += 1
-        per_spec_scores.append(hit_count / len(expected_positions))
-
-    return sum(per_spec_scores) / len(per_spec_scores)
+    return _shared_compute_acc_periodic(blocks, periodic_specs)
 
 
 def _compute_proxy_qa(response_text: str, proxy_questions: List[Dict[str, object]]) -> Tuple[int, int]:
     """计算 ProxyQA 命中数量。"""
 
-    total_count = len(proxy_questions)
-    if total_count == 0:
-        raise ValueError("proxy_questions 不能为空")
-
-    hit_count = 0
-    for question in proxy_questions:
-        answer = str(question["answer"]).strip()
-        if answer != "" and _contains_keyword(response_text, answer):
-            hit_count += 1
-    return hit_count, total_count
+    return _shared_compute_proxy_qa(response_text, proxy_questions)
 
 
 def _compute_instruction_hits(response_text: str, must_include: List[str]) -> Tuple[int, int]:
     """基于 must_include 计算指令命中。"""
 
-    instruction_total = len(must_include)
-    if instruction_total == 0:
-        raise ValueError("must_include 不能为空，用于指令遵循计算")
-
-    instruction_hits = 0
-    for item in must_include:
-        if _contains_keyword(response_text, item):
-            instruction_hits += 1
-    return instruction_hits, instruction_total
+    return _shared_compute_instruction_hits(response_text, must_include)
 
 
 def _extract_soft_keywords(check_item: str) -> List[str]:
     """从 checklist 项中提取软约束关键词。"""
 
-    # 提取长度>=2的中文连续片段，过滤模板性词语
-    raw_tokens = re.findall(r"[\u4e00-\u9fff]{2,}", check_item)
-    ignored = {
-        "是否",
-        "覆盖",
-        "包含",
-        "给出",
-        "有",
-        "方案",
-        "方面",
-        "内容",
-    }
-    tokens = [token for token in raw_tokens if token not in ignored]
-    if len(tokens) == 0 and check_item.strip() != "":
-        return [check_item.strip()]
-    return tokens
+    return _shared_extract_soft_keywords(check_item)
 
 
 def _compute_soft_instruction_hits(response_text: str, checklist: List[str]) -> Tuple[int, int]:
     """基于 checklist 计算软约束命中率。"""
 
-    soft_total = len(checklist)
-    if soft_total == 0:
-        return 0, 0
-
-    soft_hits = 0
-    for check_item in checklist:
-        item_text = str(check_item).strip()
-        if item_text == "":
-            continue
-
-        if _contains_keyword(response_text, item_text):
-            soft_hits += 1
-            continue
-
-        candidate_keywords = _extract_soft_keywords(item_text)
-        if any(_contains_keyword(response_text, keyword) for keyword in candidate_keywords):
-            soft_hits += 1
-
-    return soft_hits, soft_total
+    return _shared_compute_soft_instruction_hits(response_text, checklist)
 
 
 def _compute_structure_scores(response_text: str) -> Tuple[float, float]:
@@ -236,33 +145,7 @@ def _compute_structure_scores(response_text: str) -> Tuple[float, float]:
     - 段落平均长度大于阈值
     """
 
-    # 第一阶段：syntax 规则
-    left_count = response_text.count("(") + response_text.count("[") + response_text.count("{")
-    right_count = response_text.count(")") + response_text.count("]") + response_text.count("}")
-    bracket_ok = 1.0 if left_count == right_count else 0.0
-
-    json_extract_ok = 1.0
-    json_candidates = re.findall(r"\{.*?\}", response_text, flags=re.DOTALL)
-    if len(json_candidates) > 0:
-        valid_json_count = 0
-        for candidate in json_candidates:
-            try:
-                json.loads(candidate)
-                valid_json_count += 1
-            except json.JSONDecodeError:
-                continue
-        json_extract_ok = valid_json_count / len(json_candidates)
-
-    syntax_pass_rate = 0.5 * bracket_ok + 0.5 * json_extract_ok
-
-    # 第二阶段：schema 规则
-    blocks = _split_blocks(response_text)
-    block_score = 1.0 if len(blocks) >= 3 else len(blocks) / 3.0
-    avg_len = sum(len(block) for block in blocks) / len(blocks)
-    avg_len_score = 1.0 if avg_len >= 60 else avg_len / 60.0
-    schema_pass_rate = 0.5 * block_score + 0.5 * avg_len_score
-
-    return syntax_pass_rate, schema_pass_rate
+    return _shared_compute_structure_scores(response_text)
 
 
 def _build_quality_prompt(prompt_text: str, response_text: str) -> str:
