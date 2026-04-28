@@ -8,6 +8,7 @@ from examples.benchmark_template import (
     DOCUMENT_LEVEL_CONSTRAINT_PREFIX,
     _extract_paragraph_blocks,
     build_benchmark_task_config,
+    evaluate_output,
 )
 
 
@@ -64,6 +65,41 @@ class BenchmarkTemplateTests(unittest.TestCase):
         self.assertEqual(
             _extract_paragraph_blocks(text),
             ["First paragraph.", "Second paragraph.", "Third paragraph."],
+        )
+
+    def test_benchmark_reference_keeps_once_keywords(self) -> None:
+        config = build_benchmark_task_config("med_s001")
+        reference = config["reference"]
+
+        self.assertIsInstance(reference, dict)
+        self.assertIn("once_keywords", reference["constraints"])
+        self.assertTrue(reference["constraints"]["once_keywords"])
+
+    def test_evaluate_output_penalizes_large_length_shortfall(self) -> None:
+        config = build_benchmark_task_config("med_s001")
+        reference = config["reference"]
+        constraints = reference["constraints"]
+        must_include = constraints["must_include"]
+        expected_blocks = constraints["expected_blocks"]
+
+        paragraph = (
+            "This review covers "
+            + ", ".join(must_include)
+            + ". "
+            + "analysis " * 40
+        ).strip()
+        generated_text = "\n\n".join(paragraph for _ in range(expected_blocks))
+
+        evaluation = evaluate_output(generated_text, reference)
+        diagnostics = evaluation["diagnostics"]
+
+        self.assertEqual(evaluation["entity_consistency_score"], 1.0)
+        self.assertLess(evaluation["length_score"], 0.5)
+        self.assertGreater(evaluation["constraint_violation_rate"], 0.5)
+        self.assertFalse(diagnostics["length_within_tolerance"])
+        self.assertLess(
+            diagnostics["response_word_count"],
+            diagnostics["required_length_words"],
         )
 
 

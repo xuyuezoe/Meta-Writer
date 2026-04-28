@@ -9,13 +9,32 @@ from __future__ import annotations
 
 import json
 import re
+import sys
 from pathlib import Path
 from typing import Dict, List, Union, cast
 
 
 BENCHMARK_ROOT: Path = Path(__file__).resolve().parent.parent / "metabench"
+METABENCH_SRC_ROOT: Path = BENCHMARK_ROOT / "src"
 SAMPLES_PATH: Path = BENCHMARK_ROOT / "examples" / "samples.jsonl"
 DOCUMENT_LEVEL_CONSTRAINT_PREFIX = "Document-level requirement: "
+
+if str(METABENCH_SRC_ROOT) not in sys.path:
+    sys.path.insert(0, str(METABENCH_SRC_ROOT))
+
+from metabench.local_metrics import (
+    compute_acc_once,
+    compute_acc_periodic,
+    compute_acc_range,
+    compute_completion_rate,
+    compute_instruction_hits,
+    compute_proxy_qa,
+    compute_structure_scores,
+    contains_keyword,
+    count_length_units,
+    split_blocks,
+)
+from metabench.scoring import compute_s_length
 
 ORGANIZER_CANDIDATES_EN = [
     "classification framework",
@@ -54,16 +73,7 @@ def _extract_paragraph_blocks(text: str) -> List[str]:
     normalized_text = text.replace("\r\n", "\n").strip()
     if normalized_text == "":
         return []
-
-    paragraph_blocks: List[str] = []
-    for raw_block in normalized_text.split("\n\n"):
-        block = raw_block.strip()
-        if block == "" or block == "---":
-            continue
-        if re.match(r"^#{1,6}\s+", block):
-            continue
-        paragraph_blocks.append(block)
-    return paragraph_blocks
+    return split_blocks(normalized_text, drop_markdown_wrappers=True)
 
 
 def _read_jsonl_rows(file_path: Path) -> List[Dict[str, object]]:
@@ -132,7 +142,7 @@ def _normalize_reference(reference: Union[str, Dict[str, object]]) -> Dict[str, 
 
 def _contains_keyword(text: str, keyword: str) -> bool:
     """Return whether a keyword appears in a case-insensitive match."""
-    return keyword.lower() in text.lower()
+    return contains_keyword(text, keyword)
 
 
 def _parse_int_field(raw_value: object, field_name: str) -> int:
@@ -205,6 +215,12 @@ def load_benchmark_task(task_id: str) -> Dict[str, object]:
             raw_constraints["periodic_keywords"],
             "constraints.periodic_keywords",
         )
+        once_keywords = [str(item) for item in must_include]
+        if "once_keywords" in raw_constraints:
+            once_keywords_object = raw_constraints["once_keywords"]
+            if not isinstance(once_keywords_object, list):
+                raise TypeError("constraints.once_keywords must be a list")
+            once_keywords = [str(item) for item in once_keywords_object]
 
         proxy_questions_object = sample_row["proxy_questions"]
         if not isinstance(proxy_questions_object, list):
@@ -244,6 +260,7 @@ def load_benchmark_task(task_id: str) -> Dict[str, object]:
             "constraints": {
                 "required_length_words": required_length_words,
                 "must_include": must_include,
+                "once_keywords": once_keywords,
                 "periodic_requirements": periodic_requirements,
                 "expected_blocks": expected_blocks,
                 "range_keywords": range_keywords,
@@ -289,6 +306,15 @@ def evaluate_output(
     if not isinstance(must_include_object, list):
         raise TypeError("reference.constraints.must_include must be a list")
     must_include = [str(item) for item in must_include_object]
+    once_keywords_object = raw_constraints.get("once_keywords", must_include)
+    if not isinstance(once_keywords_object, list):
+        raise TypeError("reference.constraints.once_keywords must be a list")
+    once_keywords = [str(item) for item in once_keywords_object]
+
+    required_length_words = _parse_int_field(
+        raw_constraints["required_length_words"],
+        "reference.constraints.required_length_words",
+    )
 
     expected_blocks = _parse_int_field(
         raw_constraints["expected_blocks"],
@@ -323,6 +349,11 @@ def evaluate_output(
     if len(proxy_questions) == 0:
         raise ValueError("reference.proxy_questions must not be empty")
 
+    paragraph_blocks = _extract_paragraph_blocks(normalized_text)
+    body_text = "\n\n".join(paragraph_blocks)
+    sentence_parts = re.split(r"[.!?]+", body_text)
+    sentence_count = sum(1 for part in sentence_parts if part.strip() != "")
+
     matched_keywords = [
         item for item in must_include if _contains_keyword(normalized_text, item)
     ]
@@ -331,11 +362,6 @@ def evaluate_output(
         for item in proxy_questions
         if _contains_keyword(normalized_text, str(item["answer"]))
     ]
-
-    paragraph_blocks = _extract_paragraph_blocks(normalized_text)
-    body_text = "\n\n".join(paragraph_blocks)
-    sentence_parts = re.split(r"[.!?]+", body_text)
-    sentence_count = sum(1 for part in sentence_parts if part.strip() != "")
 
     range_keyword_hits: List[str] = []
     missing_range_keywords: List[str] = []
@@ -374,48 +400,73 @@ def evaluate_output(
         else:
             missing_periodic_keywords.append(keyword)
 
-    entity_consistency_score = len(matched_keywords) / len(must_include)
-    proxy_hit_rate = len(matched_proxy_answers) / len(proxy_questions)
-    paragraph_signal = min(1.0, len(paragraph_blocks) / expected_blocks)
-    sentence_signal = 1.0 if sentence_count >= expected_blocks * 2 else 0.5
-    range_signal = (
-        len(range_keyword_hits) / len(range_keywords) if len(range_keywords) > 0 else 1.0
+    response_word_count = count_length_units(normalized_text)
+    length_ratio = response_word_count / required_length_words
+    length_score = compute_s_length(required_length_words, normalized_text)
+    completion_rate = compute_completion_rate(paragraph_blocks, expected_blocks)
+    once_signal = compute_acc_once(normalized_text, once_keywords)
+    range_signal = compute_acc_range(paragraph_blocks, range_keywords)
+    periodic_signal = compute_acc_periodic(paragraph_blocks, periodic_keywords)
+    proxy_hit_count, proxy_total = compute_proxy_qa(normalized_text, proxy_questions)
+    instruction_hits, instruction_total = compute_instruction_hits(
+        normalized_text,
+        must_include,
     )
-    periodic_signal = (
-        len(periodic_keyword_hits) / len(periodic_keywords)
-        if len(periodic_keywords) > 0
-        else 1.0
+    syntax_pass_rate, schema_pass_rate = compute_structure_scores(
+        normalized_text,
+        drop_markdown_wrappers=True,
     )
+
+    entity_consistency_score = instruction_hits / instruction_total
+    proxy_hit_rate = proxy_hit_count / proxy_total
+    checklist_signal = len(matched_keywords) / max(len(checklist), len(must_include))
     structure_signal = min(
         1.0,
-        0.35 * paragraph_signal
-        + 0.2 * sentence_signal
-        + 0.25 * range_signal
-        + 0.2 * periodic_signal,
+        0.2 * completion_rate
+        + 0.15 * once_signal
+        + 0.15 * range_signal
+        + 0.15 * periodic_signal
+        + 0.15 * syntax_pass_rate
+        + 0.2 * schema_pass_rate,
     )
-    checklist_signal = len(matched_keywords) / max(len(checklist), len(must_include))
     logical_coherence = min(
-        1.0, 0.5 * structure_signal + 0.3 * proxy_hit_rate + 0.2 * checklist_signal
+        1.0,
+        0.35 * structure_signal
+        + 0.25 * proxy_hit_rate
+        + 0.15 * checklist_signal
+        + 0.25 * length_score,
     )
-    constraint_violation_rate = 1.0 - entity_consistency_score
+    constraint_violation_rate = 1.0 - min(entity_consistency_score, length_score)
 
     return {
         "constraint_violation_rate": constraint_violation_rate,
         "entity_consistency_score": entity_consistency_score,
         "logical_coherence": logical_coherence,
+        "length_score": length_score,
         "diagnostics": {
             "matched_keywords": matched_keywords,
             "missing_keywords": [
                 item for item in must_include if item not in matched_keywords
             ],
             "matched_proxy_question_ids": matched_proxy_answers,
+            "response_word_count": response_word_count,
+            "required_length_words": required_length_words,
+            "length_ratio": length_ratio,
+            "length_within_tolerance": 0.8 <= length_ratio <= 1.2,
             "paragraph_count": len(paragraph_blocks),
             "sentence_count": sentence_count,
             "expected_blocks": expected_blocks,
+            "completion_rate": completion_rate,
+            "once_signal": once_signal,
             "range_keyword_hits": range_keyword_hits,
             "missing_range_keywords": missing_range_keywords,
             "periodic_keyword_hits": periodic_keyword_hits,
             "missing_periodic_keywords": missing_periodic_keywords,
+            "proxy_hit_count": proxy_hit_count,
+            "proxy_total": proxy_total,
+            "syntax_pass_rate": syntax_pass_rate,
+            "schema_pass_rate": schema_pass_rate,
+            "structure_signal": structure_signal,
             "checklist": checklist,
         },
     }
