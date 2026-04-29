@@ -29,6 +29,7 @@ from metabench.local_metrics import (
     compute_completion_rate,
     compute_instruction_hits,
     compute_proxy_qa,
+    compute_soft_instruction_hits,
     compute_structure_scores,
     contains_keyword,
     count_length_units,
@@ -450,14 +451,29 @@ def evaluate_output(
         normalized_text,
         must_include,
     )
+    checklist_hit_count, checklist_total = compute_soft_instruction_hits(
+        normalized_text,
+        checklist,
+    )
     syntax_pass_rate, schema_pass_rate = compute_structure_scores(
         normalized_text,
         drop_markdown_wrappers=True,
     )
 
-    entity_consistency_score = instruction_hits / instruction_total
+    raw_keyword_coverage = instruction_hits / instruction_total
     proxy_hit_rate = proxy_hit_count / proxy_total
-    checklist_signal = len(matched_keywords) / max(len(checklist), len(must_include))
+    checklist_signal = (
+        checklist_hit_count / checklist_total if checklist_total > 0 else raw_keyword_coverage
+    )
+    semantic_coverage_score = min(
+        1.0,
+        0.2 * raw_keyword_coverage
+        + 0.3 * proxy_hit_rate
+        + 0.25 * checklist_signal
+        + 0.15 * range_signal
+        + 0.1 * periodic_signal,
+    )
+    entity_consistency_score = max(raw_keyword_coverage, semantic_coverage_score)
     structure_signal = min(
         1.0,
         0.2 * completion_rate
@@ -469,12 +485,14 @@ def evaluate_output(
     )
     logical_coherence = min(
         1.0,
-        0.35 * structure_signal
+        0.3 * structure_signal
         + 0.25 * proxy_hit_rate
-        + 0.15 * checklist_signal
+        + 0.2 * semantic_coverage_score
         + 0.25 * length_score,
     )
-    constraint_violation_rate = 1.0 - min(entity_consistency_score, length_score)
+    semantic_violation_rate = (1.0 - semantic_coverage_score) ** 1.25
+    length_violation_rate = 1.0 - length_score
+    constraint_violation_rate = max(semantic_violation_rate, length_violation_rate)
 
     return {
         "constraint_violation_rate": constraint_violation_rate,
@@ -496,9 +514,19 @@ def evaluate_output(
             "expected_blocks": expected_blocks,
             "completion_rate": completion_rate,
             "once_signal": once_signal,
+            "raw_keyword_coverage": raw_keyword_coverage,
+            "proxy_hit_rate": proxy_hit_rate,
+            "semantic_coverage_score": semantic_coverage_score,
+            "semantic_violation_rate": semantic_violation_rate,
+            "length_violation_rate": length_violation_rate,
+            "checklist_hit_count": checklist_hit_count,
+            "checklist_total": checklist_total,
+            "checklist_signal": checklist_signal,
+            "range_signal": range_signal,
             "range_keyword_hits": range_keyword_hits,
             "range_keyword_global_fallback_hits": range_keyword_global_fallback_hits,
             "missing_range_keywords": missing_range_keywords,
+            "periodic_signal": periodic_signal,
             "periodic_keyword_hits": periodic_keyword_hits,
             "periodic_keyword_partial_hits": periodic_keyword_partial_hits,
             "missing_periodic_keywords": missing_periodic_keywords,

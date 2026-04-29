@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 from pathlib import Path
 import re
 import unittest
@@ -161,6 +162,53 @@ class BenchmarkTemplateTests(unittest.TestCase):
         self.assertIn(
             "surgery and perioperative medicine",
             evaluation["diagnostics"]["matched_keywords"],
+        )
+
+    def test_evaluate_output_uses_semantic_coverage_beyond_raw_keywords(self) -> None:
+        config = build_benchmark_task_config("med_s381")
+        reference = copy.deepcopy(config["reference"])
+        reference["constraints"]["must_include"].extend(
+            [
+                "specialized surgical systems",
+                "perioperative delivery networks",
+                "resource stewardship model",
+                "implementation maturity index",
+            ]
+        )
+        paragraphs = [
+            (
+                "The review boundary is defined around perioperative optimization "
+                "in resource-limited services, with prognosis and risk assessment "
+                "used to frame the core debate."
+            ),
+            (
+                "The discussion compares evidence conflicts across care settings "
+                "and explains why implementation feasibility matters more than "
+                "copying protocols from high-resource systems."
+            ),
+            (
+                "The closing section describes evidence gaps, uncertainties, "
+                "and future research directions for practical perioperative medicine."
+            ),
+        ]
+        generated_text = "\n\n".join(paragraphs)
+
+        evaluation = evaluate_output(generated_text, reference)
+        diagnostics = evaluation["diagnostics"]
+
+        self.assertLess(
+            diagnostics["raw_keyword_coverage"],
+            diagnostics["semantic_coverage_score"],
+        )
+        self.assertEqual(
+            evaluation["entity_consistency_score"],
+            diagnostics["semantic_coverage_score"],
+        )
+        self.assertIn("specialized surgical systems", diagnostics["missing_keywords"])
+        self.assertGreater(diagnostics["proxy_hit_rate"], 0.0)
+        self.assertLess(
+            diagnostics["semantic_violation_rate"],
+            1.0 - diagnostics["semantic_coverage_score"],
         )
 
 

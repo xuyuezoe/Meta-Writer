@@ -109,8 +109,8 @@ def compute_s_instruction(eval_metrics: EvalMetrics) -> float:
     """计算指令遵循分数（硬约束/软约束）。
 
     规则:
-    - 硬约束优先，软约束提供细粒度区分。
-    - 若硬约束未全满足，施加明显惩罚，避免“全有或全无”之外仍缺少惩戒强度。
+    - 硬约束仍占主权重，但不再因为少量 exact keyword miss 做二次惩罚。
+    - 软约束用于吸收同义表达、词形变化和段落位置漂移带来的合理覆盖证据。
     """
 
     if eval_metrics.instruction_hard_total > 0:
@@ -123,13 +123,7 @@ def compute_s_instruction(eval_metrics: EvalMetrics) -> float:
     else:
         soft_score = 1.0
 
-    if hard_score < 1.0:
-        # 硬约束未满足时，先按硬约束主导聚合，再施加额外惩罚
-        base_score = 0.8 * hard_score + 0.2 * soft_score
-        instruction_score = base_score * 0.6
-    else:
-        # 硬约束全满足后，软约束负责细粒度拉开差距
-        instruction_score = 0.7 * hard_score + 0.3 * soft_score
+    instruction_score = 0.65 * hard_score + 0.35 * soft_score
 
     return _clamp_zero_one(instruction_score)
 
