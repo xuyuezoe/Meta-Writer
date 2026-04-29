@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any, Dict, List, Optional, Tuple
 
 from rich.console import Console
@@ -33,6 +34,9 @@ from .memory.commitment_extractor import CommitmentExtractor
 from .memory.discourse_ledger import DiscourseLedger
 from .memory.dtg_store import DTGStore
 from .metrics.alignment import AlignmentScorer
+from .references.corpus import CorpusLoader
+from .references.retriever import ReferenceRetriever
+from .references.types import GlobalPaperEntry, GlobalPaperIndex
 from .validators.online_validator import OnlineValidator
 
 
@@ -70,6 +74,7 @@ class SelfCorrectingOrchestrator:
         memory_path: str = "./sessions",
         session_name: str = "session",
         output_dir: str = "./outputs",
+        corpus_dir: str = "./metabench/output",
     ):
         """
         初始化自我修正协调器
@@ -83,6 +88,7 @@ class SelfCorrectingOrchestrator:
             memory_path: DTG 存储路径
             session_name: 会话名称
             output_dir: 输出目录（运行日志和相关工件的统一落盘位置）
+            corpus_dir: 论文数据集目录（metabench/output/*.md）
         """
         self.dtg              = DTGStore(memory_path, session_name=session_name)
         self.meta_state       = MetaState()
@@ -107,6 +113,8 @@ class SelfCorrectingOrchestrator:
         self.mrsd = MRSD(dtg_store=self.dtg, llm_client=llm_client)
         self.correction_log   = CorrectionLog()
         self.metric_collector = MetricCollector()
+        self._corpus = CorpusLoader(corpus_dir)
+        self.retriever = ReferenceRetriever(self._corpus)
 
     # ------------------------------------------------------------------
     # 主入口
@@ -143,6 +151,14 @@ class SelfCorrectingOrchestrator:
             generated_content: Dict[str, str] = {}
             section_queue = list(outline.keys())
 
+            global_index = self.retriever.retrieve_global(task)
+            self.logger.info("全局参考索引构建完成：%d 篇论文", global_index.n)
+            if self.run_logger is not None:
+                self.run_logger.log_global_index(global_index)
+
+            section_word_target = self._parse_section_word_target(task, outline)
+            self.logger.info("每节目标词数：%s", section_word_target)
+
             rollback_count = 0
             current_idx = 0
 
@@ -173,6 +189,7 @@ class SelfCorrectingOrchestrator:
                     section_title=section_title,
                     task=task,
                     plan_state=plan_state,
+                    word_target=section_word_target,
                 )
                 plan_state.add_intent(section_intent)
                 if self.run_logger is not None:
@@ -180,6 +197,12 @@ class SelfCorrectingOrchestrator:
 
                 # 准备 DSL 注入
                 self._update_dsl_injection(state, section_id, section_queue, current_idx)
+                section_papers = self.retriever.rank_for_section(
+                    global_index=global_index,
+                    section_title=section_title,
+                    section_intent=section_intent,
+                    task=task,
+                )
 
                 rolled_back = False
                 report = None
@@ -199,6 +222,7 @@ class SelfCorrectingOrchestrator:
                             recent_content=self._get_recent_content(),
                             section_intent=section_intent,
                             temperature=temperature,
+                            section_papers=section_papers,
                         )
                     except Exception as e:
                         self.logger.error("生成异常（section=%s attempt=%d）: %s", section_id, attempt + 1, e)
@@ -209,7 +233,13 @@ class SelfCorrectingOrchestrator:
 
                     # 第三阶段：验证
                     try:
-                        report = self.online_validator.validate_and_diagnose(decision, content, state)
+                        report = self.online_validator.validate_and_diagnose(
+                            decision,
+                            content,
+                            state,
+                            global_index=global_index,
+                            word_target=section_word_target,
+                        )
                         self.meta_state.update_validator_stability(report.dcas_score)
                     except Exception as e:
                         self.logger.error("验证异常（section=%s）: %s", section_id, e)
@@ -389,6 +419,7 @@ class SelfCorrectingOrchestrator:
                                 plan_state=plan_state,
                                 is_revision=True,
                                 revision_reason="; ".join(i.description for i in report.issues),
+                                word_target=section_word_target,
                             )
                             plan_state.revise_intent(
                                 section_id=section_id,
@@ -421,7 +452,7 @@ class SelfCorrectingOrchestrator:
                                 self.MAX_RETRIES_PER_SECTION,
                                 reason_code,
                             )
-                        fallback_content = content if content is not None else f"[{section_id} 生成失败]"
+                        fallback_content = self._coerce_degraded_section_content(content)
                         fallback_decision = decision
 
                         generated_content[section_id] = fallback_content
@@ -434,13 +465,17 @@ class SelfCorrectingOrchestrator:
 
                         last_issues = report.issues if report else []
                         self.correction_log.add_failure(section_id, last_issues)
-                        state.flagged_issues.append(f"{section_id}：降级内容（验证未通过）")
+                        state.flagged_issues.append(
+                            f"{section_id}: degraded content accepted after validation failure"
+                        )
                         self.metric_collector.record_section_first_pass(section_id, False)
                         consecutive_failures_this_section = 0
                         current_idx += 1
 
-            # 组装最终文本
-            final_text = self._assemble_text(outline, generated_content)
+            # 组装最终文本（含引用重编号和参考文献列表）
+            final_text = self._post_process_references_v2(
+                outline, generated_content, global_index
+            )
             self._print_summary()
             self.run_logger.log_run_summary(
                 self.correction_log.get_statistics(),
@@ -463,6 +498,7 @@ class SelfCorrectingOrchestrator:
         plan_state: PlanState,
         is_revision: bool = False,
         revision_reason: str = "",
+        word_target: Optional[int] = None,
     ) -> SectionIntent:
         """
         调用 SectionPlanner 生成当前节的 SectionIntent
@@ -502,7 +538,7 @@ class SelfCorrectingOrchestrator:
         )
 
         if is_revision and revision_reason:
-            task_with_reason = f"{task}\n\n（修订原因：{revision_reason}）"
+            task_with_reason = f"{task}\n\n(Revision reason: {revision_reason})"
         else:
             task_with_reason = task
 
@@ -515,19 +551,21 @@ class SelfCorrectingOrchestrator:
                 section_summaries=section_summaries_str,
                 source_dsl_entry_ids=dsl_entry_ids,
                 dsl_trust_at_generation=memory_trust,
+                word_target=word_target,
             )
         except Exception as e:
             self.logger.warning("SectionPlanner 异常，使用默认 intent：%s", e)
             return SectionIntent.create(
                 section_id=section_id,
-                local_goal=f"完成 {section_title} 的内容生成",
-                scope_boundary=f"本节仅限于 {section_title}，不得涉及后续章节内容",
+                local_goal=f"Complete the content for {section_title}",
+                scope_boundary=f"This section must stay within {section_title} and must not cover later sections",
                 open_loops_to_advance=[],
                 commitments_to_maintain=[],
                 risks_to_avoid=[],
-                success_criteria=["内容符合节目标，无严重约束违反"],
+                success_criteria=["The content matches the section goal and does not violate major constraints."],
                 source_dsl_entry_ids=dsl_entry_ids,
                 dsl_trust_at_generation=memory_trust,
+                word_target=word_target,
             )
 
     # ------------------------------------------------------------------
@@ -583,7 +621,7 @@ class SelfCorrectingOrchestrator:
             在当前 dsl_injection 基础上追加强调说明。
         """
         if state.dsl_injection:
-            state.dsl_injection = "【重要】以下话语状态约束必须严格遵守：\n" + state.dsl_injection
+            state.dsl_injection = "[Important] Strictly follow the DSL state constraints below:\n" + state.dsl_injection
 
     # ------------------------------------------------------------------
     # 成功处理
@@ -689,17 +727,6 @@ class SelfCorrectingOrchestrator:
         self._log_postprocess_skipped(section_id)
         self._print_success(section_id, attempt + 1, dcas)
 
-    # ------------------------------------------------------------------
-    # 回退
-    # ------------------------------------------------------------------
-
-    def _log_postprocess_skipped(self, section_id: str) -> None:
-        """记录 postprocess 默认关闭的原因。"""
-        reason = "feature_disabled_by_default"
-        self.logger.info("postprocess_skipped: section=%s reason=%s", section_id, reason)
-        if getattr(self, "run_logger", None) is not None:
-            self.run_logger.log_postprocess_skipped(section_id, reason)
-
     def _log_dsl_relation_stats(
         self,
         section_id: str,
@@ -739,8 +766,19 @@ class SelfCorrectingOrchestrator:
             stats.get("remaining_queue", 0),
             time_cost_ms / 1000.0,
         )
-        if getattr(self, "run_logger", None) is not None:
+        if self.run_logger is not None:
             self.run_logger.log_dsl_relation_stats(section_id, new_entries, stats)
+
+    # ------------------------------------------------------------------
+    # 回退
+    # ------------------------------------------------------------------
+
+    def _log_postprocess_skipped(self, section_id: str) -> None:
+        """记录 postprocess 默认关闭的原因。"""
+        reason = "feature_disabled_by_default"
+        self.logger.info("postprocess_skipped: section=%s reason=%s", section_id, reason)
+        if getattr(self, "run_logger", None) is not None:
+            self.run_logger.log_postprocess_skipped(section_id, reason)
 
 
     def _execute_rollback(
@@ -880,6 +918,24 @@ class SelfCorrectingOrchestrator:
         else:
             return 0.3
 
+    @staticmethod
+    def _parse_section_word_target(task: str, outline: Dict[str, str]) -> Optional[int]:
+        """
+        从任务描述中提取全局词数目标，除以节数得到每节目标词数。
+
+        匹配形式：
+            "approximately 9600-word", "9600 words", "9,600-word" 等
+
+        返回值：
+            int：每节目标词数；无法解析时返回 None
+        """
+        num_sections = max(len(outline), 1)
+        m = re.search(r'(\d[\d,]*)\s*[-–]?\s*word', task, re.IGNORECASE)
+        if m:
+            total = int(m.group(1).replace(',', ''))
+            return max(100, total // num_sections)
+        return None
+
     def _compute_low_trust_ratio(self, section_id: str) -> float:
         """
         计算当前节引用的低信任 DSL 条目比例
@@ -895,6 +951,85 @@ class SelfCorrectingOrchestrator:
             return 0.0
         low_trust = self.dsl.get_low_trust_entry_ids(threshold=0.5)
         return len(low_trust) / len(active)
+
+    def _post_process_references_v2(
+        self,
+        outline: Dict[str, str],
+        generated_content: Dict[str, str],
+        global_index: GlobalPaperIndex,
+    ) -> str:
+        """
+        组装最终文本，清理越界 [Rx] 标记，按首次出现重编号，末尾追加 References 列表。
+
+        流程：
+            1. 按大纲顺序扫描全文，提取所有 [Rx] 标记
+            2. 越界标记（x ∉ valid_r_set）直接删除
+            3. 按首次出现顺序为合法 r_index 分配连续编号 1, 2, 3…
+            4. 将 [Rx] 替换为 [编号]
+            5. 按编号顺序从 GlobalPaperEntry 构建 References 节
+
+        参数：
+            outline:           有序章节大纲 {section_id: title}
+            generated_content: 各节已生成文本
+            global_index:      全局参考索引（R1…RN）
+
+        返回值：
+            str：含内联引用编号和 References 列表的完整文本
+        """
+        import re
+        from collections import OrderedDict
+
+        valid_r_set = global_index.valid_r_set
+
+        # 第一轮：扫描确定首次出现顺序，构建 r_index → 全局编号 映射
+        r_to_num: "OrderedDict[int, int]" = OrderedDict()
+        counter = 0
+
+        def _scan(match: "re.Match") -> str:
+            nonlocal counter
+            idx = int(match.group(1))
+            if idx not in valid_r_set:
+                return ""
+            if idx not in r_to_num:
+                counter += 1
+                r_to_num[idx] = counter
+            return f"[{r_to_num[idx]}]"
+
+        parts = []
+        for section_id, title in outline.items():
+            raw = generated_content.get(section_id, "")
+            processed = re.sub(r"\[R(\d+)\]", _scan, raw)
+            parts.append(f"## {title}\n\n{processed}")
+
+        assembled = "\n\n---\n\n".join(parts)
+
+        if r_to_num:
+            ref_lines = ["\n\n---\n\n## References\n"]
+            # 按全局编号排序输出
+            for r_idx, num in sorted(r_to_num.items(), key=lambda kv: kv[1]):
+                entry_obj = global_index.get_by_r(r_idx)
+                if entry_obj is None:
+                    continue
+                authors = entry_obj.authors
+                author_str = ", ".join(str(a) for a in authors[:3])
+                if len(authors) > 3:
+                    author_str += " et al."
+                entry = f"[{num}]"
+                if author_str:
+                    entry += f" {author_str}."
+                entry += f" {entry_obj.title}."
+                if entry_obj.doi:
+                    entry += f" DOI: {entry_obj.doi}"
+                ref_lines.append(entry)
+            assembled += "\n".join(ref_lines)
+
+        self.logger.info(
+            "后处理完成：共引用 %d 篇论文（valid_r=%s → 编号1…%d）",
+            len(r_to_num),
+            sorted(r_to_num.keys()),
+            counter,
+        )
+        return assembled
 
     def _assemble_text(
         self,
@@ -913,9 +1048,13 @@ class SelfCorrectingOrchestrator:
         """
         parts = []
         for section_id, title in outline.items():
-            content = generated_content.get(section_id, f"[{section_id} 内容缺失]")
+            content = generated_content.get(section_id, "")
             parts.append(f"## {title}\n\n{content}")
         return "\n\n---\n\n".join(parts)
+
+    def _coerce_degraded_section_content(self, content: Optional[str]) -> str:
+        """Normalize degraded section content so final text never includes failure placeholders."""
+        return content.strip() if content is not None else ""
 
     # ------------------------------------------------------------------
     # Rich 打印
@@ -924,9 +1063,9 @@ class SelfCorrectingOrchestrator:
     def _print_header(self, task: str, outline: Dict[str, str]) -> None:
         self.console.print(Panel(
             f"[bold cyan]MetaWriter v4.0[/bold cyan]\n"
-            f"任务：{task}\n"
-            f"章节数：{len(outline)}",
-            title="开始生成",
+            f"Task: {task}\n"
+            f"Sections: {len(outline)}",
+            title="Generation Start",
             border_style="cyan",
         ))
 
@@ -941,15 +1080,15 @@ class SelfCorrectingOrchestrator:
         )
 
     def _print_success(self, section_id: str, attempt: int, dcas: float) -> None:
-        attempt_str = f"(第 {attempt} 次)" if attempt > 1 else "(一次通过)"
+        attempt_str = f"(attempt {attempt})" if attempt > 1 else "(first pass)"
         self.console.print(
-            f"  [green][OK] {section_id} 通过 {attempt_str} DCAS={dcas:.3f}[/green]"
+            f"  [green][OK] {section_id} passed {attempt_str} DCAS={dcas:.3f}[/green]"
         )
 
     def _print_failure(self, section_id: str, attempt: int, diagnosis, report) -> None:
         issues_str = " | ".join(i.description[:40] for i in report.issues[:3])
         self.console.print(
-            f"  [yellow][FAIL] {section_id} 第 {attempt} 次失败 -> "
+            f"  [yellow][FAIL] {section_id} failed on attempt {attempt} -> "
             f"{diagnosis.repair_scope}({diagnosis.error_tier.value}/"
             f"{diagnosis.error_source.value})[/yellow]\n"
             f"    [dim]{issues_str}[/dim]"
@@ -959,13 +1098,13 @@ class SelfCorrectingOrchestrator:
         stats = self.correction_log.get_statistics()
         metric_summary = self.metric_collector.compute_repair_efficiency()
         self.console.print(Panel(
-            f"总节数：{stats['total_sections']}   "
-            f"一次通过率：{stats['success_rate_first_try']:.0%}   "
-            f"重试：{stats['total_retries']} 次   "
-            f"回退：{stats['total_rollbacks']} 次   "
-            f"失败：{stats['total_failures']} 节\n"
-            f"False Rollback Rate：{metric_summary.get('false_rollback_rate', 'N/A')}   "
-            f"DSL 信任度：{self.meta_state.memory_trust_level:.3f}",
-            title="[bold green]生成完成[/bold green]",
+            f"Sections: {stats['total_sections']}   "
+            f"First-pass rate: {stats['success_rate_first_try']:.0%}   "
+            f"Retries: {stats['total_retries']}   "
+            f"Rollbacks: {stats['total_rollbacks']}   "
+            f"Failed sections: {stats['total_failures']}\n"
+            f"False Rollback Rate: {metric_summary.get('false_rollback_rate', 'N/A')}   "
+            f"DSL Trust Level: {self.meta_state.memory_trust_level:.3f}",
+            title="[bold green]Generation Complete[/bold green]",
             border_style="green",
         ))

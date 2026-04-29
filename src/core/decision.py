@@ -105,44 +105,71 @@ class Decision:
 # ============================================================================
 
 try:
-    from pydantic import BaseModel, Field
-    
+    from pydantic import BaseModel, Field, field_validator
+    import json as _json
+    import ast as _ast
+
     class GenerationDecisionSchema(BaseModel):
         """
-        生成决策的结构化输出 Schema
-        
-        功能：
-            用于 LangChain 的 with_structured_output() 和 OpenAI/Claude 原生 JSON schema 模式。
-            LLM API 会直接校验输出满足此 schema，解析失败率接近 0%。
-        
+        生成决策的结构化输出 Schema（新架构）
+
+        变更说明：
+            移除 citations 字段——LLM 不再输出结构化引用 JSON。
+            正文中使用 [R1]、[R2] 等简单整数标记；引用提取、验证、渲染全部由代码完成。
+
         字段：
-            decision: 本节的核心写作决策
-            reasoning: 推理过程和依据
-            expected_effect: 预期达到的叙事效果
-            confidence: 置信度（0.0 到 1.0）
-            content: 纯叙事正文（禁止包含元信息）
+            decision:              本节的核心写作决策
+            reasoning:             推理过程和依据
+            expected_effect:       预期达到的叙事效果
+            confidence:            置信度（0.0–1.0）
+            content:               纯叙事正文，包含 [Rx] 引用标记
             referenced_section_ids: 引用的前文节点 ID 列表（可选）
         """
         decision: str = Field(
             description="The core writing decision for this section"
         )
         reasoning: str = Field(
-            description="The reasoning behind the decision, optionally referencing prior section IDs"
+            description="The reasoning behind the decision, optionally citing earlier section IDs"
         )
         expected_effect: str = Field(
-            description="The narrative effect this section should achieve"
+            description="The effect this section should achieve once it is complete"
         )
         confidence: float = Field(
             ge=0.0, le=1.0,
             description="A confidence score between 0.0 and 1.0"
         )
         content: str = Field(
-            description="Narrative prose only, with no section IDs, counts, XML tags, or meta information"
+            description=(
+                "The clean body text. Where a sentence is supported by an available reference, "
+                "append the marker [Rx] (e.g. [R1], [R3]) immediately after that sentence. "
+                "Do not include section IDs, word counts, XML tags, or metadata."
+            )
         )
         referenced_section_ids: List[str] = Field(
             default_factory=list,
-            description="A list of referenced prior section IDs, such as ['sec1', 'sec2']"
+            description="A list of referenced earlier section IDs such as ['sec1', 'sec2']"
         )
+
+        @field_validator("referenced_section_ids", mode="before")
+        @classmethod
+        def _coerce_section_ids(cls, v):
+            """MiniMax-M2.5 有时将 list 字段序列化为字符串，在此强制解析回列表。"""
+            if isinstance(v, list):
+                return v
+            if isinstance(v, str) and v.strip().startswith("["):
+                try:
+                    parsed = _json.loads(v)
+                    if isinstance(parsed, list):
+                        return parsed
+                except Exception:
+                    pass
+                try:
+                    parsed = _ast.literal_eval(v)
+                    if isinstance(parsed, list):
+                        return parsed
+                except Exception:
+                    pass
+            return v if v is not None else []
 
 except ImportError:
     # 如果 pydantic 不可用，定义一个占位符

@@ -232,6 +232,40 @@ class RunLogger:
         self._write(f"  DSL 信任度：{intent.dsl_trust_at_generation:.3f}")
         self._write("")
 
+    def log_global_index(self, global_index: Any) -> None:
+        """
+        记录全局参考索引（GlobalPaperIndex）
+
+        参数：
+            global_index: GlobalPaperIndex 对象（含 R1…RN 全局论文列表）
+        """
+        entries = getattr(global_index, "entries", [])
+        self._write(f"[GLOBAL REF INDEX]  total={len(entries)} 篇论文")
+        for entry in entries:
+            r_idx = getattr(entry, "r_index", "?")
+            pid   = getattr(entry, "paper_id", "?")
+            title = getattr(entry, "title", "")
+            score = getattr(entry, "retrieval_score", 0.0)
+            doi   = getattr(entry, "doi", "")
+            self._write(
+                f"  [R{r_idx}] score={score:.3f}  paper={pid}  doi={doi}  title={title[:60]}"
+            )
+        self._write("")
+
+    def log_reference_bundle(self, section_id: str, bundle: Any) -> None:
+        """向后兼容保留（旧架构路径使用）"""
+        items = getattr(bundle, "items", [])
+        query = getattr(bundle, "query", "")
+        self._write(f"[REF BUNDLE]  section={section_id}  items={len(items)}  query={query[:80]}")
+        for item in items:
+            pid   = getattr(item, "paper_id", "?")
+            cid   = getattr(item, "chunk_id", "?")
+            title = getattr(item, "title", "")
+            score = getattr(item, "retrieval_score", 0.0)
+            rank  = getattr(item, "rank", 0)
+            self._write(f"  [{rank}] score={score:.3f}  paper={pid}  chunk={cid}  title={title[:60]}")
+        self._write("")
+
     def log_dsl_injection(self, section_id: str, entries: List[Any]) -> None:
         """
         记录 DSL 注入条目详情
@@ -564,6 +598,30 @@ class RunLogger:
             self._write(f"  总计: FAIL  阻断问题 {len(blocking)} 个")
             for issue in blocking:
                 self._write(f"    ! [{issue.severity.upper()}] {issue.description}")
+        self._write("")
+
+    def log_reference_validation(self, section_id: str, attempt: int, ref_report: Any) -> None:
+        """
+        记录 section-level 引用验证详情（新架构：纯代码 [Rx] 范围检查）
+
+        参数：
+            section_id: 节 ID
+            attempt: 尝试次数（1-based）
+            ref_report: SectionReferenceReport 对象
+        """
+        self._write("[REF VALIDATION]")
+        self._write(f"  passed          : {getattr(ref_report, 'passed', '?')}")
+        self._write(f"  valid_markers   : {getattr(ref_report, 'valid_marker_count', 0)}")
+        self._write(f"  invalid_markers : {getattr(ref_report, 'invalid_marker_count', 0)}")
+        invalid_r = getattr(ref_report, "invalid_r_indices", set())
+        self._write(f"  invalid_r_set   : {sorted(invalid_r) if invalid_r else '[]'}")
+        issues = getattr(ref_report, "issues", [])
+        if issues:
+            self._write(f"  issues ({len(issues)}):")
+            for issue in issues:
+                sev  = getattr(issue, "severity", "?")
+                desc = getattr(issue, "description", "")
+                self._write(f"    ! [{sev.upper()}] {desc}")
         self._write("")
 
     # ------------------------------------------------------------------

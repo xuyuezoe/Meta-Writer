@@ -1,47 +1,56 @@
-"""Benchmark 任务适配器。
+"""English benchmark adapter for MetaWriter.
 
-功能：
-    将仓库内 `metabench/examples/samples.jsonl` 中的样本转换为 Meta-Writer
-    可直接消费的任务配置，并提供一个无需外部裁判模型的本地评估函数。
-
-关键实现细节：
-    1. `load_benchmark_task` 直接读取本地 JSONL 样本。
-    2. `evaluate_output` 使用规则化启发式检查约束满足、信息命中与结构完整性。
-    3. `reference` 返回结构化字典，保留评估所需最小信息，不依赖外部文档。
+This module loads benchmark samples from the local `metabench/examples/samples.jsonl`
+bundle, converts them into task configs that MetaWriter can run directly, and
+provides a lightweight local evaluator that does not depend on an external judge.
 """
 
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Dict, List, Union, cast
 
 
 BENCHMARK_ROOT: Path = Path(__file__).resolve().parent.parent / "metabench"
 SAMPLES_PATH: Path = BENCHMARK_ROOT / "examples" / "samples.jsonl"
-DOCUMENT_LEVEL_CONSTRAINT_PREFIX = "整篇要求："
+DOCUMENT_LEVEL_CONSTRAINT_PREFIX = "Document-level requirement: "
+
+ORGANIZER_CANDIDATES_EN = [
+    "classification framework",
+    "clinical pathway",
+    "controversy focus",
+    "subgroup stratification",
+    "implementation barriers",
+    "evidence map",
+]
+
+CLOSING_CANDIDATES_EN = [
+    "evidence gaps",
+    "open questions",
+    "research agenda",
+    "future work",
+]
+
+
+def _contains_cjk(text: str) -> bool:
+    """Return True when the text still contains Chinese characters."""
+    return re.search(r"[\u4e00-\u9fff]", text) is not None
+
+
+def is_document_level_constraint(requirement: str) -> bool:
+    """Return whether the constraint is tagged as document-level."""
+    return requirement.startswith(DOCUMENT_LEVEL_CONSTRAINT_PREFIX)
 
 
 def _mark_document_level_constraint(requirement: str) -> str:
-    """给整篇级 benchmark 约束打上统一前缀。
-
-    设计目的：
-        benchmark 样本里的字数、整体结构、must_include 和周期性要求本质上都是
-        “整篇输出”约束，而不是单个 section 的即时校验条件。
-        这里显式加前缀，是为了让生成主流程仍然能看到这些要求，同时让
-        section 级 validator 可以稳定识别并跳过误判。
-    """
+    """Prefix a document-level benchmark requirement for the validator layer."""
     return f"{DOCUMENT_LEVEL_CONSTRAINT_PREFIX}{requirement}"
 
 
 def _extract_paragraph_blocks(text: str) -> List[str]:
-    """从最终生成文本中提取可用于 benchmark 评估的正文段落。
-
-    设计目的：
-        Meta-Writer 会在最终输出里插入 `##` 标题和 `---` 分隔线来保留章节结构。
-        如果直接按非空行切段，这些装配标记会污染段落计数和位置约束判断，
-        导致 benchmark 评分被 markdown 外壳而不是正文内容干扰。
-    """
+    """Extract body paragraphs while skipping MetaWriter assembly wrappers."""
     normalized_text = text.replace("\r\n", "\n").strip()
     if normalized_text == "":
         return []
@@ -51,28 +60,46 @@ def _extract_paragraph_blocks(text: str) -> List[str]:
         block = raw_block.strip()
         if block == "" or block == "---":
             continue
-
-        if block.startswith("## "):
+        if re.match(r"^#{1,6}\s+", block):
             continue
-
         paragraph_blocks.append(block)
     return paragraph_blocks
 
 
-def _read_jsonl_rows(file_path: Path) -> List[Dict[str, object]]:
-    """读取 JSONL 文件。
-
-    参数：
-        file_path: JSONL 文件路径。
-
-    返回值：
-        List[Dict[str, object]]：逐行解析后的字典列表。
-
-    关键实现细节：
-        遇到空行时跳过，避免文稿整理后出现格式噪声导致加载失败。
+def _extract_sections_by_order(text: str) -> Dict[str, str]:
     """
+    将生成文本按 ## 标题切分为有序 section 映射。
+
+    返回 {"sec1": text1, "sec2": text2, ...}，跳过 References 节。
+    每个 section 的值包含标题文本 + body，确保标题中的关键词（如 "future work"）
+    也能被 range_keywords / periodic_keywords 评估命中。
+    """
+    heading_pattern = re.compile(r'^##\s+(.+)', re.MULTILINE)
+    matches = list(heading_pattern.finditer(text))
+
+    section_map: Dict[str, str] = {}
+    sec_counter = 0
+
+    for i, match in enumerate(matches):
+        heading_text = match.group(1).strip()
+        # 跳过参考文献节
+        if re.match(r'^references\s*$', heading_text, re.IGNORECASE):
+            continue
+        sec_counter += 1
+        sec_id = f"sec{sec_counter}"
+        # 标题文本 + body 合并，确保标题中的关键词（如 "future work"）也能被匹配
+        content_start = match.end()
+        content_end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
+        body = text[content_start:content_end].strip()
+        section_map[sec_id] = f"{heading_text}\n\n{body}"
+
+    return section_map
+
+
+def _read_jsonl_rows(file_path: Path) -> List[Dict[str, object]]:
+    """Read a JSONL file into a list of dictionaries."""
     if not file_path.exists():
-        raise FileNotFoundError(f"未找到 benchmark 样本文件：{file_path}")
+        raise FileNotFoundError(f"Benchmark sample file not found: {file_path}")
 
     rows: List[Dict[str, object]] = []
     for raw_line in file_path.read_text(encoding="utf-8").splitlines():
@@ -84,155 +111,112 @@ def _read_jsonl_rows(file_path: Path) -> List[Dict[str, object]]:
 
 
 def list_benchmark_task_ids() -> List[str]:
-    """列出当前可用的 benchmark 任务 ID。
-
-    参数：
-        无。
-
-    返回值：
-        List[str]：按文件顺序返回样本 ID 列表。
-
-    关键实现细节：
-        直接复用本地 JSONL 解析结果，确保注册表与样本源始终一致。
-    """
+    """Return benchmark task IDs in file order."""
     task_ids: List[str] = []
     for sample_row in _read_jsonl_rows(SAMPLES_PATH):
         sample_id = str(sample_row["sample_id"])
         if sample_id == "":
-            raise ValueError("benchmark sample_id 不能为空")
+            raise ValueError("benchmark sample_id must not be empty")
         task_ids.append(sample_id)
     return task_ids
 
 
 def _build_outline(task_type: str, must_include: List[str]) -> Dict[str, str]:
-    """根据任务类型与锚点生成最小可用大纲。
-
-    参数：
-        task_type: benchmark 样本中的任务类型。
-        must_include: 当前样本的核心锚点列表。
-
-    返回值：
-        Dict[str, str]：适配 Meta-Writer 的 section 大纲。
-
-    关键实现细节：
-        保持固定三段式接口，但根据样本中的主组织锚点动态改变二级结构语义，
-        避免所有医学任务暴露完全相同的 outline。
-    """
+    """Build a compact three-section outline for the benchmark sample."""
     organizer_candidates = [
-        item
-        for item in ["分类框架", "临床路径", "争议焦点", "子群分层", "实施障碍", "证据地图"]
-        if item in must_include
+        item for item in ORGANIZER_CANDIDATES_EN if item in must_include
     ]
     closing_candidates = [
-        item
-        for item in ["证据缺口", "开放问题", "研究议程", "未来工作"]
-        if item in must_include
+        item for item in CLOSING_CANDIDATES_EN if item in must_include
     ]
-    organizer_label = organizer_candidates[0] if len(organizer_candidates) > 0 else "核心组织轴"
-    closing_label = closing_candidates[0] if len(closing_candidates) > 0 else "未来工作"
+    organizer_label = (
+        organizer_candidates[0] if organizer_candidates else "core organizing axis"
+    )
+    closing_label = closing_candidates[0] if closing_candidates else "future work"
+
     if task_type == "analysis":
         return {
-            "sec1": "研究范围、核心概念与分析视角",
-            "sec2": f"{organizer_label}驱动的代表路径比较与综合分析",
-            "sec3": f"局限性、{closing_label}与收束判断",
+            "sec1": "Scope, core concepts, and analytical perspective",
+            "sec2": f"Comparative and synthetic analysis organized around the {organizer_label}",
+            "sec3": f"Limitations, {closing_label}, and closing judgment",
         }
+
     return {
-        "sec1": "研究背景、问题界定与综述范围",
-        "sec2": f"{organizer_label}组织下的比较、整合与讨论",
-        "sec3": f"局限性反思、{closing_label}与未来工作",
+        "sec1": "Background, problem framing, and review scope",
+        "sec2": f"Comparison, integration, and discussion under the {organizer_label}",
+        "sec3": f"Reflections on limitations, {closing_label}, and forward-looking discussion",
     }
 
 
 def _normalize_reference(reference: Union[str, Dict[str, object]]) -> Dict[str, object]:
-    """规范化评估参考信息。
-
-    参数：
-        reference: 结构化参考字典，或 JSON 字符串形式的参考信息。
-
-    返回值：
-        Dict[str, object]：统一后的参考信息字典。
-
-    关键实现细节：
-        若传入字符串，则必须是合法 JSON，避免默认值掩盖字段缺失问题。
-    """
+    """Normalize a structured reference payload or its JSON serialization."""
     if isinstance(reference, dict):
         return reference
     if isinstance(reference, str):
         parsed_reference = json.loads(reference)
         if not isinstance(parsed_reference, dict):
-            raise ValueError("reference JSON 必须解析为字典")
+            raise ValueError("reference JSON must decode to a dictionary")
         return parsed_reference
-    raise TypeError("reference 必须是 Dict[str, object] 或 JSON 字符串")
+    raise TypeError("reference must be a dict or a JSON string")
 
 
 def _contains_keyword(text: str, keyword: str) -> bool:
-    """判断文本中是否包含关键字。
-
-    参数：
-        text: 待检查文本。
-        keyword: 关键字。
-
-    返回值：
-        bool：是否命中。
-
-    关键实现细节：
-        统一转为小写，兼容中英文字段混写场景。
-    """
+    """Return whether a keyword appears in a case-insensitive match."""
     return keyword.lower() in text.lower()
 
 
 def _parse_int_field(raw_value: object, field_name: str) -> int:
-    """解析并校验整数字段。
-
-    参数：
-        raw_value: 原始字段值。
-        field_name: 字段名称。
-
-    返回值：
-        int：解析后的整数值。
-
-    关键实现细节：
-        仅接受整数或整数字符串，避免在 benchmark 配置加载时吞掉结构错误。
-    """
+    """Parse an integer field and reject non-integral types early."""
     if not isinstance(raw_value, (int, str)):
-        raise TypeError(f"{field_name} 必须是整数或整数字符串")
+        raise TypeError(f"{field_name} must be an integer or an integer string")
     return int(raw_value)
 
 
+def _normalize_keyword_specs(raw_items: object, field_name: str) -> List[Dict[str, object]]:
+    """Normalize keyword constraint specs into dictionaries."""
+    if not isinstance(raw_items, list):
+        raise TypeError(f"{field_name} must be a list")
+    return [
+        dict(item) if isinstance(item, dict) else {"keyword": str(item)}
+        for item in raw_items
+    ]
+
+
+def _validate_english_sample(sample_row: Dict[str, object]) -> None:
+    """Guard against accidentally reintroducing Chinese benchmark assets."""
+    serialized = json.dumps(sample_row, ensure_ascii=False)
+    if _contains_cjk(serialized):
+        sample_id = str(sample_row.get("sample_id", "unknown"))
+        raise ValueError(
+            f"Benchmark sample {sample_id} still contains Chinese text. "
+            "Regenerate the benchmark assets in English before running."
+        )
+
+
 def load_benchmark_task(task_id: str) -> Dict[str, object]:
-    """从本地 benchmark 样本加载任务。
-
-    参数：
-        task_id: benchmark 中的任务标识符。
-
-    返回值：
-        Dict[str, object]：
-            - task: 任务描述
-            - constraints: 约束列表
-            - outline: 章节大纲
-            - reference: 评估参考信息
-
-    关键实现细节：
-        直接从 `metabench/examples/samples.jsonl` 检索匹配样本，并将约束压平为
-        Meta-Writer 能直接消费的文本约束列表，同时显式加入综述型长文风格提示。
-    """
+    """Load one benchmark sample and adapt it into a MetaWriter task config."""
     for sample_row in _read_jsonl_rows(SAMPLES_PATH):
         if str(sample_row.get("sample_id")) != task_id:
             continue
 
+        _validate_english_sample(sample_row)
+
+        prompt = str(sample_row["prompt"]).strip()
+        task_type = str(sample_row["task_type"])
+
         raw_constraints_object = sample_row["constraints"]
         if not isinstance(raw_constraints_object, dict):
-            raise TypeError("constraints 必须是字典")
+            raise TypeError("constraints must be a dictionary")
         raw_constraints = cast(Dict[str, object], raw_constraints_object)
 
         must_include_object = raw_constraints["must_include"]
         if not isinstance(must_include_object, list):
-            raise TypeError("constraints.must_include 必须是列表")
+            raise TypeError("constraints.must_include must be a list")
         must_include = [str(item) for item in must_include_object]
 
         periodic_requirements_object = raw_constraints["periodic_requirements"]
         if not isinstance(periodic_requirements_object, list):
-            raise TypeError("constraints.periodic_requirements 必须是列表")
+            raise TypeError("constraints.periodic_requirements must be a list")
         periodic_requirements = [str(item) for item in periodic_requirements_object]
 
         required_length_words = _parse_int_field(
@@ -243,47 +227,41 @@ def load_benchmark_task(task_id: str) -> Dict[str, object]:
             raw_constraints["expected_blocks"],
             "constraints.expected_blocks",
         )
-
-        range_keywords_object = raw_constraints["range_keywords"]
-        if not isinstance(range_keywords_object, list):
-            raise TypeError("constraints.range_keywords 必须是列表")
-        range_keywords = [
-            dict(item) if isinstance(item, dict) else {"keyword": str(item)}
-            for item in range_keywords_object
-        ]
-
-        periodic_keywords_object = raw_constraints["periodic_keywords"]
-        if not isinstance(periodic_keywords_object, list):
-            raise TypeError("constraints.periodic_keywords 必须是列表")
-        periodic_keywords = [
-            dict(item) if isinstance(item, dict) else {"keyword": str(item)}
-            for item in periodic_keywords_object
-        ]
-        task_type = str(sample_row["task_type"])
+        range_keywords = _normalize_keyword_specs(
+            raw_constraints["range_keywords"],
+            "constraints.range_keywords",
+        )
+        periodic_keywords = _normalize_keyword_specs(
+            raw_constraints["periodic_keywords"],
+            "constraints.periodic_keywords",
+        )
 
         proxy_questions_object = sample_row["proxy_questions"]
         if not isinstance(proxy_questions_object, list):
-            raise TypeError("proxy_questions 必须是列表")
+            raise TypeError("proxy_questions must be a list")
         checklist_object = sample_row["checklist"]
         if not isinstance(checklist_object, list):
-            raise TypeError("checklist 必须是列表")
+            raise TypeError("checklist must be a list")
         proxy_questions_list = cast(List[object], proxy_questions_object)
         checklist_list = cast(List[object], checklist_object)
 
         constraints: List[str] = [
-            _mark_document_level_constraint(f"目标长度约 {required_length_words} 字"),
+            _mark_document_level_constraint("Write the entire article in English."),
             _mark_document_level_constraint(
-                f"正文至少形成 {expected_blocks} 个自然段，整体写成综述型长文而非简报或提纲"
+                f"Target length is about {required_length_words} words."
             ),
             _mark_document_level_constraint(
-                "写作风格应接近 survey paper：先界定范围，再做分类、比较、综合，最后讨论局限性与未来工作"
+                f"The body should contain at least {expected_blocks} natural paragraphs and read like a long-form review rather than a brief or outline."
+            ),
+            _mark_document_level_constraint(
+                "Use a survey-paper style: define the scope first, then organize, compare, and synthesize the evidence before closing with limitations and future work."
             ),
             *[
-                _mark_document_level_constraint(f"必须覆盖：{item}")
+                _mark_document_level_constraint(f"Must explicitly cover: {item}.")
                 for item in must_include
             ],
             *[
-                _mark_document_level_constraint(f"周期性要求：{item}")
+                _mark_document_level_constraint(f"Periodic requirement: {item}")
                 for item in periodic_requirements
             ],
         ]
@@ -291,7 +269,8 @@ def load_benchmark_task(task_id: str) -> Dict[str, object]:
         reference: Dict[str, object] = {
             "sample_id": str(sample_row["sample_id"]),
             "task_type": task_type,
-            "prompt": str(sample_row["prompt"]),
+            "language": "en",
+            "prompt": prompt,
             "constraints": {
                 "required_length_words": required_length_words,
                 "must_include": must_include,
@@ -313,49 +292,32 @@ def load_benchmark_task(task_id: str) -> Dict[str, object]:
         }
 
         return {
-            "task": str(sample_row["prompt"]),
+            "task": prompt,
             "constraints": constraints,
             "outline": _build_outline(task_type, must_include),
             "reference": reference,
         }
 
-    raise ValueError(f"未找到 benchmark 任务：{task_id}")
+    raise ValueError(f"Unknown benchmark task: {task_id}")
 
 
 def evaluate_output(
     generated_text: str, reference: Union[str, Dict[str, object]]
 ) -> Dict[str, object]:
-    """评估生成结果。
-
-    参数：
-        generated_text: Meta-Writer 生成的文本。
-        reference: benchmark 任务参考信息。
-
-    返回值：
-        Dict[str, object]：
-            - constraint_violation_rate: 约束违反率
-            - entity_consistency_score: 关键实体一致性评分
-            - logical_coherence: 逻辑连贯性评分
-            - diagnostics: 详细诊断信息
-
-    关键实现细节：
-        采用本地可复现的启发式规则，不依赖外部 judge 模型，便于 example 接口直连跑通。
-        在原有关键词命中基础上，额外利用段落数量、位置约束与周期性关键词，
-        对综述型长文的结构信号进行软性评分。
-    """
+    """Evaluate a generated benchmark answer with lightweight local heuristics."""
     normalized_reference = _normalize_reference(reference)
     normalized_text = generated_text.strip()
     if normalized_text == "":
-        raise ValueError("generated_text 不能为空")
+        raise ValueError("generated_text must not be empty")
 
     raw_constraints_object = normalized_reference["constraints"]
     if not isinstance(raw_constraints_object, dict):
-        raise TypeError("reference.constraints 必须是字典")
+        raise TypeError("reference.constraints must be a dictionary")
     raw_constraints = cast(Dict[str, object], raw_constraints_object)
 
     must_include_object = raw_constraints["must_include"]
     if not isinstance(must_include_object, list):
-        raise TypeError("reference.constraints.must_include 必须是列表")
+        raise TypeError("reference.constraints.must_include must be a list")
     must_include = [str(item) for item in must_include_object]
 
     expected_blocks = _parse_int_field(
@@ -363,33 +325,33 @@ def evaluate_output(
         "reference.constraints.expected_blocks",
     )
 
-    range_keywords_object = raw_constraints["range_keywords"]
-    if not isinstance(range_keywords_object, list):
-        raise TypeError("reference.constraints.range_keywords 必须是列表")
-    range_keywords = [
-        dict(item) for item in range_keywords_object if isinstance(item, dict)
-    ]
-
-    periodic_keywords_object = raw_constraints["periodic_keywords"]
-    if not isinstance(periodic_keywords_object, list):
-        raise TypeError("reference.constraints.periodic_keywords 必须是列表")
-    periodic_keywords = [
-        dict(item) for item in periodic_keywords_object if isinstance(item, dict)
-    ]
+    range_keywords = _normalize_keyword_specs(
+        raw_constraints["range_keywords"],
+        "reference.constraints.range_keywords",
+    )
+    periodic_keywords = _normalize_keyword_specs(
+        raw_constraints["periodic_keywords"],
+        "reference.constraints.periodic_keywords",
+    )
 
     checklist_object = normalized_reference["checklist"]
     if not isinstance(checklist_object, list):
-        raise TypeError("reference.checklist 必须是列表")
+        raise TypeError("reference.checklist must be a list")
     checklist_list = cast(List[object], checklist_object)
     checklist = [str(item) for item in checklist_list]
 
     proxy_questions_object = normalized_reference["proxy_questions"]
     if not isinstance(proxy_questions_object, list):
-        raise TypeError("reference.proxy_questions 必须是列表")
+        raise TypeError("reference.proxy_questions must be a list")
     proxy_questions_list = cast(List[object], proxy_questions_object)
     proxy_questions = [
         dict(item) for item in proxy_questions_list if isinstance(item, dict)
     ]
+
+    if len(must_include) == 0:
+        raise ValueError("reference.constraints.must_include must not be empty")
+    if len(proxy_questions) == 0:
+        raise ValueError("reference.proxy_questions must not be empty")
 
     matched_keywords = [
         item for item in must_include if _contains_keyword(normalized_text, item)
@@ -399,27 +361,29 @@ def evaluate_output(
         for item in proxy_questions
         if _contains_keyword(normalized_text, str(item["answer"]))
     ]
+
     paragraph_blocks = _extract_paragraph_blocks(normalized_text)
     body_text = "\n\n".join(paragraph_blocks)
-    sentence_count = sum(
-        1
-        for part in body_text.replace("！", "。").replace("？", "。").split("。")
-        if part.strip() != ""
-    )
+    sentence_parts = re.split(r"[.!?]+", body_text)
+    sentence_count = sum(1 for part in sentence_parts if part.strip() != "")
 
-    if len(must_include) == 0:
-        raise ValueError("reference.constraints.must_include 不能为空")
-    if len(proxy_questions) == 0:
-        raise ValueError("reference.proxy_questions 不能为空")
+    # 预先按 ## 标题切分文档，供 section_id 字段使用
+    section_texts = _extract_sections_by_order(normalized_text)
 
     range_keyword_hits: List[str] = []
     missing_range_keywords: List[str] = []
     for item in range_keywords:
         keyword = str(item["keyword"])
-        start_index = max(1, int(item["start"])) - 1
-        end_index = min(len(paragraph_blocks), int(item["end"]))
-        candidate_blocks = paragraph_blocks[start_index:end_index]
-        if any(_contains_keyword(block, keyword) for block in candidate_blocks):
+        # 优先使用 section_id（按文档结构检测），回退到绝对段落索引
+        if "section_id" in item:
+            sec_text = section_texts.get(str(item["section_id"]), "")
+            hit = _contains_keyword(sec_text, keyword)
+        else:
+            start_index = max(1, int(item["start"])) - 1
+            end_index = min(len(paragraph_blocks), int(item["end"]))
+            candidate_blocks = paragraph_blocks[start_index:end_index]
+            hit = any(_contains_keyword(block, keyword) for block in candidate_blocks)
+        if hit:
             range_keyword_hits.append(keyword)
         else:
             missing_range_keywords.append(keyword)
@@ -428,26 +392,38 @@ def evaluate_output(
     missing_periodic_keywords: List[str] = []
     for item in periodic_keywords:
         keyword = str(item["keyword"])
-        every_value = int(item["every"])
-        start_paragraph = max(1, int(item["start"]))
-        if every_value <= 0:
-            raise ValueError("periodic_keywords.every 必须为正整数")
-
-        target_hit_count = 0
-        current_paragraph = start_paragraph
-        while current_paragraph <= len(paragraph_blocks):
-            target_hit_count += 1
-            current_paragraph += every_value
-
-        actual_hit_count = sum(
-            1
-            for block in paragraph_blocks[start_paragraph - 1 :]
-            if _contains_keyword(block, keyword)
-        )
-        if actual_hit_count >= target_hit_count and target_hit_count > 0:
-            periodic_keyword_hits.append(keyword)
+        # 优先使用 section_id + min_count（按节内最低出现次数），回退到 every 窗口逻辑
+        if "section_id" in item and "min_count" in item:
+            sec_text = section_texts.get(str(item["section_id"]), "")
+            min_count = int(item["min_count"])
+            actual_count = sum(
+                1 for block in sec_text.split("\n\n") if _contains_keyword(block, keyword)
+            )
+            if actual_count >= min_count:
+                periodic_keyword_hits.append(keyword)
+            else:
+                missing_periodic_keywords.append(keyword)
         else:
-            missing_periodic_keywords.append(keyword)
+            every_value = int(item["every"])
+            start_paragraph = max(1, int(item["start"]))
+            if every_value <= 0:
+                raise ValueError("periodic_keywords.every must be positive")
+
+            target_hit_count = 0
+            current_paragraph = start_paragraph
+            while current_paragraph <= len(paragraph_blocks):
+                target_hit_count += 1
+                current_paragraph += every_value
+
+            actual_hit_count = sum(
+                1
+                for block in paragraph_blocks[start_paragraph - 1 :]
+                if _contains_keyword(block, keyword)
+            )
+            if actual_hit_count >= target_hit_count and target_hit_count > 0:
+                periodic_keyword_hits.append(keyword)
+            else:
+                missing_periodic_keywords.append(keyword)
 
     entity_consistency_score = len(matched_keywords) / len(must_include)
     proxy_hit_rate = len(matched_proxy_answers) / len(proxy_questions)
@@ -497,27 +473,18 @@ def evaluate_output(
 
 
 def build_benchmark_task_config(task_id: str) -> Dict[str, object]:
-    """构造可注册到 Meta-Writer 的 benchmark 任务配置。
-
-    参数：
-        task_id: benchmark 样本 ID。
-
-    返回值：
-        Dict[str, object]：包含任务、约束、大纲、参考信息与会话名。
-
-    关键实现细节：
-        统一在这里生成 `session_name`，避免不同 example 文件重复拼接命名逻辑。
-    """
+    """Build the benchmark task config registered into the main task registry."""
     benchmark_task = load_benchmark_task(task_id)
     constraints_object = benchmark_task["constraints"]
     if not isinstance(constraints_object, list):
-        raise TypeError("benchmark_task.constraints 必须是列表")
+        raise TypeError("benchmark_task.constraints must be a list")
     outline_object = benchmark_task["outline"]
     if not isinstance(outline_object, dict):
-        raise TypeError("benchmark_task.outline 必须是字典")
+        raise TypeError("benchmark_task.outline must be a dictionary")
     reference_object = benchmark_task["reference"]
     if not isinstance(reference_object, dict):
-        raise TypeError("benchmark_task.reference 必须是字典")
+        raise TypeError("benchmark_task.reference must be a dictionary")
+
     constraints_list = cast(List[object], constraints_object)
     outline_dict = cast(Dict[str, object], outline_object)
     reference_dict = cast(Dict[str, object], reference_object)
@@ -527,5 +494,6 @@ def build_benchmark_task_config(task_id: str) -> Dict[str, object]:
         "constraints": list(constraints_list),
         "outline": dict(outline_dict),
         "reference": dict(reference_dict),
+        "language": "en",
         "session_name": f"metabench_{task_id}",
     }

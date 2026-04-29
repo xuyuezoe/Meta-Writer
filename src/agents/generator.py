@@ -1,11 +1,12 @@
 """
-内容生成器：Generator
+内容生成器：Generator（新架构）
 
-功能：
-    接受 GenerationState 和可选的 SectionIntent，构建结构化 prompt，
-    调用 LLM 生成结构化输出（Pydantic），返回 (content, Decision) 对。
-    使用 LangChain 的 structured output API，解析失败率 < 1%。
-    支持 DecodingConfig 驱动的温度参数和 Section Intent 注入。
+变更说明：
+    - 引用模式：从 [Cx]+citations JSON 改为 [Rx] 简单整数标记
+    - 参考文献展示：从 500 字截断改为完整摘要 + 完整 top chunk
+    - 移除 _extract_citations()：引用提取由 Orchestrator 后处理代码完成
+    - 返回值：(content, Decision)，不再有 citations 列表
+    - 接受 List[GlobalPaperEntry]（per-section 相关论文）而非 ReferenceBundle
 
 依赖：LLMClient、GenerationState（core/state.py）、
       Decision、GenerationDecisionSchema（core/decision.py）、SectionIntent（core/plan.py）
@@ -21,6 +22,7 @@ from typing import TYPE_CHECKING, Optional, List, Tuple, Dict
 from ..core.decision import Decision, GenerationDecisionSchema
 from ..core.plan import SectionIntent
 from ..core.state import GenerationState
+from ..references.types import GlobalPaperEntry
 
 if TYPE_CHECKING:
     from ..logging.run_logger import RunLogger
@@ -28,20 +30,18 @@ if TYPE_CHECKING:
 
 class Generator:
     """
-    内容生成器
+    内容生成器（新架构）
 
     功能：
-        构建包含状态、任务、SectionIntent、上下文的 prompt，
+        构建包含状态、任务、SectionIntent、参考文献（全文展示）的 prompt，
         调用 LLM 生成结构化输出（Pydantic GenerationDecisionSchema），
-        返回 (content, Decision) 对。
-        使用 LangChain structured output，解析失败率 < 1%。
+        返回 (content, Decision)。
+
+        LLM 在正文中写 [R1]、[R3] 等标记；代码负责后续提取、验证、渲染。
 
     参数：
         llm_client: LLM 客户端实例
-
-    关键实现细节：
-        使用 LLMClient.generate_structured() 代替之前的 XML 正则解析。
-        LLM API 原生校验输出满足 schema，失败率从 15-30% 降至 <1%。
+        run_logger: 可选的运行日志器
     """
 
     MAX_RETRIES = 3
@@ -49,13 +49,6 @@ class Generator:
     _XML_TAGS = ("decision", "reasoning", "expected_effect", "confidence", "content")
 
     def __init__(self, llm_client, run_logger: Optional["RunLogger"] = None):
-        """
-        初始化生成器
-
-        参数：
-            llm_client: LLM 客户端实例
-            run_logger: 可选的运行日志器，用于记录 prompt 和 LLM 原始响应
-        """
         self.llm = llm_client
         self.run_logger = run_logger
         self.logger = logging.getLogger(__name__)
@@ -68,50 +61,47 @@ class Generator:
         section_intent: Optional[SectionIntent] = None,
         temperature: float = 0.7,
         orchestrator_attempt: int = 1,
+        section_papers: Optional[List[GlobalPaperEntry]] = None,
     ) -> Tuple[str, Decision]:
         """
-        生成内容并返回决策对象（使用结构化输出）
-
-        功能：
-            调用 LLMClient.generate_structured()，获取 Pydantic 实例，
-            无需 XML 正则解析，直接构造 Decision 对象。
+        生成内容并返回决策对象。
 
         参数：
-            state: 当前生成状态（含 DSL 注入、节信息等）
-            task: 全局任务描述
-            recent_content: 最近已生成内容（截断到最后 500 字符）
-            section_intent: 可选的章节局部计划（来自 SectionPlanner）
-            temperature: 生成温度（由 DecodingConfig 或默认值决定）
-            orchestrator_attempt: 协调器层的尝试序号（1-based），传给 run_logger
+            state:               当前生成状态
+            task:                全局任务描述
+            recent_content:      最近已生成内容（截断到最后 500 字符）
+            section_intent:      可选的章节局部计划
+            temperature:         生成温度
+            orchestrator_attempt: 协调器层尝试序号（1-based）
+            section_papers:      当节最相关的 GlobalPaperEntry 列表（可选）
 
         返回值：
-            Tuple[str, Decision]：(生成内容, 决策对象)
+            Tuple[str, Decision]：(生成内容含 [Rx] 标记, 决策对象)
 
         异常：
-            RuntimeError：调用失败时抛出
+            RuntimeError：三次重试后仍失败
         """
         last_error: Optional[Exception] = None
         section_id = state.current_section
 
         for attempt in range(self.MAX_RETRIES):
-            # 第三次尝试降温至 0.3
             actual_temp = 0.3 if attempt == self.MAX_RETRIES - 1 else temperature
             prompt = self._build_prompt(
                 state=state,
                 task=task,
                 recent_content=recent_content,
                 section_intent=section_intent,
-                strict=False,  # 不需要 strict 模式，因为 schema 本身就是强约束
+                section_papers=section_papers,
             )
             self.logger.debug(
-                "Generator attempt %d section=%s temp=%.2f",
+                "第 %d 次尝试生成，section=%s temp=%.2f papers=%d",
                 attempt + 1,
                 section_id,
                 actual_temp,
+                len(section_papers) if section_papers else 0,
             )
 
             try:
-                # 调用结构化输出 API
                 structured_output = self.llm.generate_structured(
                     prompt=prompt,
                     schema=GenerationDecisionSchema,
@@ -125,14 +115,13 @@ class Generator:
                     },
                 )
 
-                # 直接构造 Decision，无需解析
                 content = self._sanitize_content(structured_output.content)
                 decision = Decision(
                     timestamp=int(time.time()),
                     decision_id="",
-                    decision=structured_output.decision or "Provide the core writing move for this section.",
-                    reasoning=structured_output.reasoning or "Use the available state and prior sections consistently.",
-                    expected_effect=structured_output.expected_effect or "Deliver a coherent draft for the current section.",
+                    decision=structured_output.decision or "Structured decision provided",
+                    reasoning=structured_output.reasoning or "Structured reasoning provided",
+                    expected_effect=structured_output.expected_effect or "Deliver the core body text for the current section",
                     confidence=structured_output.confidence if structured_output.confidence is not None else 0.8,
                     referenced_sections=self._resolve_section_references(
                         structured_output.referenced_section_ids, state
@@ -141,64 +130,45 @@ class Generator:
                     phase="expanding",
                 )
 
-                # 记录到 run_logger
                 if self.run_logger is not None:
                     self.run_logger.log_parsed_decision(
                         section_id, orchestrator_attempt, content, decision
                     )
 
+                # 统计正文中 [Rx] 标记数量（仅用于日志）
+                rx_count = len(re.findall(r'\[R\d+\]', content))
                 self.logger.info(
-                    "Generation succeeded [attempt %d] section=%s confidence=%.2f",
+                    "生成成功 [尝试 %d] section=%s confidence=%.2f rx_markers=%d",
                     attempt + 1,
                     section_id,
                     decision.confidence,
+                    rx_count,
                 )
                 return content, decision
 
             except (ValueError, TypeError, RuntimeError) as e:
                 last_error = e
-                self.logger.warning("Generator call failed at retry %d: %s", attempt + 1, e)
+                self.logger.warning("第 %d 次调用失败：%s", attempt + 1, e)
 
         raise RuntimeError(
-            f"Generation failed after {self.MAX_RETRIES} retries. Last error: {last_error}"
+            f"生成失败：经过 {self.MAX_RETRIES} 次重试仍无法获得结构化输出。最后错误：{last_error}"
         )
 
-    # ------------------------------------------------------------------
-    # 新增辅助方法：解析section引用
-    # ------------------------------------------------------------------
+    # ── 章节引用解析 ──────────────────────────────────────────────────────────
 
     def _resolve_section_references(
         self, section_ids: List[str], state: GenerationState
     ) -> List[Tuple[str, str]]:
-        """
-        从 section ID 列表改写为 (section_id, snippet) 元组列表
-
-        参数：
-            section_ids: LLM 返回的节点 ID 列表（如 ['sec1', 'sec2']）
-            state: 当前生成状态
-
-        返回值：
-            [(section_id, "引用片段"), ...]
-        """
-        # 如果没有引用或状态中没有历史记录，返回空列表
+        """从 section ID 列表改写为 (section_id, snippet) 元组列表。"""
         if not section_ids or not state.section_snippets:
             return []
-
         result = []
-        for section_id in section_ids:
-            # 尝试从生成历史中获取该节的内容（取前 100 字作为 snippet）
-            if section_id in state.section_snippets:
-                snippet = state.section_snippets[section_id][:100]
-                result.append((section_id, snippet))
-            else:
-                # 如果找不到，用空 snippet
-                result.append((section_id, ""))
-
+        for sid in section_ids:
+            snippet = state.section_snippets.get(sid, "")[:100]
+            result.append((sid, snippet))
         return result
 
-    # ------------------------------------------------------------------
-    # Prompt 构建
-    # ------------------------------------------------------------------
+    # ── Prompt 构建 ──────────────────────────────────────────────────────────
 
     def _build_prompt(
         self,
@@ -206,208 +176,240 @@ class Generator:
         task: str,
         recent_content: str,
         section_intent: Optional[SectionIntent],
-        strict: bool = False,
+        section_papers: Optional[List[GlobalPaperEntry]] = None,
     ) -> str:
         """
-        构建生成 prompt
+        构建生成 prompt。
 
         结构：
             1. 当前状态（state.to_prompt()）
             2. 章节局部计划（Section Intent，若提供）
-            3. 最近已生成内容（截断到 500 字符）
-            4. 任务描述
-            5. 结构化输出要求（使用 schema）
-
-        参数：
-            state: 生成状态
-            task: 任务描述
-            recent_content: 已生成内容（最后 500 字符）
-            section_intent: 可选的章节局部计划
-            strict: 已弃用（保留用于向后兼容）
-
-        返回值：
-            str：完整 prompt 字符串
+            3. 全局参考文献展示（若提供）—— 完整摘要 + 完整 top chunk
+            4. 引用使用规范（[Rx] 标记）
+            5. 最近已生成内容
+            6. 任务描述
+            7. JSON 输出要求
         """
         state_desc = state.to_prompt()
         truncated = recent_content[-self.RECENT_CONTENT_LIMIT:] if recent_content else "(none)"
 
         intent_block = ""
         scope_warning = ""
+        word_count_instruction = ""
         if section_intent is not None:
             intent_block = f"\n{section_intent.to_prompt_text()}\n"
             scope_warning = (
-                "\n[Scope Constraint] "
-                "This section may only execute the local plan above. "
-                "Do not fully resolve the main conflict early and do not advance plot beats that belong to later sections. "
-                "Leave unresolved tension for later sections unless this section is explicitly the ending.\n"
+                "\n[Scope boundary]"
+                " This section must handle only the goals in the section intent above. "
+                "Do not fully resolve the main conflict early or advance material that belongs to later sections. "
+                "When this section ends, unresolved tension should still remain for later sections.\n"
             )
+            if section_intent.word_target is not None:
+                word_count_instruction = (
+                    f"\n[Length requirement] Write approximately {section_intent.word_target} words "
+                    f"for this section. Aim for at least {int(section_intent.word_target * 0.85)} words. "
+                    "Expand every key point with concrete examples, evidence, and analysis. "
+                    "Do not truncate early.\n"
+                )
+
+        reference_block = self._build_reference_block(section_papers)
+        citation_instructions = self._build_citation_instructions(section_papers)
 
         return (
             "You are a long-form writing system.\n"
-            "All natural-language fields must be written in English.\n"
-            "In particular, decision, reasoning, expected_effect, and content must be English.\n"
             f"\nCurrent state:\n{state_desc}"
             f"{intent_block}"
             f"{scope_warning}"
+            f"{word_count_instruction}"
+            f"{reference_block}"
+            f"{citation_instructions}"
             f"\nRecent content:\n{truncated}"
             f"\n\nCurrent task:\n{task}"
-            "\n\nReturn one JSON object with these fields:"
+            "\n\nReturn a JSON object with the following fields:"
             "\n- decision: the core writing decision for this section"
-            "\n- reasoning: the rationale for that decision, optionally referencing prior section IDs"
-            "\n- expected_effect: the narrative effect this section should achieve"
-            "\n- confidence: a numeric confidence value between 0.0 and 1.0"
-            "\n- content: narrative prose only, with no section IDs, token counts, or meta commentary"
-            "\n- referenced_section_ids: a list of prior section IDs such as ['sec1', 'sec2'], or []"
+            "\n- reasoning: the reasoning behind that decision, optionally citing earlier section IDs"
+            "\n- expected_effect: the effect this section should achieve"
+            "\n- confidence: a number between 0.0 and 1.0"
+            "\n- content: prose text for the section."
+            + (
+                " Where a sentence is supported by one of the available references,"
+                " append the marker [Rx] (e.g. [R1], [R3]) immediately after that sentence."
+                " Aim to cite references actively wherever the evidence is relevant."
+                " Do not use any Markdown headings (##, ###, etc.) inside the content."
+                " Organize with paragraphs only, not subheadings."
+                if reference_block else
+                " Do not use any Markdown headings (##, ###, etc.) inside the content."
+                " Organize with paragraphs only, not subheadings."
+            )
+            + "\n- referenced_section_ids: a list of cited earlier section IDs such as [\"sec1\", \"sec2\"]"
         )
 
-    # ------------------------------------------------------------------
-    # 响应解析
-    # ------------------------------------------------------------------
+    @staticmethod
+    def _build_reference_block(papers: Optional[List[GlobalPaperEntry]]) -> str:
+        """
+        将 per-section 相关论文格式化为 prompt 中的参考文献区块。
 
-    def _parse_response(
-        self,
-        response: str,
-        state: GenerationState,
-        section_intent: Optional[SectionIntent],
-    ) -> Tuple[str, Decision]:
-        """按严格→宽松→正文兜底三层解析 LLM 响应"""
-        try:
-            fields = {
-                tag: self._extract_tag_strict(response, tag)
-                for tag in ("decision", "reasoning", "expected_effect", "confidence", "content")
-            }
-            return self._finalize_decision(fields, state)
-        except ValueError as strict_err:
-            self.logger.warning("protocol_parse_failure(strict): %s", strict_err)
+        展示内容：
+            - 全局编号 [Rx]（LLM 使用该标记）
+            - 论文标题
+            - 完整摘要
+            - BM25 top chunk 完整文本（不截断）
+        """
+        if not papers:
+            return ""
 
-        try:
-            fields = {
-                tag: self._extract_tag_loose(response, tag)
-                for tag in ("decision", "reasoning", "expected_effect", "confidence", "content")
-            }
-            return self._finalize_decision(fields, state)
-        except ValueError as loose_err:
-            self.logger.warning("protocol_parse_failure(loose): %s", loose_err)
+        lines = ["\n== Available References =="]
+        lines.append(
+            "Each reference below has a unique marker [Rx]. "
+            "Read the abstract and excerpt carefully before writing."
+        )
 
-        fallback_content = self._extract_fallback_content(response)
-        if fallback_content:
-            decision = self._build_fallback_decision(state, section_intent, response)
-            self.logger.warning("fallback_decision_used: built decision from visible content")
-            return fallback_content, decision
+        for entry in papers:
+            lines.append(f"\n[R{entry.r_index}] {entry.title}")
 
-        raise ValueError("protocol_parse_failure: unable to extract content")
+            # 完整摘要（不截断）
+            if entry.abstract:
+                lines.append(f"  Abstract: {entry.abstract}")
+
+            # top chunk 完整文本（不截断）
+            if entry.top_chunk_text:
+                # 去掉 Markdown 标题行前缀使 LLM 聚焦内容
+                chunk_body = "\n".join(
+                    line for line in entry.top_chunk_text.split("\n")
+                    if not line.strip().startswith("#")
+                ).strip()
+                if chunk_body:
+                    lines.append(f"  Key excerpt: {chunk_body}")
+
+        lines.append(
+            "\n(Only use the markers [R1]–[R{n}] listed above. "
+            "Do not invent any other [Rx] marker. "
+            "If no reference fits a sentence, write the sentence without any marker.)".format(
+                n=papers[-1].r_index if papers else 0
+            )
+        )
+        return "\n".join(lines)
+
+    @staticmethod
+    def _build_citation_instructions(papers: Optional[List[GlobalPaperEntry]]) -> str:
+        """生成引用规范说明（仅在有论文时添加）。"""
+        if not papers:
+            return ""
+
+        valid_labels = ", ".join(f"[R{e.r_index}]" for e in papers)
+        return (
+            "\n[Citation Instructions]\n"
+            f"Valid reference markers for this section: {valid_labels}\n"
+            "Rules:\n"
+            "  1. After a factual claim that can be supported by one of the references, "
+            "append the most relevant [Rx] marker immediately — even if the support is partial.\n"
+            "  2. Aim to use AS MANY references as are genuinely relevant. "
+            "Actively look for connections between your claims and the available evidence.\n"
+            "  3. Do NOT use any marker outside the valid list above.\n"
+            "  4. If a claim has no supporting reference at all, write it without any marker.\n"
+            "  5. Transition, introductory, and connecting sentences do not need markers.\n"
+        )
+
+    # ── 内容清洗 ─────────────────────────────────────────────────────────────
 
     def _sanitize_content(self, content: str) -> str:
         """
-        清洗生成内容，移除 LLM 常见的格式污染
+        清洗生成内容，移除常见格式污染。
 
-        处理以下三类污染：
-            1. 节 ID 泄漏：内容开头出现形如 "sec2" 的节 ID 行
-            2. 引用标签污染：reasoning 中的 <ref> 或转义后的 <a href> 混入内容
-            3. 字数统计：MiniMax 自动追加的"字数：XXX字"行
-
-        参数：
-            content: 从 <content> 标签提取的原始文本
-
-        返回值：
-            str：清洗后的纯叙事文本
+        处理：
+            1. 节 ID 泄漏（开头的 sec2 等行）
+            2. HTML 引用标签污染
+            3. 末尾字数统计行
+            4. CJK 字符（保留 [Rx] 标记）
+            5. 擅自插入的 Markdown 标题行
         """
         text = content.strip()
-
-        # 第一阶段：移除开头的节 ID 行（如 sec1、sec2、section_3 等）
         text = re.sub(r'^\s*[a-zA-Z_]*\d+\s*\n', '', text)
-
-        # 第二阶段：移除 HTML 锚点引用标签（reasoning ref 泄漏的产物）
         text = re.sub(r'<a\s+href="[^"]*">\[.*?\]</a>', '', text)
         text = re.sub(r'<ref\s+id="[^"]*">.*?</ref>', '', text, flags=re.DOTALL)
-
-        # 第三阶段：移除末尾的字数统计行
-        text = re.sub(r'\n*(?:word count|words?|characters?|chars?)[：:]\s*\d+\s*$', '', text.strip(), flags=re.IGNORECASE)
-
+        text = re.sub(
+            r'\n*(?:[字字数数]+|word count)[：:]\s*\d+[字]?\s*$',
+            '', text.strip(), flags=re.IGNORECASE,
+        )
+        text = re.sub(r'[一-鿿㐀-䶿＀-￯　-〿]+', ' ', text)
+        text = re.sub(r',\s*,', ',', text)
+        text = re.sub(r'  +', ' ', text)
+        text = re.sub(r'^#{2,}\s+.*$', '', text, flags=re.MULTILINE)
+        text = re.sub(r'\n{3,}', '\n\n', text)
         return text.strip()
 
+    # ── 旧式 XML 解析（保留供降级路径使用） ─────────────────────────────────
+
     def _finalize_decision(self, fields: Dict[str, str], state: GenerationState) -> Tuple[str, Decision]:
-        """根据解析出的字段构造 Decision 对象并返回正文"""
         decision_text = fields["decision"].strip()
         reasoning = fields["reasoning"].strip()
         expected_effect = fields["expected_effect"].strip()
         confidence_str = fields["confidence"].strip()
         content = self._sanitize_content(fields["content"])
         if not content:
-            raise ValueError("protocol_parse_failure: empty content")
-
+            raise ValueError("protocol_parse_failure: content 为空")
         try:
             confidence = float(confidence_str)
         except ValueError as e:
-            raise ValueError(f"confidence field is not a valid float: '{confidence_str}'") from e
+            raise ValueError(f"confidence 字段无法解析：'{confidence_str}'") from e
 
-        referenced_sections = self._extract_references(reasoning)
         decision = Decision(
             timestamp=int(time.time()),
             decision_id="",
-            decision=decision_text or "Use the generated content as the section's primary move.",
-            reasoning=reasoning or "No structured reasoning was available, so the visible content was used directly.",
-            expected_effect=expected_effect or "Deliver a coherent draft for the current section.",
+            decision=decision_text or "Fallback decision",
+            reasoning=reasoning or "No reasoning provided",
+            expected_effect=expected_effect or "Deliver core body text",
             confidence=confidence,
-            referenced_sections=referenced_sections,
+            referenced_sections=self._extract_references(reasoning),
             target_section=state.current_section,
             phase="expanding",
         )
         return content, decision
 
     def _extract_tag_strict(self, text: str, tag: str) -> str:
-        """严格提取闭合 XML 标签内容，缺失即抛错"""
         pattern = rf"<{tag}>(.*?)</{tag}>"
         match = re.search(pattern, text, re.DOTALL)
         if not match:
-            raise ValueError(f"protocol_parse_failure: missing <{tag}> tag")
+            raise ValueError(f"protocol_parse_failure: 缺少 <{tag}> 标签")
         return match.group(1).strip()
 
     def _extract_tag_loose(self, text: str, tag: str) -> str:
-        """宽松提取标签，允许缺少闭合时截断到下一个标签"""
         strict_pattern = rf"<{tag}>(.*?)</{tag}>"
         match = re.search(strict_pattern, text, re.DOTALL)
         if match:
             return match.group(1).strip()
-
         start_token = f"<{tag}>"
         start = text.find(start_token)
         if start == -1:
-            raise ValueError(f"protocol_parse_failure: missing {start_token}")
+            raise ValueError(f"protocol_parse_failure: 缺少 {start_token}")
         start += len(start_token)
         if tag == "content":
             snippet = text[start:].strip()
             if not snippet:
-                raise ValueError("protocol_parse_failure: blank content")
+                raise ValueError("protocol_parse_failure: content 空白")
             return snippet
-
         remainder = text[start:]
         next_idx = len(remainder)
         for other in self._XML_TAGS:
             token = f"<{other}>"
             pos = remainder.find(token)
-            if pos == -1:
-                continue
-            if pos < next_idx:
+            if pos != -1 and pos < next_idx:
                 next_idx = pos
         snippet = remainder[:next_idx].strip()
         if not snippet:
-            raise ValueError(f"protocol_parse_failure: missing content for <{tag}>")
+            raise ValueError(f"protocol_parse_failure: <{tag}> 内容缺失")
         return snippet
 
     def _extract_fallback_content(self, text: str) -> str:
-        """在 XML 解析失败时尽量提取正文"""
         try:
-            raw_content = self._extract_tag_loose(text, "content")
-            cleaned = self._sanitize_content(raw_content)
+            raw = self._extract_tag_loose(text, "content")
+            cleaned = self._sanitize_content(raw)
             if cleaned:
                 return cleaned
         except ValueError:
             pass
-
         cleaned = re.sub(r"<[^>]+>", " ", text)
-        cleaned = self._sanitize_content(cleaned)
-        return cleaned
+        return self._sanitize_content(cleaned)
 
     def _build_fallback_decision(
         self,
@@ -419,37 +421,20 @@ class Generator:
         expected_effect: Optional[str] = None,
         confidence: Optional[float] = None,
     ) -> Decision:
-        """Construct a fallback decision so the pipeline can continue."""
-        goal_hint = section_intent.local_goal if section_intent else f"Draft the content for section {state.current_section}."
-        decision_text = decision_text or "Use the generated content as the section's primary move."
-        reasoning = reasoning or "No structured reasoning was available, so the visible content was used directly."
-        expected_effect = expected_effect or goal_hint
-        confidence = confidence if confidence is not None else 0.5
-
+        goal_hint = section_intent.local_goal if section_intent else f"Complete {state.current_section}"
         return Decision(
             timestamp=int(time.time()),
             decision_id="",
-            decision=decision_text,
-            reasoning=reasoning,
-            expected_effect=expected_effect,
-            confidence=confidence,
+            decision=decision_text or "Structured decision missing",
+            reasoning=reasoning or "No structured reasoning",
+            expected_effect=expected_effect or goal_hint,
+            confidence=confidence if confidence is not None else 0.5,
             referenced_sections=[],
             target_section=state.current_section,
             phase="expanding",
         )
 
     def _extract_references(self, reasoning: str) -> List[Tuple[str, str]]:
-        """
-        从 reasoning 中提取节引用
-
-        格式：<ref id="section_id">snippet</ref>
-
-        参数：
-            reasoning: 推理文本
-
-        返回值：
-            List[Tuple[str, str]]：[(section_id, snippet), ...]
-        """
         pattern = r'<ref\s+id="([^"]+)">(.*?)</ref>'
         matches = re.findall(pattern, reasoning, re.DOTALL)
-        return [(section_id.strip(), snippet.strip()) for section_id, snippet in matches]
+        return [(sid.strip(), snip.strip()) for sid, snip in matches]

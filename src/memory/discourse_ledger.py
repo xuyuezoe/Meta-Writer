@@ -5,10 +5,6 @@
     管理长文本生成过程中所有已提取的话语承诺对象（LedgerEntry）及其关系（EntryRelation）。
     提供关系层候选剪枝、显著性评分（salience_score）、回退/清除、冲突检测等核心能力。
     DiscourseLedger 是 DSL 主贡献的核心实现载体。
-
-依赖：LedgerEntry、EntryRelation、CommitmentType、ConstraintType（来自 core/ledger.py）
-被依赖：CommitmentExtractor（写入条目）、OnlineValidator（读取注入）、
-        Orchestrator（触发回退/清除）、MetaState（读取 memory_trust_level）
 """
 from __future__ import annotations
 
@@ -24,6 +20,7 @@ from ..core.ledger import (
     EntryRelation,
     LedgerEntry,
 )
+
 if TYPE_CHECKING:
     from ..utils.llm_client import LLMClient
 
@@ -42,7 +39,7 @@ class DiscourseLedger:
 
     def __init__(
         self,
-        llm_client: Optional[LLMClient] = None,
+        llm_client: Optional["LLMClient"] = None,
         max_inject_entries: int = 8,
         candidate_score_threshold: float = 1.0,
         run_logger=None,
@@ -53,19 +50,11 @@ class DiscourseLedger:
         self._run_logger = run_logger
         self.logger = logging.getLogger(__name__)
 
-        # 主存储：entry_id → LedgerEntry
         self._entries: Dict[str, LedgerEntry] = {}
-
-        # 关系图：entry_id → List[EntryRelation]（按 source_id 索引）
         self._relations: Dict[str, List[EntryRelation]] = {}
-
-        # 反向索引：target_id → List[EntryRelation]（用于级联查找）
         self._relations_by_target: Dict[str, List[EntryRelation]] = {}
-
-        # 历史失败关联：entry_id → 失败次数（用于 salience failure_history 因子）
         self._failure_associations: Dict[str, int] = {}
 
-        # section 内待处理关系队列
         self._pending_relation_pairs: List[Tuple[str, str]] = []
         self._pending_relation_keys: Set[Tuple[str, str]] = set()
         self._relation_result_cache: Dict[Tuple[str, str], Tuple[str, float]] = {}
@@ -93,7 +82,7 @@ class DiscourseLedger:
             conflicting = self._entries.get(conflicting_id)
             if conflicting and conflicting.is_active():
                 conflict_warnings.append(
-                    f"新条目与 [{conflicting_id}] 存在冲突：{conflicting.content[:60]}"
+                    f"New entry conflicts with [{conflicting_id}]: {conflicting.content[:60]}"
                 )
 
         self._entries[entry.entry_id] = entry
@@ -165,9 +154,7 @@ class DiscourseLedger:
         return conflict_warnings
 
     def _find_existing_conflicts(self, new_entry: LedgerEntry) -> List[str]:
-        """
-        扫描现有关系图，找到与 new_entry 内容可能冲突的条目 ID。
-        """
+        """扫描现有关系图，找到与 new_entry 内容可能冲突的条目 ID。"""
         new_keywords = self._extract_keywords(new_entry.content)
         conflicting: List[str] = []
 
@@ -203,7 +190,6 @@ class DiscourseLedger:
         统一关系判定方向。
 
         说明：
-            该方向不是纯语义方向，而是语义规则与流水线时序规则的组合。
             当前主要目标是稳定可计算，而不是构建绝对语义真图。
         """
         entry_a = self._entries.get(a)
@@ -300,17 +286,18 @@ class DiscourseLedger:
         return priority
 
     def _build_batch_relation_prompt(self, pairs: List[Tuple[str, str]]) -> str:
+        """Build an English-only relation prompt for one or more DSL entry pairs."""
         lines = [
             "Determine the relation for each DSL entry pair below.",
-            "Judge each pair independently.",
-            "Allowed relation_type values are supports, conflicts, resolves, and none.",
-            "Use resolves only when the target is an open_loop.",
-            "Base the answer only on the two DSL entries provided. Do not add background knowledge.",
-            "If the relation is unclear, return none.",
-            "Return a JSON array only. Do not include explanations or markdown code fences.",
+            "Return a JSON array only.",
+            'Use only four relation_type values: "supports", "conflicts", "resolves", or "none".',
+            "Use resolves only when the target is an open loop.",
+            "Judge conservatively from the two DSL entries only. Do not invent extra background.",
+            "If the relation is uncertain, return none.",
+            "Return a JSON array only. Do not output markdown or explanations.",
             "Each object must include source_id, target_id, relation_type, and confidence.",
             "",
-            "Pairs to judge:",
+            "Pairs:",
         ]
 
         for source_id, target_id in pairs:
@@ -331,7 +318,7 @@ class DiscourseLedger:
             )
 
         lines.append(
-            'Example output: [{"source_id":"...","target_id":"...","relation_type":"none","confidence":0.0}]'
+            '[{"source_id":"...","target_id":"...","relation_type":"none","confidence":0.0}]'
         )
         return "\n".join(lines)
 
@@ -369,7 +356,6 @@ class DiscourseLedger:
     ) -> None:
         if relation_type not in {"supports", "conflicts", "resolves"}:
             return
-
         if confidence < confidence_threshold:
             return
 
@@ -400,9 +386,7 @@ class DiscourseLedger:
         batch_size: int = 4,
         confidence_threshold: float = 0.5,
     ) -> Dict[str, int | float]:
-        """
-        批量处理待判定关系，返回本节统计。
-        """
+        """批量处理待判定关系，返回本节统计。"""
         start_time = time.time()
         section_stats = dict(self._relation_stats_window)
         section_stats.setdefault("processed", 0)
@@ -441,7 +425,10 @@ class DiscourseLedger:
             for source_id, target_id in remaining_pairs
         }
 
-        processed_keys = {self._make_pair_key(source_id, target_id) for source_id, target_id in selected_pairs}
+        processed_keys = {
+            self._make_pair_key(source_id, target_id)
+            for source_id, target_id in selected_pairs
+        }
 
         for batch_start in range(0, len(selected_pairs), max(1, batch_size)):
             batch_pairs = selected_pairs[batch_start: batch_start + max(1, batch_size)]
@@ -495,7 +482,7 @@ class DiscourseLedger:
                 self._relation_result_cache[pair_key] = (relation_type, confidence)
                 applied = confidence >= confidence_threshold
                 self._log_relation_result(section_id, source_id, target_id, relation_type, confidence, applied)
-                if confidence >= confidence_threshold:
+                if applied:
                     self._apply_relation_result(
                         source_id=source_id,
                         target_id=target_id,
@@ -526,13 +513,12 @@ class DiscourseLedger:
         return section_stats
 
     # ------------------------------------------------------------------
+    # ------------------------------------------------------------------
     # 第三阶段：生命周期管理
     # ------------------------------------------------------------------
 
     def revoke_entry(self, entry_id: str, revoked_by_section: str) -> None:
-        """
-        撤销指定条目，并触发级联 trust_level 衰减。
-        """
+        """撤销指定条目，并触发级联 trust_level 衰减。"""
         entry = self._entries.get(entry_id)
         if not entry:
             return
@@ -545,9 +531,7 @@ class DiscourseLedger:
                     downstream.trust_level = max(0.0, downstream.trust_level - 0.2 * rel.confidence)
 
     def update_entry_stability(self, section_id: str, all_sections_so_far: List[str]) -> None:
-        """
-        在每节生成后更新所有活跃条目的稳定性分数。
-        """
+        """在每节生成后更新所有活跃条目的稳定性分数。"""
         for entry in self._entries.values():
             if not entry.is_active():
                 continue
@@ -561,12 +545,11 @@ class DiscourseLedger:
                 entry.support_span.append(section_id)
 
     def record_failure_association(self, entry_ids: List[str]) -> None:
-        """
-        记录一批条目与当前验证失败的关联（用于 salience 的 failure_history 因子）。
-        """
+        """记录一批条目与当前验证失败的关联（用于 salience 的 failure_history 因子）。"""
         for eid in entry_ids:
             self._failure_associations[eid] = self._failure_associations.get(eid, 0) + 1
 
+    # ------------------------------------------------------------------
     # ------------------------------------------------------------------
     # 第四阶段：回退与清除
     # ------------------------------------------------------------------
@@ -576,9 +559,7 @@ class DiscourseLedger:
         cutoff_section_id: str,
         section_queue: List[str],
     ) -> List[str]:
-        """
-        整节回退：清除在 cutoff_section_id 之后引入的所有条目。
-        """
+        """整节回退：清除在 cutoff_section_id 之后引入的所有条目。"""
         if cutoff_section_id not in section_queue:
             return []
 
@@ -592,7 +573,7 @@ class DiscourseLedger:
             if entry.source_section in sections_to_remove:
                 if entry.stability_score > 0.7:
                     warnings.append(
-                        f"高稳定性条目被清除（stability={entry.stability_score:.2f}）：{entry.content[:60]}"
+                        f"High-stability entry removed (stability={entry.stability_score:.2f}): {entry.content[:60]}"
                     )
                 to_remove.append(eid)
 
@@ -631,9 +612,7 @@ class DiscourseLedger:
         contaminated_section: str,
         conflict_description: str,
     ) -> List[str]:
-        """
-        精确记忆清除（对应 state_level 错误）。
-        """
+        """精确记忆清除（对应 state_level 错误）。"""
         conflict_keywords = self._extract_keywords(conflict_description)
         purged: List[str] = []
 
@@ -651,6 +630,7 @@ class DiscourseLedger:
         return purged
 
     # ------------------------------------------------------------------
+    # ------------------------------------------------------------------
     # 第五阶段：显著性评分与注入
     # ------------------------------------------------------------------
 
@@ -663,9 +643,7 @@ class DiscourseLedger:
         outline: Dict[str, str],
         target_section_id: str,
     ) -> List[LedgerEntry]:
-        """
-        获取用于 prompt 注入的账本条目（按 salience 排序取前 K 条）。
-        """
+        """获取用于 prompt 注入的账本条目（按 salience 排序取前 K 条）。"""
         injectable_types = {
             CommitmentType.FACT,
             CommitmentType.COMMITMENT,
@@ -707,9 +685,7 @@ class DiscourseLedger:
         failure_ids_set: Set[str],
         target_keywords: Set[str],
     ) -> float:
-        """
-        计算单条账本条目的 salience_score（运行时计算，不静态存储）。
-        """
+        """计算单条账本条目的 salience_score（运行时计算，不静态存储）。"""
         if total_sections > 1:
             relative_pos = target_section_idx / (total_sections - 1)
         else:
@@ -741,13 +717,12 @@ class DiscourseLedger:
         )
 
     # ------------------------------------------------------------------
+    # ------------------------------------------------------------------
     # 第六阶段：统计查询
     # ------------------------------------------------------------------
 
     def compute_memory_trust_level(self) -> float:
-        """
-        计算当前 DSL 整体可信度（所有活跃条目 trust_level 的均值）。
-        """
+        """计算当前 DSL 整体可信度（所有活跃条目 trust_level 的均值）。"""
         active_entries = [e for e in self._entries.values() if e.is_active()]
         if not active_entries:
             return 1.0
@@ -784,6 +759,7 @@ class DiscourseLedger:
             "memory_trust_level": round(self.compute_memory_trust_level(), 3),
         }
 
+    # ------------------------------------------------------------------
     # ------------------------------------------------------------------
     # 工具方法
     # ------------------------------------------------------------------
@@ -860,30 +836,47 @@ class DiscourseLedger:
         return re.sub(r"\s+", " ", text.strip().lower())
 
     @classmethod
+    def _extract_char_ngrams(cls, text: str) -> Set[str]:
+        stop_ngrams = {
+            "tion",
+            "ment",
+            "with",
+            "from",
+            "that",
+            "this",
+            "ould",
+            "ight",
+        }
+        normalized = cls._normalize_text(text)
+        chunks = re.findall(r"[a-z0-9-]+", normalized)
+        ngrams: Set[str] = set()
+        for chunk in chunks:
+            if len(chunk) < 2:
+                continue
+            for size in range(3, 7):
+                if len(chunk) < size:
+                    continue
+                for idx in range(0, len(chunk) - size + 1):
+                    piece = chunk[idx: idx + size]
+                    if piece in stop_ngrams:
+                        continue
+                    ngrams.add(piece)
+        return ngrams
+
+    @classmethod
     def _extract_keyword_tokens(cls, text: str) -> Set[str]:
         normalized = cls._normalize_text(text)
         tokens: Set[str] = set()
-        stop_tokens = {
-            "the", "and", "for", "with", "from", "that", "this", "into", "onto", "over",
-            "under", "within", "across", "about", "after", "before", "through", "during",
-            "provide", "provides", "systematic", "systematically", "review", "analysis",
-            "future", "section", "sections", "detailed", "comparison", "important", "issue",
-            "framework", "discussion", "approach", "result", "results", "content",
-        }
+        english_terms = re.findall(r"\b[a-z]{2,}(?:-[a-z]{2,})?\b", normalized)
+        tokens.update(english_terms)
 
-        english_terms = re.findall(r"\b[a-z][a-z0-9]*(?:-[a-z0-9]+)*\b", normalized)
-        for token in english_terms:
-            if len(token) >= 3 and token not in stop_tokens:
+        acronyms = re.findall(r"\b[a-z0-9]{2,8}\b", normalized)
+        for token in acronyms:
+            if any(ch.isdigit() for ch in token) or token.isupper():
                 tokens.add(token)
 
-        title_acronyms = re.findall(r"\b[A-Z]{2,8}\b", text)
-        tokens.update(token.lower() for token in title_acronyms)
-
-        mixed_tokens = re.findall(r"\b[a-zA-Z]*\d+[a-zA-Z0-9-]*\b", text)
-        tokens.update(token.lower() for token in mixed_tokens if len(token) >= 2)
-
-        numeric_spans = re.findall(r"\b\d{1,4}(?:-\d{1,4})?(?:st|nd|rd|th)?\b", normalized)
-        tokens.update(numeric_spans)
+        year_or_range = re.findall(r"\b\d{1,4}(?:-\d{1,4})?\b", text)
+        tokens.update(year_or_range)
         return {token for token in tokens if token}
 
     @classmethod
@@ -900,11 +893,17 @@ class DiscourseLedger:
 
     @classmethod
     def _compute_term_overlap_score(cls, source_text: str, target_text: str) -> float:
+        char_overlap = cls._overlap_ratio(
+            cls._extract_char_ngrams(source_text),
+            cls._extract_char_ngrams(target_text),
+        )
         keyword_overlap = cls._overlap_ratio(
             cls._extract_keyword_tokens(source_text),
             cls._extract_keyword_tokens(target_text),
         )
-        return min(1.0, keyword_overlap)
+        high = max(char_overlap, keyword_overlap)
+        low = min(char_overlap, keyword_overlap)
+        return min(1.0, high + 0.15 * low)
 
     @classmethod
     def _is_too_short_noise_pair(cls, source_text: str, target_text: str) -> bool:
@@ -920,13 +919,12 @@ class DiscourseLedger:
         if re.fullmatch(r"[0-9]+(?:\.[0-9]+)?", normalized):
             return True
         return normalized in {
+            "tbd",
+            "todo",
             "see above",
             "same as above",
-            "to be added",
-            "to be completed",
             "placeholder",
-            "tbd",
-            "n/a",
+            "to be added",
         }
 
     @classmethod
@@ -938,13 +936,13 @@ class DiscourseLedger:
         normalized = cls._normalize_text(text)
         generic_phrases = {
             "provide a framework",
-            "systematically review",
+            "systematic overview",
             "future sections",
             "detailed comparison",
-            "important issue",
-            "further analysis",
-            "practical pathway",
-            "ongoing attention",
+            "deeper analysis",
+            "important topic",
+            "actionable path",
+            "continue the discussion",
         }
         penalty = 0.0
         for phrase in generic_phrases:

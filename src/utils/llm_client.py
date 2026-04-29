@@ -93,11 +93,12 @@ class LLMClient:
     @staticmethod
     def _normalize_proxy_env_vars() -> None:
         """
-        规范化代理环境变量，兼容 httpx 对 SOCKS 代理 scheme 的要求。
+        Normalize proxy env vars for httpx/OpenAI SDK compatibility.
 
         设计目的：
-            一些本地代理工具会导出 `socks://host:port`，但 httpx / OpenAI SDK
-            只接受 `socks5://...`。这里仅做最小修正，避免客户端在构造阶段直接崩溃。
+            某些本地代理工具会把 SOCKS 代理写成 `socks://...`，但 httpx
+            只接受 `socks5://...`。这里在客户端初始化前做一次轻量修正，
+            避免任务在真正发出 API 请求前就因代理 scheme 非法而崩溃。
         """
         proxy_env_names = (
             "ALL_PROXY",
@@ -107,10 +108,13 @@ class LLMClient:
             "HTTPS_PROXY",
             "https_proxy",
         )
-        for env_name in proxy_env_names:
-            proxy_value = os.getenv(env_name)
-            if proxy_value and proxy_value.startswith("socks://"):
-                os.environ[env_name] = "socks5://" + proxy_value[len("socks://") :]
+        for name in proxy_env_names:
+            value = os.environ.get(name)
+            if not value:
+                continue
+            stripped = value.strip()
+            if stripped.lower().startswith("socks://"):
+                os.environ[name] = "socks5://" + stripped[len("socks://") :]
 
     def _normalize_openai_base_url(self, base_url: Optional[str]) -> Optional[str]:
         """
@@ -239,6 +243,25 @@ class LLMClient:
         )
         return lowered.startswith(openai_prefixes)
 
+    def _prefers_openai_chat(self) -> bool:
+        """
+        判断当前配置是否应优先使用 OpenAI Chat Completions。
+
+        设计目的：
+            某些第三方模型虽然不是 OpenAI 命名风格，但其网关只暴露
+            OpenAI 兼容接口。MiniMax 就属于这种情况；如果先打
+            Anthropic Messages，会稳定命中 `/messages` 404。
+        """
+        lowered_model = self.model.strip().lower()
+        if lowered_model.startswith("minimax"):
+            return True
+
+        base = (self.base_url or "").strip().lower()
+        if "api.minimaxi.com" in base:
+            return True
+
+        return self._looks_like_openai_model()
+
     def _candidate_protocols(self) -> List[str]:
         """
         生成当前请求的候选协议顺序。
@@ -252,7 +275,7 @@ class LLMClient:
         if not self.base_url:
             return ["openai_chat"]
 
-        if self._looks_like_openai_model():
+        if self._prefers_openai_chat():
             return ["openai_chat", "anthropic_messages"]
         return ["anthropic_messages", "openai_chat"]
 
@@ -267,7 +290,7 @@ class LLMClient:
         """
         if not self.base_url:
             return True
-        return self._looks_like_openai_model()
+        return self._prefers_openai_chat()
 
     def _retry_delay(self, round_index: int) -> float:
         """
@@ -831,6 +854,7 @@ class LLMClient:
             raw_text = self._extract_text_from_response(response)
             cleaned_text = self._clean_thinking_model_output(raw_text)
             json_obj = stdlib_json.loads(cleaned_text)
+            json_obj = self._coerce_json_fields(json_obj)
             result = schema(**json_obj)
 
             log_meta["structured_output"] = True
@@ -905,9 +929,47 @@ class LLMClient:
         try:
             cleaned_text = self._clean_thinking_model_output(response_text)
             json_obj = stdlib_json.loads(cleaned_text)
+            json_obj = self._coerce_json_fields(json_obj)
             return schema(**json_obj)
         except (stdlib_json.JSONDecodeError, TypeError, ValueError) as error:
             raise RuntimeError(f"结构化输出调用失败: {error}") from error
+
+    @staticmethod
+    def _coerce_json_fields(json_obj: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        修复 MiniMax-M2.5 等模型将 list 字段序列化为字符串的问题。
+
+        设计目的：
+            MiniMax-M2.5 在 response_format=json_object 模式下，偶尔将
+            List[str] 字段输出为 Python repr 字符串 "['a', 'b']" 或 JSON
+            字符串 '["a","b"]'，导致 Pydantic 验证抛出 ValueError。
+            在此做一次轻量强制转换：对所有字符串值，若其以 "[" 开头，
+            尝试 json.loads → ast.literal_eval，成功且结果为列表则替换。
+
+        参数：
+            json_obj: 已通过 json.loads 解析的原始字典
+
+        返回值：
+            Dict[str, Any]: 经过 list 字段修正的字典（原地修改并返回）
+        """
+        import ast as _ast
+        import json as _json
+
+        for key, value in json_obj.items():
+            if not isinstance(value, str):
+                continue
+            stripped = value.strip()
+            if not stripped.startswith("["):
+                continue
+            for parser in (_json.loads, _ast.literal_eval):
+                try:
+                    parsed = parser(stripped)
+                    if isinstance(parsed, list):
+                        json_obj[key] = parsed
+                        break
+                except Exception:
+                    continue
+        return json_obj
 
     def _clean_thinking_model_output(self, text: str) -> str:
         """
