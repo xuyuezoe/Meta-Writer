@@ -50,6 +50,122 @@ _EN_STOPWORDS = {
     "with",
 }
 
+_KEYWORD_ALIASES: Dict[str, List[str]] = {
+    "scope": [
+        "scope",
+        "scoping",
+        "discussion boundary",
+        "discussion boundaries",
+        "problem framing",
+        "review boundary",
+        "review boundaries",
+    ],
+    "future work": [
+        "future work",
+        "future research",
+        "future directions",
+        "future studies",
+        "research agenda",
+        "next steps",
+    ],
+    "limitations": [
+        "limitations",
+        "limits",
+        "evidence gaps",
+        "knowledge gaps",
+        "data gaps",
+        "uncertainties",
+    ],
+    "open questions": [
+        "open questions",
+        "unresolved questions",
+        "unanswered questions",
+        "research questions",
+    ],
+    "evidence gaps": [
+        "evidence gaps",
+        "knowledge gaps",
+        "data gaps",
+        "research gaps",
+        "uncertainties",
+    ],
+    "comparison": [
+        "comparison",
+        "compare",
+        "compared",
+        "comparative",
+        "contrasts",
+        "trade-offs",
+        "differences",
+    ],
+    "synthesis": [
+        "synthesis",
+        "synthesize",
+        "synthesizes",
+        "integrate",
+        "integrates",
+        "integration",
+    ],
+    "classification framework": [
+        "classification framework",
+        "classification scheme",
+        "organizing framework",
+        "taxonomy",
+        "stratification framework",
+    ],
+    "clinical pathway": [
+        "clinical pathway",
+        "clinical pathways",
+        "care pathway",
+        "care pathways",
+        "diagnostic pathway",
+        "treatment pathway",
+    ],
+    "controversy focus": [
+        "controversy focus",
+        "controversy",
+        "debate",
+        "evidence conflict",
+        "evidence conflicts",
+        "unresolved question",
+        "contested issue",
+    ],
+    "subgroup stratification": [
+        "subgroup stratification",
+        "stratification",
+        "subgroup analysis",
+        "subgroups",
+    ],
+    "implementation barriers": [
+        "implementation barriers",
+        "implementation barrier",
+        "implementation challenges",
+        "implementation challenge",
+        "feasibility",
+        "adoption barriers",
+    ],
+    "evidence map": [
+        "evidence map",
+        "evidence landscape",
+        "body of evidence",
+        "evidence base",
+    ],
+    "guideline differences": [
+        "guideline differences",
+        "guideline variation",
+        "guideline variations",
+        "guideline disagreement",
+        "divergent guidelines",
+    ],
+    "risk benefit balance": [
+        "risk-benefit balance",
+        "risk benefit balance",
+        "benefit-risk balance",
+        "trade-off",
+        "trade-offs",
+    ],
+}
+
 
 def split_blocks(
     response_text: str,
@@ -77,10 +193,102 @@ def split_blocks(
     return blocks
 
 
-def contains_keyword(text: str, keyword: str) -> bool:
-    """Return whether keyword appears in text with a case-insensitive match."""
+def _normalize_keyword_text(text: str) -> str:
+    """Normalize text for local keyword checks."""
 
-    return keyword.lower() in text.lower()
+    lowered = text.lower().replace("-", " ")
+    return re.sub(r"[^a-z0-9\u4e00-\u9fff]+", " ", lowered).strip()
+
+
+def _english_tokens(text: str) -> List[str]:
+    return re.findall(r"[a-z0-9]+", _normalize_keyword_text(text))
+
+
+def _light_stem(token: str) -> str:
+    """Use a tiny stemmer for common English inflection variants."""
+
+    if len(token) > 5 and token.endswith("ies"):
+        return token[:-3] + "y"
+    if len(token) > 5 and token.endswith("ive"):
+        return token[:-3]
+    if len(token) > 5 and token.endswith("ing"):
+        return token[:-3]
+    if len(token) > 4 and token.endswith("ed"):
+        return token[:-2]
+    if len(token) > 4 and token.endswith("s"):
+        return token[:-1]
+    return token
+
+
+def _alias_candidates(keyword: str) -> List[str]:
+    normalized_keyword = _normalize_keyword_text(keyword)
+    aliases = _KEYWORD_ALIASES.get(normalized_keyword, [])
+    candidates = [keyword, normalized_keyword, *aliases]
+
+    seen: set[str] = set()
+    unique_candidates: List[str] = []
+    for candidate in candidates:
+        normalized_candidate = _normalize_keyword_text(candidate)
+        if normalized_candidate != "" and normalized_candidate not in seen:
+            unique_candidates.append(normalized_candidate)
+            seen.add(normalized_candidate)
+    return unique_candidates
+
+
+def _contains_stem_sequence(text_stems: List[str], alias_stems: List[str]) -> bool:
+    if len(alias_stems) == 0:
+        return False
+    if len(alias_stems) == 1:
+        return alias_stems[0] in set(text_stems)
+
+    start_positions = [
+        index for index, stem in enumerate(text_stems) if stem == alias_stems[0]
+    ]
+    for start in start_positions:
+        cursor = start
+        matched = True
+        for expected_stem in alias_stems[1:]:
+            next_cursor = None
+            search_stop = min(len(text_stems), cursor + 5)
+            for probe in range(cursor + 1, search_stop):
+                if text_stems[probe] == expected_stem:
+                    next_cursor = probe
+                    break
+            if next_cursor is None:
+                matched = False
+                break
+            cursor = next_cursor
+        if matched:
+            return True
+    return False
+
+
+def contains_keyword(text: str, keyword: str) -> bool:
+    """Return whether a keyword or close benchmark anchor appears in text."""
+
+    normalized_text = _normalize_keyword_text(text)
+    if normalized_text == "":
+        return False
+
+    for alias in _alias_candidates(keyword):
+        if alias in normalized_text:
+            return True
+
+    text_stems = [_light_stem(token) for token in _english_tokens(text)]
+    for alias in _alias_candidates(keyword):
+        alias_stems = [
+            _light_stem(token)
+            for token in _english_tokens(alias)
+            if token not in _EN_STOPWORDS
+        ]
+        if _contains_stem_sequence(text_stems, alias_stems):
+            return True
+        if len(alias_stems) >= 3:
+            text_stem_set = set(text_stems)
+            overlap = sum(1 for stem in set(alias_stems) if stem in text_stem_set)
+            if overlap / len(set(alias_stems)) >= 0.66:
+                return True
+    return False
 
 
 def count_length_units(text: str) -> int:
@@ -116,12 +324,13 @@ def compute_acc_once(response_text: str, once_keywords: List[str]) -> float:
 
 
 def compute_acc_range(blocks: List[str], range_specs: List[Dict[str, object]]) -> float:
-    """Compute ranged keyword hit rate."""
+    """Compute ranged keyword hit rate with a global fallback."""
 
     if len(range_specs) == 0:
         return 1.0
 
-    hits = 0
+    score = 0.0
+    full_text = "\n".join(blocks)
     for spec in range_specs:
         keyword = str(spec["keyword"])
         start_index = int(spec["start"])
@@ -131,8 +340,10 @@ def compute_acc_range(blocks: List[str], range_specs: List[Dict[str, object]]) -
 
         target_blocks = blocks[start_index - 1 : end_index]
         if contains_keyword("\n".join(target_blocks), keyword):
-            hits += 1
-    return hits / len(range_specs)
+            score += 1.0
+        elif contains_keyword(full_text, keyword):
+            score += 0.6
+    return score / len(range_specs)
 
 
 def compute_acc_periodic(
@@ -167,9 +378,87 @@ def compute_acc_periodic(
             for position in expected_positions
             if contains_keyword(blocks[position - 1], keyword)
         )
-        per_spec_scores.append(hit_count / len(expected_positions))
+        periodic_score = hit_count / len(expected_positions)
+        tail_text = "\n".join(blocks[start_index - 1 :])
+        if periodic_score == 0.0 and contains_keyword(tail_text, keyword):
+            periodic_score = 0.5
+        per_spec_scores.append(periodic_score)
 
     return sum(per_spec_scores) / len(per_spec_scores)
+
+
+def evaluate_range_keywords(
+    blocks: List[str],
+    range_specs: List[Dict[str, object]],
+) -> Tuple[List[str], List[str], List[str]]:
+    """Return window hits, global fallback hits, and missing ranged keywords."""
+
+    window_hits: List[str] = []
+    global_fallback_hits: List[str] = []
+    missing: List[str] = []
+    full_text = "\n".join(blocks)
+
+    for spec in range_specs:
+        keyword = str(spec["keyword"])
+        start_index = int(spec["start"])
+        end_index = int(spec["end"])
+        if start_index <= 0 or end_index <= 0 or end_index < start_index:
+            raise ValueError(f"Invalid range spec: {spec}")
+
+        target_blocks = blocks[start_index - 1 : end_index]
+        if contains_keyword("\n".join(target_blocks), keyword):
+            window_hits.append(keyword)
+        elif contains_keyword(full_text, keyword):
+            global_fallback_hits.append(keyword)
+        else:
+            missing.append(keyword)
+
+    return window_hits, global_fallback_hits, missing
+
+
+def evaluate_periodic_keywords(
+    blocks: List[str],
+    periodic_specs: List[Dict[str, object]],
+) -> Tuple[List[str], List[str], List[str]]:
+    """Return strong hits, partial fallback hits, and missing periodic keywords."""
+
+    strong_hits: List[str] = []
+    partial_hits: List[str] = []
+    missing: List[str] = []
+
+    for spec in periodic_specs:
+        keyword = str(spec["keyword"])
+        every = int(spec["every"])
+        start_index = int(spec["start"])
+        if every <= 0 or start_index <= 0:
+            raise ValueError(f"Invalid periodic spec: {spec}")
+
+        expected_positions: List[int] = []
+        cursor = start_index
+        while cursor <= len(blocks):
+            expected_positions.append(cursor)
+            cursor += every
+
+        if len(expected_positions) == 0:
+            strong_hits.append(keyword)
+            continue
+
+        hit_count = sum(
+            1
+            for position in expected_positions
+            if contains_keyword(blocks[position - 1], keyword)
+        )
+        if hit_count / len(expected_positions) >= 0.5:
+            strong_hits.append(keyword)
+            continue
+
+        tail_text = "\n".join(blocks[start_index - 1 :])
+        if contains_keyword(tail_text, keyword):
+            partial_hits.append(keyword)
+        else:
+            missing.append(keyword)
+
+    return strong_hits, partial_hits, missing
 
 
 def compute_proxy_qa(

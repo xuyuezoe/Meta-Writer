@@ -32,6 +32,8 @@ from metabench.local_metrics import (
     compute_structure_scores,
     contains_keyword,
     count_length_units,
+    evaluate_periodic_keywords,
+    evaluate_range_keywords,
     split_blocks,
 )
 from metabench.scoring import compute_s_length
@@ -101,8 +103,42 @@ def list_benchmark_task_ids() -> List[str]:
     return task_ids
 
 
-def _build_outline(task_type: str, must_include: List[str]) -> Dict[str, str]:
-    """Build a compact three-section outline for the benchmark sample."""
+def _target_section_count(required_length_words: int) -> int:
+    """Choose a review-like section count from the target length."""
+
+    if required_length_words <= 3000:
+        return 4
+    if required_length_words <= 7000:
+        return 5
+    if required_length_words <= 12000:
+        return 6
+    return 7
+
+
+def _section_word_budgets(required_length_words: int, section_count: int) -> List[int]:
+    """Distribute an approximate word budget across sections."""
+
+    if section_count <= 0:
+        raise ValueError("section_count must be positive")
+
+    base_budget = required_length_words // section_count
+    remainder = required_length_words % section_count
+    return [
+        base_budget + (1 if section_index < remainder else 0)
+        for section_index in range(section_count)
+    ]
+
+
+def _with_budget(title: str, word_budget: int) -> str:
+    return f"{title} (target about {word_budget} words)"
+
+
+def _build_outline(
+    task_type: str,
+    must_include: List[str],
+    required_length_words: int,
+) -> Dict[str, str]:
+    """Build a review-like outline with explicit section word budgets."""
     organizer_candidates = [
         item for item in ORGANIZER_CANDIDATES_EN if item in must_include
     ]
@@ -113,18 +149,47 @@ def _build_outline(task_type: str, must_include: List[str]) -> Dict[str, str]:
         organizer_candidates[0] if organizer_candidates else "core organizing axis"
     )
     closing_label = closing_candidates[0] if closing_candidates else "future work"
+    focus_label = must_include[4] if len(must_include) > 4 else "core evidence"
+    context_label = must_include[5] if len(must_include) > 5 else "practice context"
+    evidence_label = must_include[6] if len(must_include) > 6 else "evidence integration"
 
     if task_type == "analysis":
-        return {
-            "sec1": "Scope, core concepts, and analytical perspective",
-            "sec2": f"Comparative and synthetic analysis organized around the {organizer_label}",
-            "sec3": f"Limitations, {closing_label}, and closing judgment",
-        }
+        section_titles = [
+            "Scope, terminology, and review boundaries",
+            f"Background and organizing framework around the {organizer_label}",
+            f"Core evidence on {focus_label} and {evidence_label}",
+            f"Comparative synthesis for the {context_label} context",
+            f"Limitations, {closing_label}, and closing judgment",
+        ]
+    else:
+        section_titles = [
+            "Background, problem framing, and review scope",
+            f"Organizing framework and evidence base for the {organizer_label}",
+            f"Comparative discussion of {focus_label} and {evidence_label}",
+            f"Implementation and practice implications for {context_label}",
+            f"Limitations, {closing_label}, and forward-looking discussion",
+        ]
 
+    section_count = _target_section_count(required_length_words)
+    if section_count >= 6:
+        section_titles.insert(
+            3,
+            f"Methodological contrasts and evidence conflicts around the {organizer_label}",
+        )
+    if section_count >= 7:
+        section_titles.insert(
+            -1,
+            f"Open questions and research agenda for {context_label}",
+        )
+
+    if section_count < len(section_titles):
+        section_titles = section_titles[: section_count - 1] + [section_titles[-1]]
+    else:
+        section_titles = section_titles[:section_count]
+    budgets = _section_word_budgets(required_length_words, len(section_titles))
     return {
-        "sec1": "Background, problem framing, and review scope",
-        "sec2": f"Comparison, integration, and discussion under the {organizer_label}",
-        "sec3": f"Reflections on limitations, {closing_label}, and forward-looking discussion",
+        f"sec{index + 1}": _with_budget(title, budgets[index])
+        for index, title in enumerate(section_titles)
     }
 
 
@@ -240,6 +305,9 @@ def load_benchmark_task(task_id: str) -> Dict[str, object]:
                 f"The body should contain at least {expected_blocks} natural paragraphs and read like a long-form review rather than a brief or outline."
             ),
             _mark_document_level_constraint(
+                "Use the approximate word budget in each section title to distribute the target length across the article."
+            ),
+            _mark_document_level_constraint(
                 "Use a survey-paper style: define the scope first, then organize, compare, and synthesize the evidence before closing with limitations and future work."
             ),
             *[
@@ -281,7 +349,7 @@ def load_benchmark_task(task_id: str) -> Dict[str, object]:
         return {
             "task": prompt,
             "constraints": constraints,
-            "outline": _build_outline(task_type, must_include),
+            "outline": _build_outline(task_type, must_include, required_length_words),
             "reference": reference,
         }
 
@@ -363,42 +431,12 @@ def evaluate_output(
         if _contains_keyword(normalized_text, str(item["answer"]))
     ]
 
-    range_keyword_hits: List[str] = []
-    missing_range_keywords: List[str] = []
-    for item in range_keywords:
-        keyword = str(item["keyword"])
-        start_index = max(1, int(item["start"])) - 1
-        end_index = min(len(paragraph_blocks), int(item["end"]))
-        candidate_blocks = paragraph_blocks[start_index:end_index]
-        if any(_contains_keyword(block, keyword) for block in candidate_blocks):
-            range_keyword_hits.append(keyword)
-        else:
-            missing_range_keywords.append(keyword)
-
-    periodic_keyword_hits: List[str] = []
-    missing_periodic_keywords: List[str] = []
-    for item in periodic_keywords:
-        keyword = str(item["keyword"])
-        every_value = int(item["every"])
-        start_paragraph = max(1, int(item["start"]))
-        if every_value <= 0:
-            raise ValueError("periodic_keywords.every must be positive")
-
-        target_hit_count = 0
-        current_paragraph = start_paragraph
-        while current_paragraph <= len(paragraph_blocks):
-            target_hit_count += 1
-            current_paragraph += every_value
-
-        actual_hit_count = sum(
-            1
-            for block in paragraph_blocks[start_paragraph - 1 :]
-            if _contains_keyword(block, keyword)
-        )
-        if actual_hit_count >= target_hit_count and target_hit_count > 0:
-            periodic_keyword_hits.append(keyword)
-        else:
-            missing_periodic_keywords.append(keyword)
+    range_keyword_hits, range_keyword_global_fallback_hits, missing_range_keywords = (
+        evaluate_range_keywords(paragraph_blocks, range_keywords)
+    )
+    periodic_keyword_hits, periodic_keyword_partial_hits, missing_periodic_keywords = (
+        evaluate_periodic_keywords(paragraph_blocks, periodic_keywords)
+    )
 
     response_word_count = count_length_units(normalized_text)
     length_ratio = response_word_count / required_length_words
@@ -459,8 +497,10 @@ def evaluate_output(
             "completion_rate": completion_rate,
             "once_signal": once_signal,
             "range_keyword_hits": range_keyword_hits,
+            "range_keyword_global_fallback_hits": range_keyword_global_fallback_hits,
             "missing_range_keywords": missing_range_keywords,
             "periodic_keyword_hits": periodic_keyword_hits,
+            "periodic_keyword_partial_hits": periodic_keyword_partial_hits,
             "missing_periodic_keywords": missing_periodic_keywords,
             "proxy_hit_count": proxy_hit_count,
             "proxy_total": proxy_total,

@@ -67,6 +67,29 @@ class BenchmarkTemplateTests(unittest.TestCase):
             ["First paragraph.", "Second paragraph.", "Third paragraph."],
         )
 
+    def test_benchmark_outline_uses_review_sections_with_word_budgets(self) -> None:
+        config = build_benchmark_task_config("med_s003")
+        outline = config["outline"]
+
+        self.assertIsInstance(outline, dict)
+        self.assertGreaterEqual(len(outline), 6)
+        self.assertTrue(
+            all(
+                isinstance(title, str)
+                and "target about" in title
+                and "words" in title
+                for title in outline.values()
+            )
+        )
+
+    def test_short_benchmark_outline_keeps_closing_section(self) -> None:
+        config = build_benchmark_task_config("med_s381")
+        outline_titles = list(config["outline"].values())
+
+        self.assertGreaterEqual(len(outline_titles), 4)
+        self.assertIn("Limitations", outline_titles[-1])
+        self.assertIn("future work", outline_titles[-1])
+
     def test_benchmark_reference_keeps_once_keywords(self) -> None:
         config = build_benchmark_task_config("med_s001")
         reference = config["reference"]
@@ -100,6 +123,44 @@ class BenchmarkTemplateTests(unittest.TestCase):
         self.assertLess(
             diagnostics["response_word_count"],
             diagnostics["required_length_words"],
+        )
+
+    def test_evaluate_output_accepts_soft_keyword_and_range_fallback_hits(self) -> None:
+        config = build_benchmark_task_config("med_s001")
+        reference = config["reference"]
+        paragraphs = [
+            "Cardiovascular medicine and acute coronary syndrome are introduced with mechanism, adult inpatient care, and hemodynamics in view.",
+            "The classification scheme frames a comparison of diagnostic and therapeutic priorities.",
+            "The mechanism and hemodynamics evidence are compared across adult inpatient pathways.",
+            "A further comparison integrates cardiovascular medicine evidence with practical inpatient constraints.",
+            "The review turns to limitations and uncertainties in the evidence base.",
+            "Evidence gaps remain visible when adult inpatient pathways are compared across settings.",
+            "Future research should refine the agenda while the discussion boundaries remain explicit.",
+        ]
+
+        evaluation = evaluate_output("\n\n".join(paragraphs), reference)
+        diagnostics = evaluation["diagnostics"]
+
+        self.assertIn("scope", evaluation["diagnostics"]["matched_keywords"])
+        self.assertIn("scope", diagnostics["range_keyword_global_fallback_hits"])
+        self.assertNotIn("scope", diagnostics["missing_range_keywords"])
+        self.assertIn("future work", diagnostics["range_keyword_hits"])
+
+    def test_evaluate_output_accepts_partial_long_domain_phrase(self) -> None:
+        config = build_benchmark_task_config("med_s381")
+        reference = config["reference"]
+        paragraphs = [
+            "The scope of perioperative optimization is framed within perioperative medicine and low-resource settings.",
+            "The controversy focus concerns whether prognosis tools and risk assessment can travel across settings.",
+            "The evidence compares limitations in risk assessment and implementation feasibility.",
+            "Future work should address evidence gaps and practical constraints.",
+        ]
+
+        evaluation = evaluate_output("\n\n".join(paragraphs), reference)
+
+        self.assertIn(
+            "surgery and perioperative medicine",
+            evaluation["diagnostics"]["matched_keywords"],
         )
 
 
