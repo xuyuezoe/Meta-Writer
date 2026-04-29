@@ -129,7 +129,10 @@ try:
             description="The core writing decision for this section"
         )
         reasoning: str = Field(
-            description="The reasoning behind the decision, optionally citing earlier section IDs"
+            description=(
+                "The reasoning behind the decision, optionally citing earlier section IDs. "
+                "Do NOT place [Rx] reference markers here — they belong in the content field only."
+            )
         )
         expected_effect: str = Field(
             description="The effect this section should achieve once it is complete"

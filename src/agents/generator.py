@@ -62,6 +62,7 @@ class Generator:
         temperature: float = 0.7,
         orchestrator_attempt: int = 1,
         section_papers: Optional[List[GlobalPaperEntry]] = None,
+        citation_retry_hint: Optional[str] = None,
     ) -> Tuple[str, Decision]:
         """
         生成内容并返回决策对象。
@@ -74,6 +75,7 @@ class Generator:
             temperature:         生成温度
             orchestrator_attempt: 协调器层尝试序号（1-based）
             section_papers:      当节最相关的 GlobalPaperEntry 列表（可选）
+            citation_retry_hint: 上一轮因引用密度不足失败时的强制提示；None 表示首次尝试
 
         返回值：
             Tuple[str, Decision]：(生成内容含 [Rx] 标记, 决策对象)
@@ -92,6 +94,7 @@ class Generator:
                 recent_content=recent_content,
                 section_intent=section_intent,
                 section_papers=section_papers,
+                citation_retry_hint=citation_retry_hint,
             )
             self.logger.debug(
                 "第 %d 次尝试生成，section=%s temp=%.2f papers=%d",
@@ -177,6 +180,7 @@ class Generator:
         recent_content: str,
         section_intent: Optional[SectionIntent],
         section_papers: Optional[List[GlobalPaperEntry]] = None,
+        citation_retry_hint: Optional[str] = None,
     ) -> str:
         """
         构建生成 prompt。
@@ -188,7 +192,8 @@ class Generator:
             4. 引用使用规范（[Rx] 标记）
             5. 最近已生成内容
             6. 任务描述
-            7. JSON 输出要求
+            7. 引用重试警告（仅在上一轮因引用密度不足失败时出现，紧贴输出规范前）
+            8. JSON 输出要求
         """
         state_desc = state.to_prompt()
         truncated = recent_content[-self.RECENT_CONTENT_LIMIT:] if recent_content else "(none)"
@@ -215,6 +220,14 @@ class Generator:
         reference_block = self._build_reference_block(section_papers)
         citation_instructions = self._build_citation_instructions(section_papers)
 
+        # 引用重试警告：仅在 orchestrator 检测到上一轮引用密度不足时注入，
+        # 紧贴 JSON 输出规范正前方，利用 recency 效应最大化约束遵循率。
+        citation_warning = (
+            f"\n[!!CITATION REQUIREMENT NOT MET IN PREVIOUS ATTEMPT!!]\n"
+            f"{citation_retry_hint}\n"
+            "You must satisfy this requirement in the current response.\n"
+        ) if citation_retry_hint else ""
+
         return (
             "You are a long-form writing system.\n"
             f"\nCurrent state:\n{state_desc}"
@@ -225,9 +238,11 @@ class Generator:
             f"{citation_instructions}"
             f"\nRecent content:\n{truncated}"
             f"\n\nCurrent task:\n{task}"
+            f"{citation_warning}"
             "\n\nReturn a JSON object with the following fields:"
             "\n- decision: the core writing decision for this section"
-            "\n- reasoning: the reasoning behind that decision, optionally citing earlier section IDs"
+            "\n- reasoning: the reasoning behind that decision, optionally citing earlier section IDs."
+            " Do NOT put [Rx] markers here."
             "\n- expected_effect: the effect this section should achieve"
             "\n- confidence: a number between 0.0 and 1.0"
             "\n- content: prose text for the section."

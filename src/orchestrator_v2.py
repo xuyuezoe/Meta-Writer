@@ -209,6 +209,7 @@ class SelfCorrectingOrchestrator:
                 content: Optional[str] = None
                 decision: Optional[Decision] = None
                 last_failure_reason: Optional[str] = None
+                citation_retry_hint: Optional[str] = None  # 每节重置；引用失败后由验证路径填充
 
                 for attempt in range(self.MAX_RETRIES_PER_SECTION):
                     # 第二阶段：生成
@@ -223,6 +224,7 @@ class SelfCorrectingOrchestrator:
                             section_intent=section_intent,
                             temperature=temperature,
                             section_papers=section_papers,
+                            citation_retry_hint=citation_retry_hint,
                         )
                     except Exception as e:
                         self.logger.error("生成异常（section=%s attempt=%d）: %s", section_id, attempt + 1, e)
@@ -332,6 +334,28 @@ class SelfCorrectingOrchestrator:
                         f"{diagnosis.repair_scope}({diagnosis.error_tier.value})",
                         report.issues,
                     )
+
+                    # 引用失败检测：当 ReferenceValidator 报告合法引用不足时，
+                    # 构建明确的重试提示，下一轮生成会将其注入 prompt 顶层。
+                    # 目的：把"失败原因"变成"下轮硬约束"，打破三轮同输入循环。
+                    ref_rpt = report.reference_report if report else None
+                    if ref_rpt is not None and not ref_rpt.passed:
+                        available_labels = (
+                            " ".join(f"[R{e.r_index}]" for e in section_papers)
+                            if section_papers else "none"
+                        )
+                        citation_retry_hint = (
+                            f"The previous attempt produced {ref_rpt.valid_marker_count} valid [Rx] "
+                            f"marker(s) in the content field, but at least 2 are required. "
+                            f"References available for this section: {available_labels}. "
+                            "You MUST append [Rx] immediately after each sentence that a reference supports. "
+                            "[Rx] markers must appear ONLY in the content field — "
+                            "never in reasoning, decision, or expected_effect."
+                        )
+                        self.logger.info(
+                            "citation_retry_hint set for next attempt: section=%s valid_markers=%d",
+                            section_id, ref_rpt.valid_marker_count,
+                        )
 
                     # 执行修复
                     if diagnosis.repair_scope == "partial_rollback":
