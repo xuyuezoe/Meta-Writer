@@ -202,6 +202,7 @@ def _build_run_result(
         "outline": dict(config["outline"]) if isinstance(config["outline"], dict) else {},
         "text_word_count": len(final_text.split()),
         "text_length_chars": len(final_text),
+        "text_length": len(final_text),
         "correction_stats": correction_stats,
         "dtg_stats": dtg_stats,
         "metric_summary": metric_summary,
