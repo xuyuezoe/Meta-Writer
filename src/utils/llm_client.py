@@ -851,6 +851,15 @@ class LLMClient:
             self._preferred_protocol = "openai_chat"
             self._collect_usage(response)
 
+            # 检测 finish_reason：若为 "length" 说明 token 达限，JSON 大概率被截断
+            finish_reason = self._extract_finish_reason(response)
+            if finish_reason == "length":
+                self.logger.warning(
+                    "generate_structured: finish_reason=length，JSON 可能被截断 "
+                    "(model=%s max_tokens=%d)，先尝试 JSON 救援",
+                    self.model, max_tokens,
+                )
+
             raw_text = self._extract_text_from_response(response)
             cleaned_text = self._clean_thinking_model_output(raw_text)
             json_obj = stdlib_json.loads(cleaned_text)
@@ -879,12 +888,156 @@ class LLMClient:
             return self._generate_structured_fallback(prompt, schema, temperature, max_tokens, log_meta)
 
         except (stdlib_json.JSONDecodeError, TypeError, ValueError) as parse_error:
+            schema_name = schema.__name__ if hasattr(schema, "__name__") else str(schema)
             self.logger.warning(
-                "response_format 返回内容无法解析为 %s，尝试降级到普通生成：%s",
-                schema.__name__ if hasattr(schema, "__name__") else str(schema),
-                parse_error,
+                "response_format 返回内容无法解析为 %s（位置 %s），先尝试字段级救援...",
+                schema_name, parse_error,
             )
+            # 先尝试从损坏的 JSON 中逐字段抢救，避免整体重新生成浪费一次 LLM 调用。
+            # 典型场景：content 字段过长导致 token 截断，或含未转义控制字符。
+            rescued = self._try_rescue_truncated_json(cleaned_text)
+            if rescued is not None:
+                try:
+                    rescued = self._coerce_json_fields(rescued)
+                    result = schema(**rescued)
+                    self.logger.info(
+                        "JSON 字段救援成功：schema=%s rescued_keys=%s",
+                        schema_name, sorted(rescued.keys()),
+                    )
+                    return result
+                except Exception as rescue_err:
+                    self.logger.warning("JSON 字段救援构造 schema 失败：%s，降级到全量重生成", rescue_err)
+            else:
+                self.logger.warning("JSON 字段救援未提取到 content，降级到全量重生成")
+
             return self._generate_structured_fallback(prompt, schema, temperature, max_tokens, log_meta)
+
+    def _extract_finish_reason(self, response: Any) -> Optional[str]:
+        """
+        从 API 响应中提取 finish_reason。
+
+        设计目的：
+            finish_reason="length" 表示模型在 max_tokens 时被强制截断，
+            是 JSON 被截断的直接证据，需要在日志层面明确区分。
+        """
+        choices = getattr(response, "choices", None)
+        if isinstance(choices, list) and choices:
+            return getattr(choices[0], "finish_reason", None)
+        if isinstance(response, Mapping):
+            choices_data = response.get("choices", [])
+            if choices_data:
+                return choices_data[0].get("finish_reason")
+        return None
+
+    @staticmethod
+    def _extract_json_string_tolerant(text: str, start: int) -> str:
+        """
+        从 start 位置开始，解析一个 JSON 字符串直到遇到未转义的 `"` 或文本结尾。
+
+        设计目的：
+            正则无法正确处理 `\"` 转义 + 截断组合。此方法是一个最小化的
+            JSON string 解析器：正确反转义 \\ / \" / \n / \t / \r，
+            遇到截断（text 提前结束）时返回已解析的部分内容，而不是抛出异常。
+
+        参数：
+            text:  包含 JSON 内容的原始字符串
+            start: 字符串值的起始位置（即开头 `"` 之后的第一个字符）
+
+        返回：
+            解析出的字符串内容（可能是截断版本，但总是有效的 Python str）
+        """
+        buf: List[str] = []
+        i = start
+        while i < len(text):
+            ch = text[i]
+            if ch == "\\" and i + 1 < len(text):
+                nxt = text[i + 1]
+                buf.append(
+                    '"' if nxt == '"' else
+                    '\n' if nxt == 'n' else
+                    '\t' if nxt == 't' else
+                    '\r' if nxt == 'r' else
+                    '\\' if nxt == '\\' else
+                    nxt
+                )
+                i += 2
+            elif ch == '"':
+                break  # 正常结束
+            else:
+                buf.append(ch)
+                i += 1
+        return "".join(buf).strip()
+
+    def _try_rescue_truncated_json(self, text: str) -> Optional[Dict[str, Any]]:
+        """
+        从截断或含非法字符的 JSON 文本中逐字段抢救可用内容。
+
+        设计目的：
+            当 response_format=json_object 被截断（finish_reason=length）或
+            content 字段含未转义控制字符时，json.loads 整体失败。
+            此方法用有限正则对各字段独立提取，只要拿到 content 就能继续。
+            缺失的元数据字段（decision/reasoning 等）填入安全默认值，
+            不会阻断生成主循环。
+
+        返回：
+            提取到 content 时返回字段 dict，否则返回 None。
+
+        关键约束：
+            - 只做字段提取，不尝试修复 JSON 语法（太脆弱）
+            - content 是必须字段；其余字段可用默认值兜底
+            - 日志中标注 "rescued" 以便追踪
+        """
+        recovered: Dict[str, Any] = {}
+
+        # 第一阶段：提取 string 类短字段（出现在 content 之前，一般不截断）
+        for key in ("decision", "reasoning", "expected_effect"):
+            m = re.search(
+                r'"' + re.escape(key) + r'"\s*:\s*"((?:[^"\\]|\\.)*?)"',
+                text, re.DOTALL,
+            )
+            if m:
+                try:
+                    recovered[key] = m.group(1).replace('\\"', '"')
+                except Exception:
+                    pass
+
+        # 第二阶段：提取 confidence（数字型，不会截断）
+        m = re.search(r'"confidence"\s*:\s*([0-9]*\.?[0-9]+)', text)
+        if m:
+            try:
+                recovered["confidence"] = float(m.group(1))
+            except ValueError:
+                pass
+
+        # 第三阶段：提取 content（可能被截断）
+        # 用字符级解析器而非正则：正确处理 \" 转义，在截断位置安全停止。
+        content_match = re.search(r'"content"\s*:\s*"', text)
+        if content_match:
+            recovered["content"] = self._extract_json_string_tolerant(
+                text, content_match.end()
+            )
+
+        # 第四阶段：提取 referenced_section_ids（列表型）
+        m = re.search(r'"referenced_section_ids"\s*:\s*(\[[^\]]*\])', text)
+        if m:
+            try:
+                recovered["referenced_section_ids"] = json.loads(m.group(1))
+            except Exception:
+                recovered["referenced_section_ids"] = []
+        else:
+            recovered.setdefault("referenced_section_ids", [])
+
+        # content 是必须字段；无法提取则放弃救援
+        if "content" not in recovered:
+            return None
+
+        # 为缺失的必须字段填入安全默认值
+        recovered.setdefault("decision", "Content generated (rescued from partial JSON output)")
+        recovered.setdefault("reasoning", "Original structured response was partially parsed.")
+        recovered.setdefault("expected_effect", "Deliver section content.")
+        recovered.setdefault("confidence", 0.6)
+
+        return recovered
 
     def _generate_structured_fallback(
         self,
