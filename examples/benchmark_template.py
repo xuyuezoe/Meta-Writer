@@ -9,13 +9,35 @@ from __future__ import annotations
 
 import json
 import re
+import sys
 from pathlib import Path
 from typing import Dict, List, Union, cast
 
 
 BENCHMARK_ROOT: Path = Path(__file__).resolve().parent.parent / "metabench"
+METABENCH_SRC_ROOT: Path = BENCHMARK_ROOT / "src"
 SAMPLES_PATH: Path = BENCHMARK_ROOT / "examples" / "samples.jsonl"
 DOCUMENT_LEVEL_CONSTRAINT_PREFIX = "Document-level requirement: "
+
+if str(METABENCH_SRC_ROOT) not in sys.path:
+    sys.path.insert(0, str(METABENCH_SRC_ROOT))
+
+from metabench.local_metrics import (
+    compute_acc_once,
+    compute_acc_periodic,
+    compute_acc_range,
+    compute_completion_rate,
+    compute_instruction_hits,
+    compute_proxy_qa,
+    compute_soft_instruction_hits,
+    compute_structure_scores,
+    contains_keyword,
+    count_length_units,
+    evaluate_periodic_keywords,
+    evaluate_range_keywords,
+    split_blocks,
+)
+from metabench.scoring import compute_s_length
 
 ORGANIZER_CANDIDATES_EN = [
     "classification framework",
@@ -54,16 +76,7 @@ def _extract_paragraph_blocks(text: str) -> List[str]:
     normalized_text = text.replace("\r\n", "\n").strip()
     if normalized_text == "":
         return []
-
-    paragraph_blocks: List[str] = []
-    for raw_block in normalized_text.split("\n\n"):
-        block = raw_block.strip()
-        if block == "" or block == "---":
-            continue
-        if re.match(r"^#{1,6}\s+", block):
-            continue
-        paragraph_blocks.append(block)
-    return paragraph_blocks
+    return split_blocks(normalized_text, drop_markdown_wrappers=True)
 
 
 def _read_jsonl_rows(file_path: Path) -> List[Dict[str, object]]:
@@ -91,8 +104,42 @@ def list_benchmark_task_ids() -> List[str]:
     return task_ids
 
 
-def _build_outline(task_type: str, must_include: List[str]) -> Dict[str, str]:
-    """Build a compact three-section outline for the benchmark sample."""
+def _target_section_count(required_length_words: int) -> int:
+    """Choose a review-like section count from the target length."""
+
+    if required_length_words <= 3000:
+        return 4
+    if required_length_words <= 7000:
+        return 5
+    if required_length_words <= 12000:
+        return 6
+    return 7
+
+
+def _section_word_budgets(required_length_words: int, section_count: int) -> List[int]:
+    """Distribute an approximate word budget across sections."""
+
+    if section_count <= 0:
+        raise ValueError("section_count must be positive")
+
+    base_budget = required_length_words // section_count
+    remainder = required_length_words % section_count
+    return [
+        base_budget + (1 if section_index < remainder else 0)
+        for section_index in range(section_count)
+    ]
+
+
+def _with_budget(title: str, word_budget: int) -> str:
+    return f"{title} (target about {word_budget} words)"
+
+
+def _build_outline(
+    task_type: str,
+    must_include: List[str],
+    required_length_words: int,
+) -> Dict[str, str]:
+    """Build a review-like outline with explicit section word budgets."""
     organizer_candidates = [
         item for item in ORGANIZER_CANDIDATES_EN if item in must_include
     ]
@@ -103,18 +150,47 @@ def _build_outline(task_type: str, must_include: List[str]) -> Dict[str, str]:
         organizer_candidates[0] if organizer_candidates else "core organizing axis"
     )
     closing_label = closing_candidates[0] if closing_candidates else "future work"
+    focus_label = must_include[4] if len(must_include) > 4 else "core evidence"
+    context_label = must_include[5] if len(must_include) > 5 else "practice context"
+    evidence_label = must_include[6] if len(must_include) > 6 else "evidence integration"
 
     if task_type == "analysis":
-        return {
-            "sec1": "Scope, core concepts, and analytical perspective",
-            "sec2": f"Comparative and synthetic analysis organized around the {organizer_label}",
-            "sec3": f"Limitations, {closing_label}, and closing judgment",
-        }
+        section_titles = [
+            "Scope, terminology, and review boundaries",
+            f"Background and organizing framework around the {organizer_label}",
+            f"Core evidence on {focus_label} and {evidence_label}",
+            f"Comparative synthesis for the {context_label} context",
+            f"Limitations, {closing_label}, and closing judgment",
+        ]
+    else:
+        section_titles = [
+            "Background, problem framing, and review scope",
+            f"Organizing framework and evidence base for the {organizer_label}",
+            f"Comparative discussion of {focus_label} and {evidence_label}",
+            f"Implementation and practice implications for {context_label}",
+            f"Limitations, {closing_label}, and forward-looking discussion",
+        ]
 
+    section_count = _target_section_count(required_length_words)
+    if section_count >= 6:
+        section_titles.insert(
+            3,
+            f"Methodological contrasts and evidence conflicts around the {organizer_label}",
+        )
+    if section_count >= 7:
+        section_titles.insert(
+            -1,
+            f"Open questions and research agenda for {context_label}",
+        )
+
+    if section_count < len(section_titles):
+        section_titles = section_titles[: section_count - 1] + [section_titles[-1]]
+    else:
+        section_titles = section_titles[:section_count]
+    budgets = _section_word_budgets(required_length_words, len(section_titles))
     return {
-        "sec1": "Background, problem framing, and review scope",
-        "sec2": f"Comparison, integration, and discussion under the {organizer_label}",
-        "sec3": f"Reflections on limitations, {closing_label}, and forward-looking discussion",
+        f"sec{index + 1}": _with_budget(title, budgets[index])
+        for index, title in enumerate(section_titles)
     }
 
 
@@ -132,7 +208,7 @@ def _normalize_reference(reference: Union[str, Dict[str, object]]) -> Dict[str, 
 
 def _contains_keyword(text: str, keyword: str) -> bool:
     """Return whether a keyword appears in a case-insensitive match."""
-    return keyword.lower() in text.lower()
+    return contains_keyword(text, keyword)
 
 
 def _parse_int_field(raw_value: object, field_name: str) -> int:
@@ -205,6 +281,12 @@ def load_benchmark_task(task_id: str) -> Dict[str, object]:
             raw_constraints["periodic_keywords"],
             "constraints.periodic_keywords",
         )
+        once_keywords = [str(item) for item in must_include]
+        if "once_keywords" in raw_constraints:
+            once_keywords_object = raw_constraints["once_keywords"]
+            if not isinstance(once_keywords_object, list):
+                raise TypeError("constraints.once_keywords must be a list")
+            once_keywords = [str(item) for item in once_keywords_object]
 
         proxy_questions_object = sample_row["proxy_questions"]
         if not isinstance(proxy_questions_object, list):
@@ -222,6 +304,9 @@ def load_benchmark_task(task_id: str) -> Dict[str, object]:
             ),
             _mark_document_level_constraint(
                 f"The body should contain at least {expected_blocks} natural paragraphs and read like a long-form review rather than a brief or outline."
+            ),
+            _mark_document_level_constraint(
+                "Use the approximate word budget in each section title to distribute the target length across the article."
             ),
             _mark_document_level_constraint(
                 "Use a survey-paper style: define the scope first, then organize, compare, and synthesize the evidence before closing with limitations and future work."
@@ -244,6 +329,7 @@ def load_benchmark_task(task_id: str) -> Dict[str, object]:
             "constraints": {
                 "required_length_words": required_length_words,
                 "must_include": must_include,
+                "once_keywords": once_keywords,
                 "periodic_requirements": periodic_requirements,
                 "expected_blocks": expected_blocks,
                 "range_keywords": range_keywords,
@@ -264,7 +350,7 @@ def load_benchmark_task(task_id: str) -> Dict[str, object]:
         return {
             "task": prompt,
             "constraints": constraints,
-            "outline": _build_outline(task_type, must_include),
+            "outline": _build_outline(task_type, must_include, required_length_words),
             "reference": reference,
         }
 
@@ -289,6 +375,15 @@ def evaluate_output(
     if not isinstance(must_include_object, list):
         raise TypeError("reference.constraints.must_include must be a list")
     must_include = [str(item) for item in must_include_object]
+    once_keywords_object = raw_constraints.get("once_keywords", must_include)
+    if not isinstance(once_keywords_object, list):
+        raise TypeError("reference.constraints.once_keywords must be a list")
+    once_keywords = [str(item) for item in once_keywords_object]
+
+    required_length_words = _parse_int_field(
+        raw_constraints["required_length_words"],
+        "reference.constraints.required_length_words",
+    )
 
     expected_blocks = _parse_int_field(
         raw_constraints["expected_blocks"],
@@ -323,6 +418,11 @@ def evaluate_output(
     if len(proxy_questions) == 0:
         raise ValueError("reference.proxy_questions must not be empty")
 
+    paragraph_blocks = _extract_paragraph_blocks(normalized_text)
+    body_text = "\n\n".join(paragraph_blocks)
+    sentence_parts = re.split(r"[.!?]+", body_text)
+    sentence_count = sum(1 for part in sentence_parts if part.strip() != "")
+
     matched_keywords = [
         item for item in must_include if _contains_keyword(normalized_text, item)
     ]
@@ -332,90 +432,109 @@ def evaluate_output(
         if _contains_keyword(normalized_text, str(item["answer"]))
     ]
 
-    paragraph_blocks = _extract_paragraph_blocks(normalized_text)
-    body_text = "\n\n".join(paragraph_blocks)
-    sentence_parts = re.split(r"[.!?]+", body_text)
-    sentence_count = sum(1 for part in sentence_parts if part.strip() != "")
-
-    range_keyword_hits: List[str] = []
-    missing_range_keywords: List[str] = []
-    for item in range_keywords:
-        keyword = str(item["keyword"])
-        start_index = max(1, int(item["start"])) - 1
-        end_index = min(len(paragraph_blocks), int(item["end"]))
-        candidate_blocks = paragraph_blocks[start_index:end_index]
-        if any(_contains_keyword(block, keyword) for block in candidate_blocks):
-            range_keyword_hits.append(keyword)
-        else:
-            missing_range_keywords.append(keyword)
-
-    periodic_keyword_hits: List[str] = []
-    missing_periodic_keywords: List[str] = []
-    for item in periodic_keywords:
-        keyword = str(item["keyword"])
-        every_value = int(item["every"])
-        start_paragraph = max(1, int(item["start"]))
-        if every_value <= 0:
-            raise ValueError("periodic_keywords.every must be positive")
-
-        target_hit_count = 0
-        current_paragraph = start_paragraph
-        while current_paragraph <= len(paragraph_blocks):
-            target_hit_count += 1
-            current_paragraph += every_value
-
-        actual_hit_count = sum(
-            1
-            for block in paragraph_blocks[start_paragraph - 1 :]
-            if _contains_keyword(block, keyword)
-        )
-        if actual_hit_count >= target_hit_count and target_hit_count > 0:
-            periodic_keyword_hits.append(keyword)
-        else:
-            missing_periodic_keywords.append(keyword)
-
-    entity_consistency_score = len(matched_keywords) / len(must_include)
-    proxy_hit_rate = len(matched_proxy_answers) / len(proxy_questions)
-    paragraph_signal = min(1.0, len(paragraph_blocks) / expected_blocks)
-    sentence_signal = 1.0 if sentence_count >= expected_blocks * 2 else 0.5
-    range_signal = (
-        len(range_keyword_hits) / len(range_keywords) if len(range_keywords) > 0 else 1.0
+    range_keyword_hits, range_keyword_global_fallback_hits, missing_range_keywords = (
+        evaluate_range_keywords(paragraph_blocks, range_keywords)
     )
-    periodic_signal = (
-        len(periodic_keyword_hits) / len(periodic_keywords)
-        if len(periodic_keywords) > 0
-        else 1.0
+    periodic_keyword_hits, periodic_keyword_partial_hits, missing_periodic_keywords = (
+        evaluate_periodic_keywords(paragraph_blocks, periodic_keywords)
     )
+
+    response_word_count = count_length_units(normalized_text)
+    length_ratio = response_word_count / required_length_words
+    length_score = compute_s_length(required_length_words, normalized_text)
+    completion_rate = compute_completion_rate(paragraph_blocks, expected_blocks)
+    once_signal = compute_acc_once(normalized_text, once_keywords)
+    range_signal = compute_acc_range(paragraph_blocks, range_keywords)
+    periodic_signal = compute_acc_periodic(paragraph_blocks, periodic_keywords)
+    proxy_hit_count, proxy_total = compute_proxy_qa(normalized_text, proxy_questions)
+    instruction_hits, instruction_total = compute_instruction_hits(
+        normalized_text,
+        must_include,
+    )
+    checklist_hit_count, checklist_total = compute_soft_instruction_hits(
+        normalized_text,
+        checklist,
+    )
+    syntax_pass_rate, schema_pass_rate = compute_structure_scores(
+        normalized_text,
+        drop_markdown_wrappers=True,
+    )
+
+    raw_keyword_coverage = instruction_hits / instruction_total
+    proxy_hit_rate = proxy_hit_count / proxy_total
+    checklist_signal = (
+        checklist_hit_count / checklist_total if checklist_total > 0 else raw_keyword_coverage
+    )
+    semantic_coverage_score = min(
+        1.0,
+        0.2 * raw_keyword_coverage
+        + 0.3 * proxy_hit_rate
+        + 0.25 * checklist_signal
+        + 0.15 * range_signal
+        + 0.1 * periodic_signal,
+    )
+    entity_consistency_score = max(raw_keyword_coverage, semantic_coverage_score)
     structure_signal = min(
         1.0,
-        0.35 * paragraph_signal
-        + 0.2 * sentence_signal
-        + 0.25 * range_signal
-        + 0.2 * periodic_signal,
+        0.2 * completion_rate
+        + 0.15 * once_signal
+        + 0.15 * range_signal
+        + 0.15 * periodic_signal
+        + 0.15 * syntax_pass_rate
+        + 0.2 * schema_pass_rate,
     )
-    checklist_signal = len(matched_keywords) / max(len(checklist), len(must_include))
     logical_coherence = min(
-        1.0, 0.5 * structure_signal + 0.3 * proxy_hit_rate + 0.2 * checklist_signal
+        1.0,
+        0.3 * structure_signal
+        + 0.25 * proxy_hit_rate
+        + 0.2 * semantic_coverage_score
+        + 0.25 * length_score,
     )
-    constraint_violation_rate = 1.0 - entity_consistency_score
+    semantic_violation_rate = (1.0 - semantic_coverage_score) ** 1.25
+    length_violation_rate = 1.0 - length_score
+    constraint_violation_rate = max(semantic_violation_rate, length_violation_rate)
 
     return {
         "constraint_violation_rate": constraint_violation_rate,
         "entity_consistency_score": entity_consistency_score,
         "logical_coherence": logical_coherence,
+        "length_score": length_score,
         "diagnostics": {
             "matched_keywords": matched_keywords,
             "missing_keywords": [
                 item for item in must_include if item not in matched_keywords
             ],
             "matched_proxy_question_ids": matched_proxy_answers,
+            "response_word_count": response_word_count,
+            "required_length_words": required_length_words,
+            "length_ratio": length_ratio,
+            "length_within_tolerance": 0.8 <= length_ratio <= 1.2,
             "paragraph_count": len(paragraph_blocks),
             "sentence_count": sentence_count,
             "expected_blocks": expected_blocks,
+            "completion_rate": completion_rate,
+            "once_signal": once_signal,
+            "raw_keyword_coverage": raw_keyword_coverage,
+            "proxy_hit_rate": proxy_hit_rate,
+            "semantic_coverage_score": semantic_coverage_score,
+            "semantic_violation_rate": semantic_violation_rate,
+            "length_violation_rate": length_violation_rate,
+            "checklist_hit_count": checklist_hit_count,
+            "checklist_total": checklist_total,
+            "checklist_signal": checklist_signal,
+            "range_signal": range_signal,
             "range_keyword_hits": range_keyword_hits,
+            "range_keyword_global_fallback_hits": range_keyword_global_fallback_hits,
             "missing_range_keywords": missing_range_keywords,
+            "periodic_signal": periodic_signal,
             "periodic_keyword_hits": periodic_keyword_hits,
+            "periodic_keyword_partial_hits": periodic_keyword_partial_hits,
             "missing_periodic_keywords": missing_periodic_keywords,
+            "proxy_hit_count": proxy_hit_count,
+            "proxy_total": proxy_total,
+            "syntax_pass_rate": syntax_pass_rate,
+            "schema_pass_rate": schema_pass_rate,
+            "structure_signal": structure_signal,
             "checklist": checklist,
         },
     }
