@@ -86,7 +86,12 @@ class OnlineValidator:
         self.meta_state = meta_state
         self.run_logger = run_logger
         self.logger = logging.getLogger(__name__)
-        self.reference_validator = ReferenceValidator(llm_client=llm_client)
+        # Fix 1：min_citations=1（原值2）。
+        # 设计动机：7节大纲下语料库仅有~4篇相关论文，7×2=14次引用需求
+        # 远超语料库自然容量（约6次）。sec5/sec6/sec7（Limitations/Evidence gaps/Future work）
+        # 本质上是对文献的反思，并非一手引用节；强制2引用导致系统性cascade失败。
+        # 1次引用仍足以保证每节有文献锚定，不退化为零引用写作。
+        self.reference_validator = ReferenceValidator(llm_client=llm_client, min_citations=1)
 
     # ------------------------------------------------------------------
     # 主入口

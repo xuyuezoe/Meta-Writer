@@ -217,10 +217,18 @@ def load_paper_file(path: Path) -> Optional[dict]:
     stats = meta.get("stats") or {}
     word_count = int(stats.get("word_count") or 0) if isinstance(stats, dict) else 0
 
+    chunks = _chunk_markdown(paper_id, body)
+
+    # 标题回退：若 frontmatter title 过短（<4词），从 body 第一个 heading 提取。
+    # 部分 metabench 文件存在 title 被截断的情况（如 "Nationwide Cohort Study"），
+    # 真实完整标题保存在 Markdown body 的首个 heading 中。
+    if len(title.split()) < 4 and chunks:
+        candidate = chunks[0].get("section_title", "")
+        if len(candidate.split()) >= 4:
+            title = candidate
+
     # Build index text: abstract + title (high-weight retrieval fields)
     index_text = f"{title}\n{abstract}"
-
-    chunks = _chunk_markdown(paper_id, body)
 
     return {
         "paper_id": paper_id,

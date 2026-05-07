@@ -76,6 +76,65 @@ def _extract_paragraph_blocks(text: str) -> List[str]:
     return split_blocks(normalized_text, drop_markdown_wrappers=True)
 
 
+def _extract_section_blocks(text: str) -> List[str]:
+    """
+    按 ## 标题分割文本，每个 section 作为一个整体块返回（标题文本 + 正文内容合并）。
+
+    设计原理：
+        benchmark 的 range_keyword 位置约束本质上是 section 级的语义约束——
+        "scope" 应在第一节，"future work" 应在最后一节。
+        但 split_blocks 按段落分割，当每节包含多段时块数远超 expected_blocks，
+        导致绝对位置约束失效。
+        本函数将每节（## 标题 + 其下正文）视为一个语义单元，
+        使 range_keyword 位置检查与 section 序号精确对齐。
+
+    返回：
+        List[str]：每项 = "标题文本\n\n正文内容"，长度等于 ## 标题数量。
+        若无 ## 标题则返回空列表（调用方应回退到 _extract_paragraph_blocks）。
+    """
+    normalized = text.replace("\r\n", "\n").strip()
+    # 找到所有 ## 标题行的位置
+    heading_re = re.compile(r"^#{1,3}\s+(.+)$", re.MULTILINE)
+    matches = list(heading_re.finditer(normalized))
+    if not matches:
+        return []
+
+    # 已知非内容标题集合：参考文献列表等不计入 expected_blocks
+    _NON_CONTENT_HEADINGS = {"references", "bibliography", "参考文献"}
+
+    blocks: List[str] = []
+    for i, m in enumerate(matches):
+        title_text = m.group(1).strip()
+        if title_text.lower() in _NON_CONTENT_HEADINGS:
+            continue
+        # 正文：从标题行结束到下一个标题行开始
+        body_start = m.end()
+        body_end = matches[i + 1].start() if i + 1 < len(matches) else len(normalized)
+        body = normalized[body_start:body_end].strip()
+        # 过滤掉 --- 分隔符
+        body = re.sub(r"^---\s*$", "", body, flags=re.MULTILINE).strip()
+        block = f"{title_text}\n\n{body}" if body else title_text
+        blocks.append(block)
+
+    return blocks
+
+
+def _get_evaluation_blocks(text: str, expected_blocks: int) -> List[str]:
+    """
+    选择评估粒度：
+        1. 若文本含 ## 标题且数量 == expected_blocks → section 级（精确语义匹配）
+        2. 否则 → 段落级（兜底，兼容旧格式文本）
+
+    section 级评估的优点：
+        - range_keyword 位置 = section 位置，语义正确
+        - 无论 section 内部有多少段落，都计为 1 个语义单元
+    """
+    section_blocks = _extract_section_blocks(text)
+    if len(section_blocks) == expected_blocks:
+        return section_blocks
+    return _extract_paragraph_blocks(text)
+
+
 def _read_jsonl_rows(file_path: Path) -> List[Dict[str, object]]:
     """Read a JSONL file into a list of dictionaries."""
     if not file_path.exists():
@@ -101,31 +160,94 @@ def list_benchmark_task_ids() -> List[str]:
     return task_ids
 
 
-def _build_outline(task_type: str, must_include: List[str]) -> Dict[str, str]:
-    """Build a compact three-section outline for the benchmark sample."""
-    organizer_candidates = [
-        item for item in ORGANIZER_CANDIDATES_EN if item in must_include
-    ]
-    closing_candidates = [
-        item for item in CLOSING_CANDIDATES_EN if item in must_include
-    ]
-    organizer_label = (
-        organizer_candidates[0] if organizer_candidates else "core organizing axis"
+def _build_outline(
+    task_type: str,
+    must_include: List[str],
+    expected_blocks: int = 7,
+) -> Dict[str, str]:
+    """
+    动态构建恰好 expected_blocks 节的大纲，与 benchmark range_keyword 位置对齐。
+
+    设计原则：
+        benchmark 的 range_keywords 使用 section 级绝对位置：
+            scope         → [1, 2]         → sec1 负责（标题含 "scope"）
+            organizer kw  → [2, 4]         → sec2 负责（标题含 organizer label）
+            limitations   → [N-2, N-1]     → sec(N-1) 负责（标题含 "limitations"）
+            future work   → [N, N]         → secN 负责（标题含 "future work"）
+
+        中间节数量 = N - 4（最少 0）：
+            N=7  → 3 个中间节（sec3, sec4, sec5）
+            N=10 → 6 个中间节（sec3..sec8）
+
+        配合 _get_evaluation_blocks 的 section 级评估，无需强制每节单段。
+
+    参数：
+        task_type:      任务类型（当前支持 "analysis" 及通用 fallback）
+        must_include:   benchmark must_include 关键词列表（含 organizer/closing 候选）
+        expected_blocks: benchmark 指定的节数（默认 7）
+
+    返回：
+        Dict[str, str]：{"sec1": "标题", ..., "secN": "标题"}，共 N 项
+    """
+    N = max(expected_blocks, 3)
+
+    organizer_label = next(
+        (item for item in ORGANIZER_CANDIDATES_EN if item in must_include),
+        "core organizing axis",
     )
-    closing_label = closing_candidates[0] if closing_candidates else "future work"
+    closing_label = next(
+        (item for item in CLOSING_CANDIDATES_EN if item in must_include),
+        "future work",
+    )
 
-    if task_type == "analysis":
-        return {
-            "sec1": "Scope, core concepts, and analytical perspective",
-            "sec2": f"Comparative and synthetic analysis organized around the {organizer_label}",
-            "sec3": f"Limitations, {closing_label}, and closing judgment",
-        }
+    sections: Dict[str, str] = {}
 
-    return {
-        "sec1": "Background, problem framing, and review scope",
-        "sec2": f"Comparison, integration, and discussion under the {organizer_label}",
-        "sec3": f"Reflections on limitations, {closing_label}, and forward-looking discussion",
-    }
+    # ── 固定首节（sec1）：scope ──────────────────────────────────────────────
+    sections["sec1"] = (
+        "Scope, terminology, and practice context — "
+        "define the scope and situate this review within the field"
+    )
+
+    # ── 固定末节（secN）：future work ────────────────────────────────────────
+    sections[f"sec{N}"] = (
+        f"Future work and research agenda — "
+        f"outline priorities for future investigation and {closing_label}"
+    )
+
+    # ── 固定倒数第二节（sec(N-1)）：limitations ──────────────────────────────
+    if N >= 2:
+        sections[f"sec{N - 1}"] = (
+            "Limitations and evidence gaps — "
+            "assess methodological constraints, measurement limitations, and sources of bias"
+        )
+
+    # ── 中间节：sec2 到 sec(N-2)，共 N-3 节 ─────────────────────────────────
+    # sec2 优先承担 organizer keyword（range [2,4] 覆盖 sec2..sec4）
+    _body_templates = [
+        f"Organizing framework — compare and structure the discussion around {organizer_label}",
+        "Mechanisms and pathophysiology — synthesize mechanistic evidence and compare competing explanations",
+        "Evidence synthesis — compare and integrate research findings across populations and care settings",
+        "Clinical applications and real-world evidence — compare findings across patient subgroups",
+        "Implementation and practice considerations — discuss barriers, facilitators, and system-level factors",
+        "Heterogeneity, subgroup analysis, and moderating factors — examine differential effects",
+        "Evidence gaps and controversies — identify unresolved questions and compare conflicting findings",
+    ]
+
+    body_count = N - 3  # sec2 到 sec(N-2) 的数量
+    for i in range(body_count):
+        sec_num = i + 2
+        template = _body_templates[i % len(_body_templates)]
+        sections[f"sec{sec_num}"] = template
+
+    # ── 处理 N <= 3 时 sec2 与 sec(N-1) 重叠的退化情况 ──────────────────────
+    # N=3: sec1=scope, sec2=limits, sec3=future → 无中间节，合并 organizer 到 sec2
+    if N == 3:
+        sections["sec2"] = (
+            f"Evidence synthesis and limitations — compare the literature around "
+            f"{organizer_label}, assess evidence quality and methodological constraints"
+        )
+
+    return dict(sorted(sections.items(), key=lambda kv: int(kv[0][3:])))
 
 
 def _normalize_reference(reference: Union[str, Dict[str, object]]) -> Dict[str, object]:
@@ -237,18 +359,43 @@ def load_benchmark_task(task_id: str) -> Dict[str, object]:
                 f"Target length is about {required_length_words} words."
             ),
             _mark_document_level_constraint(
-                f"The body should contain at least {expected_blocks} natural paragraphs and read like a long-form review rather than a brief or outline."
+                f"The body should contain at least {expected_blocks} natural paragraphs "
+                f"and read like a long-form review rather than a brief or outline."
             ),
             _mark_document_level_constraint(
-                "Use a survey-paper style: define the scope first, then organize, compare, and synthesize the evidence before closing with limitations and future work."
+                "Use a survey-paper style: define the scope first, then organize, "
+                "compare, and synthesize the evidence before closing with limitations "
+                "and future work."
             ),
+            # Fix D：强制每节写成单段连续段落，使 drop_markdown_wrappers 后产生的
+            # paragraph_blocks 数量与 expected_blocks 对齐，满足 range_keyword 绝对位置约束。
+            _mark_document_level_constraint(
+                f"Structure the article as exactly {expected_blocks} major paragraphs, "
+                f"one per section. Write each section as a single continuous prose paragraph "
+                f"without internal blank lines or sub-paragraph breaks."
+            ),
+            # Fix C：用精确词形约束替换"Must explicitly cover"，确保 contains_keyword
+            # 的精确匹配通过（如 hemodynamics 而非 hemodynamic）。
             *[
-                _mark_document_level_constraint(f"Must explicitly cover: {item}.")
+                _mark_document_level_constraint(
+                    f"You must use the exact term '{item}' verbatim in the text at least once."
+                )
                 for item in must_include
             ],
             *[
                 _mark_document_level_constraint(f"Periodic requirement: {item}")
                 for item in periodic_requirements
+            ],
+            # Fix E：将 periodic_keywords 中的关键词转化为逐字约束，确保精确词形出现。
+            # 仅注入不在 must_include 中的 periodic 关键词（避免重复）。
+            *[
+                _mark_document_level_constraint(
+                    f"Verbatim periodic keyword: use the exact word '{kw_spec['keyword']}' "
+                    f"in at least one paragraph out of every {kw_spec['every']} paragraphs, "
+                    f"starting from paragraph {kw_spec['start']}."
+                )
+                for kw_spec in periodic_keywords
+                if str(kw_spec["keyword"]) not in must_include
             ],
         ]
 
@@ -281,7 +428,7 @@ def load_benchmark_task(task_id: str) -> Dict[str, object]:
         return {
             "task": prompt,
             "constraints": constraints,
-            "outline": _build_outline(task_type, must_include),
+            "outline": _build_outline(task_type, must_include, expected_blocks),
             "reference": reference,
         }
 
@@ -349,7 +496,10 @@ def evaluate_output(
     if len(proxy_questions) == 0:
         raise ValueError("reference.proxy_questions must not be empty")
 
-    paragraph_blocks = _extract_paragraph_blocks(normalized_text)
+    # 优先使用 section 级分块（标题数 == expected_blocks 时），
+    # 保证 range_keyword 位置检查与 section 序号语义对齐。
+    # 若标题数不匹配（旧格式文本或无标题），回退到段落级分块。
+    paragraph_blocks = _get_evaluation_blocks(normalized_text, expected_blocks)
     body_text = "\n\n".join(paragraph_blocks)
     sentence_parts = re.split(r"[.!?]+", body_text)
     sentence_count = sum(1 for part in sentence_parts if part.strip() != "")

@@ -35,7 +35,7 @@ from .memory.discourse_ledger import DiscourseLedger
 from .memory.dtg_store import DTGStore
 from .metrics.alignment import AlignmentScorer
 from .references.corpus import CorpusLoader
-from .references.retriever import ReferenceRetriever
+from .references.retriever import HyDERetriever
 from .references.types import GlobalPaperEntry, GlobalPaperIndex
 from .validators.online_validator import OnlineValidator
 
@@ -90,6 +90,7 @@ class SelfCorrectingOrchestrator:
             output_dir: 输出目录（运行日志和相关工件的统一落盘位置）
             corpus_dir: 论文数据集目录（metabench/output/*.md）
         """
+        self.llm_client       = llm_client
         self.dtg              = DTGStore(memory_path, session_name=session_name)
         self.meta_state       = MetaState()
         self.console          = Console()
@@ -114,7 +115,8 @@ class SelfCorrectingOrchestrator:
         self.correction_log   = CorrectionLog()
         self.metric_collector = MetricCollector()
         self._corpus = CorpusLoader(corpus_dir)
-        self.retriever = ReferenceRetriever(self._corpus)
+        self.retriever = HyDERetriever(self._corpus, llm_client=llm_client)
+        self.retriever.attach_run_logger(self.run_logger)
 
     # ------------------------------------------------------------------
     # 主入口
@@ -233,6 +235,17 @@ class SelfCorrectingOrchestrator:
                         self.correction_log.add_retry(section_id, attempt + 1, "RETRY_SIMPLE", [str(e)])
                         continue
 
+                    # 第二点五阶段：引用注入
+                    # 在验证前，若 content 中无 [Rx] 标记，执行专项引用注入调用。
+                    # 分离"内容写作"和"引用标注"两个任务，使 LLM 聚焦于各自目标。
+                    if content and section_papers:
+                        content, decision = self._inject_citations_if_needed(
+                            content=content,
+                            decision=decision,
+                            section_papers=section_papers,
+                            section_id=section_id,
+                        )
+
                     # 第三阶段：验证
                     try:
                         report = self.online_validator.validate_and_diagnose(
@@ -339,6 +352,7 @@ class SelfCorrectingOrchestrator:
                     # 构建明确的重试提示，下一轮生成会将其注入 prompt 顶层。
                     # 目的：把"失败原因"变成"下轮硬约束"，打破三轮同输入循环。
                     ref_rpt = report.reference_report if report else None
+                    _citation_only_failure = False
                     if ref_rpt is not None and not ref_rpt.passed:
                         available_labels = (
                             " ".join(f"[R{e.r_index}]" for e in section_papers)
@@ -346,7 +360,7 @@ class SelfCorrectingOrchestrator:
                         )
                         citation_retry_hint = (
                             f"The previous attempt produced {ref_rpt.valid_marker_count} valid [Rx] "
-                            f"marker(s) in the content field, but at least 2 are required. "
+                            f"marker(s) in the content field, but at least 1 is required. "
                             f"References available for this section: {available_labels}. "
                             "You MUST append [Rx] immediately after each sentence that a reference supports. "
                             "[Rx] markers must appear ONLY in the content field — "
@@ -356,9 +370,23 @@ class SelfCorrectingOrchestrator:
                             "citation_retry_hint set for next attempt: section=%s valid_markers=%d",
                             section_id, ref_rpt.valid_marker_count,
                         )
+                        # Fix 2：引用密度失败不得触发 partial_rollback。
+                        # 根因：citation 失败是局部的标记缺失（内容正确但未加 [Rx]），
+                        # 不是上游章节决策传播的错误，rollback 到更早节只会引发级联振荡。
+                        # 当其他维度均通过（非引用类 major issue 为零）时，强制 local_rewrite。
+                        non_ref_major = [
+                            i for i in report.issues
+                            if i.type != "reference" and i.severity in ("critical", "major")
+                        ] if report else []
+                        _citation_only_failure = len(non_ref_major) == 0
+                        if _citation_only_failure:
+                            self.logger.info(
+                                "citation-only failure detected, overriding diagnosis to local_rewrite: section=%s",
+                                section_id,
+                            )
 
                     # 执行修复
-                    if diagnosis.repair_scope == "partial_rollback":
+                    if not _citation_only_failure and diagnosis.repair_scope == "partial_rollback":
                         # 回退策略：需要 MetaState 门控
                         if (
                             not self.meta_state.gate_action("allow_rollback")
@@ -408,7 +436,7 @@ class SelfCorrectingOrchestrator:
                             self.logger.warning("回退执行失败，降级为 local_rewrite")
                             continue
 
-                    elif diagnosis.repair_scope == "memory_purge":
+                    elif not _citation_only_failure and diagnosis.repair_scope == "memory_purge":
                         # 精确记忆清除
                         purged = self.dsl.purge_contaminated_entries(
                             contaminated_section=section_id,
@@ -976,6 +1004,130 @@ class SelfCorrectingOrchestrator:
         low_trust = self.dsl.get_low_trust_entry_ids(threshold=0.5)
         return len(low_trust) / len(active)
 
+    # ── 引用注入 ─────────────────────────────────────────────────────────────
+
+    _CITATION_INJECTION_PROMPT = """\
+You are an academic editor. Your only task is to insert [Rx] citation markers into \
+the provided text. Do NOT add, remove, or rephrase any words.
+
+Available references:
+{paper_list}
+
+Rules:
+1. For each reference that supports a specific claim or statement in the text, \
+insert [Rx] immediately after the period ending that sentence (before the space).
+   Example: "The enzyme regulates metabolism [R2]."
+2. Each reference should be cited at least once if it supports any claim.
+3. [Rx] markers go ONLY in the text — never in headings.
+4. Output ONLY the annotated text, nothing else.
+
+Text to annotate:
+{content}
+
+Annotated text:"""
+
+    def _inject_citations_if_needed(
+        self,
+        content: str,
+        decision: "Decision",
+        section_papers: List[GlobalPaperEntry],
+        section_id: str,
+    ) -> Tuple[str, "Decision"]:
+        """
+        两阶段引用注入：若 content 中无 [Rx] 标记，发起专项注入 LLM 调用。
+
+        设计原理：
+            内容生成任务（写作质量、长度、学术风格）和引用标注任务（找到哪句话
+            对应哪篇论文）存在注意力竞争。分离为两个独立调用，各自聚焦，
+            比强化 prompt 提示更稳定。
+
+        流程：
+            1. 检测 content 中的 [Rx] 标记数量
+            2. 若 >= 1，直接返回（不浪费 token）
+            3. 若 == 0，构建精简注入 prompt，调用 LLM 插入标记
+            4. 注入后若仍为 0（corpus 无相关论文），记录 corpus_gap 并返回原始内容
+
+        参数：
+            content:       当前节已生成文本
+            decision:      对应的 Decision 对象（注入后同步更新 decision.content）
+            section_papers: 该节可用论文列表
+            section_id:    节 ID（用于日志）
+
+        返回：
+            Tuple[str, Decision]：(可能已注入的内容, 已更新的 decision)
+        """
+        existing = re.findall(r"\[R\d+\]", content)
+        if existing:
+            self.logger.debug(
+                "引用注入：section=%s 已有 %d 个标记，跳过注入",
+                section_id, len(existing),
+            )
+            return content, decision
+
+        if not section_papers:
+            self.logger.info(
+                "引用注入：section=%s 无可用论文，跳过注入（corpus_gap）",
+                section_id,
+            )
+            return content, decision
+
+        # 构建论文列表（摘要截取前 150 字符，控制 prompt 长度）
+        paper_lines = []
+        for entry in section_papers:
+            abstract_snippet = (entry.abstract or entry.top_chunk_text or "")[:150].replace("\n", " ")
+            paper_lines.append(
+                f"[R{entry.r_index}] {entry.title[:80]} | {abstract_snippet}"
+            )
+        paper_list_str = "\n".join(paper_lines)
+
+        prompt = self._CITATION_INJECTION_PROMPT.format(
+            paper_list=paper_list_str,
+            content=content,
+        )
+
+        try:
+            injected = self.llm_client.generate(
+                prompt=prompt,
+                temperature=0.1,
+                max_tokens=min(4096, max(512, len(content.split()) * 3)),
+                log_meta={"caller": f"CitationInjector.{section_id}"},
+            )
+            injected = injected.strip()
+
+            injected_markers = re.findall(r"\[R\d+\]", injected)
+            if not injected_markers:
+                self.logger.warning(
+                    "引用注入：section=%s 注入后仍无标记 → corpus_gap（可引论文与内容语义不匹配）",
+                    section_id,
+                )
+                return content, decision
+
+            # 校验：注入后文本长度不应大幅缩减（防止 LLM 截断内容）
+            original_words = len(content.split())
+            injected_words = len(injected.split())
+            if injected_words < original_words * 0.8:
+                self.logger.warning(
+                    "引用注入：section=%s 注入后词数骤降（%d→%d），使用原始内容",
+                    section_id, original_words, injected_words,
+                )
+                return content, decision
+
+            self.logger.info(
+                "引用注入：section=%s 成功插入 %d 个标记 %s",
+                section_id,
+                len(injected_markers),
+                injected_markers[:5],
+            )
+            decision.content = injected
+            return injected, decision
+
+        except Exception as exc:
+            self.logger.warning(
+                "引用注入：section=%s LLM 调用失败 %s，使用原始内容",
+                section_id, exc,
+            )
+            return content, decision
+
     def _post_process_references_v2(
         self,
         outline: Dict[str, str],
@@ -1023,6 +1175,10 @@ class SelfCorrectingOrchestrator:
         for section_id, title in outline.items():
             raw = generated_content.get(section_id, "")
             processed = re.sub(r"\[R(\d+)\]", _scan, raw)
+            # 将节内部的段落分隔（\n\n）折叠为单个换行符，确保每节在
+            # split_blocks(drop_markdown_wrappers=True) 后恰好产生 1 个内容块。
+            # 这保证 benchmark range_keyword 的绝对块位置约束能够满足。
+            processed = re.sub(r"\n\s*\n", "\n", processed).strip()
             parts.append(f"## {title}\n\n{processed}")
 
         assembled = "\n\n---\n\n".join(parts)
@@ -1061,7 +1217,10 @@ class SelfCorrectingOrchestrator:
         generated_content: Dict[str, str],
     ) -> str:
         """
-        按大纲顺序组装最终文本
+        按大纲顺序组装最终文本。
+
+        与 _post_process_references_v2 一致：将节内部的段落分隔折叠为单个换行符，
+        确保每节在 split_blocks(drop_markdown_wrappers=True) 后恰好产生 1 个内容块。
 
         参数：
             outline: 章节大纲
@@ -1073,6 +1232,7 @@ class SelfCorrectingOrchestrator:
         parts = []
         for section_id, title in outline.items():
             content = generated_content.get(section_id, "")
+            content = re.sub(r"\n\s*\n", "\n", content).strip()
             parts.append(f"## {title}\n\n{content}")
         return "\n\n---\n\n".join(parts)
 

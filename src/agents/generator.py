@@ -256,7 +256,10 @@ class Generator:
                 " Do not use any Markdown headings (##, ###, etc.) inside the content."
                 " Organize with paragraphs only, not subheadings."
             )
-            + "\n- referenced_section_ids: a list of cited earlier section IDs such as [\"sec1\", \"sec2\"]"
+            + "\n  IMPORTANT: In the content field, never write internal section labels like 'sec1', 'sec2', 'sec6', etc."
+            " If you need to refer to an earlier section, describe it by its role or topic"
+            " (e.g., 'the scope section', 'the limitations section', 'the preceding section', 'as discussed earlier')."
+            "\n- referenced_section_ids: a list of cited earlier section IDs such as [\"sec1\", \"sec2\"]"
         )
 
     @staticmethod
@@ -351,6 +354,9 @@ class Generator:
         text = re.sub(r'  +', ' ', text)
         text = re.sub(r'^#{2,}\s+.*$', '', text, flags=re.MULTILINE)
         text = re.sub(r'\n{3,}', '\n\n', text)
+        # DSL 内部节标签泄漏清洗：将正文中的 sec1/sec6 等替换为 Section N
+        # 使用单词边界确保不匹配 "secondary"、"section" 等合法词
+        text = re.sub(r'\bsec(\d+)\b', lambda m: f"Section {m.group(1)}", text)
         return text.strip()
 
     # ── 旧式 XML 解析（保留供降级路径使用） ─────────────────────────────────

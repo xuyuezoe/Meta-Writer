@@ -232,6 +232,28 @@ class RunLogger:
         self._write(f"  DSL 信任度：{intent.dsl_trust_at_generation:.3f}")
         self._write("")
 
+    def log_retrieval_event(self, event_type: str, **kwargs: Any) -> None:
+        """
+        记录检索过程中的关键事件（HyDE 伪文档、BM25 匹配情况等）。
+
+        参数：
+            event_type: 事件类型标识，如 "KW_BM25"、"HYDE_BM25"、"MINI_HYDE"
+            **kwargs:   任意键值对，按顺序逐行写入日志
+        """
+        self._write(f"[RETRIEVAL:{event_type}]")
+        for key, value in kwargs.items():
+            if isinstance(value, list):
+                self._write(f"  {key}:")
+                for item in value:
+                    self._write(f"    - {item}")
+            else:
+                text = str(value)
+                # 长文本截取前 300 字符，避免日志膨胀
+                if len(text) > 300:
+                    text = text[:300] + "..."
+                self._write(f"  {key}: {text}")
+        self._write("")
+
     def log_global_index(self, global_index: Any) -> None:
         """
         记录全局参考索引（GlobalPaperIndex）

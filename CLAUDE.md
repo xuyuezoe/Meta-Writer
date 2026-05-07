@@ -98,7 +98,7 @@ except:
 if not result:
     return default_value
 value = data.get("key", "")
-
+```
 这些行为会掩盖系统问题。
 
 ✅ 正确做法：
@@ -106,14 +106,15 @@ value = data.get("key", "")
 显式抛出错误
 返回结构化错误信息
 让上层系统处理
-2. 禁止模糊逻辑
+#### 2. 禁止模糊逻辑
 
 禁止：
 
 不明确的变量名（如 data, tmp, obj）
 隐式类型转换
 不可追踪的数据流
-3. 禁止“能跑就行”
+
+#### 3. 禁止“能跑就行”
 
 代码必须：
 
@@ -124,6 +125,7 @@ value = data.get("key", "")
 1. 全量类型标注（Full Typing）
 def process(input_data: Dict[str, Any]) -> Tuple[Result, Metrics]:
 2. 中文Docstring（必须详细）
+```python
 def compute_similarity(a: str, b: str) -> float:
     """
     计算两个文本的语义相似度
@@ -138,6 +140,7 @@ def compute_similarity(a: str, b: str) -> float:
     核心逻辑：
         使用embedding进行语义匹配，而非字符串匹配
     """
+```
 3. 分阶段逻辑（Stage-based Comments）
 # 第一阶段：输入校验
 # 第二阶段：特征提取
@@ -150,14 +153,15 @@ def compute_similarity(a: str, b: str) -> float:
 return result
 
 必须：
-
+```python
 return {
     "output": result,
     "metrics": {...},
     "debug": {...},
     "status": "success"
 }
-🧪 错误处理原则（Error Handling）
+```
+错误处理原则（Error Handling）
 
 所有错误必须：
 
@@ -226,8 +230,8 @@ raise ValueError(f"[DSL解析失败] 输入结构非法: {input_data}")
 
 在输出前，你必须确认：
 
-是否使用了第一性原理？
-是否避免了兜底逻辑？
-是否所有结构可解释？
-是否具备扩展性？
-是否可以被严格审查？
+- 是否使用了第一性原理？
+- 是否避免了兜底逻辑？
+- 是否所有结构可解释？
+- 是否具备扩展性？
+- 是否可以被严格审查？
