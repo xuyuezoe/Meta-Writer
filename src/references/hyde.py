@@ -3,13 +3,9 @@ HyDE（Hypothetical Document Embeddings 变体）生成器。
 
 核心原理：
     任务描述（写作指令语言）与论文摘要（科学文献语言）处于不同词汇空间，
-    BM25 无法跨越此鸿沟。HyDE 通过让 LLM 先生成一段「假设文档」
+    BM25 与RAG无法跨越此鸿沟。HyDE 通过让 LLM 先生成一段「假设文档」
     （与语料库同体裁、同词汇空间的文本），再用该文档做 BM25 查询，
     从根本上解决词汇鸿沟问题。
-
-参考文献：
-    - HyDE: Gao et al., 2022 (原始设计基于 embedding)
-    - Query2Doc: Peng et al., 2023 (BM25 + LLM 伪文档，直接支撑本实现)
 
 降级策略：
     llm_client 为 None 时静默跳过 LLM 调用，返回 None；
@@ -106,8 +102,7 @@ class HyDEGenerator:
             prompt=_TASK_PROMPT.format(task=task[:1200]),
             label="task",
             llm_client=llm_client,
-            max_tokens=1024,
-            allow_think_only_fallback=True,
+            max_tokens=280,
         )
 
     def generate_for_section(
@@ -136,7 +131,7 @@ class HyDEGenerator:
             ),
             label=f"section:{section_title[:30]}",
             llm_client=llm_client,
-            max_tokens=2048,
+            max_tokens=120,
         )
 
     def generate_for_memory(
@@ -166,7 +161,7 @@ class HyDEGenerator:
             prompt=_MEMORY_PROMPT.format(intent=intent[:400]),
             label="memory",
             llm_client=llm_client,
-            max_tokens=2048,
+            max_tokens=120,
         )
 
     # ── 内部实现 ──────────────────────────────────────────────────────────────
@@ -178,7 +173,6 @@ class HyDEGenerator:
         label: str,
         llm_client: Optional["LLMClient"],
         max_tokens: int,
-        allow_think_only_fallback: bool = False,
     ) -> Optional[str]:
         """统一生成入口：缓存命中则直接返回，否则调用 LLM。"""
         if key in self._cache:
@@ -194,36 +188,23 @@ class HyDEGenerator:
                 prompt=prompt,
                 temperature=0.3,
                 max_tokens=max_tokens,
-                # section/memory 级别使用 False：think_only 时返回 None，
-                # 触发关键词 BM25 回退，避免将思考块内容当作科学文档用于检索。
-                # task 级别可传 True 保留兜底行为。
-                allow_think_only_fallback=allow_think_only_fallback,
                 log_meta={"caller": f"HyDEGenerator.{label}"},
             )
             text = text.strip()
             if not text:
-                logger.warning(
-                    "HyDEGenerator: LLM 返回空文本 [%s]（max_tokens=%d） → 回退到关键词 BM25",
-                    label, max_tokens,
-                )
+                logger.warning("HyDEGenerator: LLM 返回空文本 [%s]", label)
                 return None
 
             self._cache[key] = text
-            preview = text[:200].replace("\n", " ")
             logger.info(
-                "HyDEGenerator [%s] 生成成功：%d词 | 预览: %s%s",
+                "HyDEGenerator: 生成假设文档 [%s] %d词",
                 label,
                 len(text.split()),
-                preview,
-                "..." if len(text) > 200 else "",
             )
             return text
 
         except Exception as exc:
-            logger.warning(
-                "HyDEGenerator: LLM 调用失败 [%s] %s → 回退到关键词 BM25",
-                label, exc,
-            )
+            logger.warning("HyDEGenerator: LLM 调用失败 [%s] %s", label, exc)
             return None
 
     @staticmethod
