@@ -772,11 +772,31 @@ class LLMClient:
 
                 think_only = False
                 if strip_think and "<think>" in text:
-                    visible = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
-                    if visible:
-                        text = visible
+                    # 第一步：剥离所有完整的 <think>...</think> 块，取剩余可见文本
+                    after_strip = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+                    has_incomplete = "<think>" in after_strip  # 残留 <think> 说明块未闭合
+
+                    if after_strip and not has_incomplete:
+                        # 正常路径：有可见文本且已清洁
+                        text = after_strip
                     else:
-                        text = original_text if allow_think_only_fallback else ""
+                        # 情形A：不完整 <think> 块（max_tokens 耗尽被截断，无 </think>）
+                        #         after_strip 仍含 <think> 前缀，无法直接使用
+                        # 情形B：完整 <think> 块 + 无可见文本（max_tokens 不足以生成正文）
+                        # 统一处理：提取所有 think 内容（剥去标签本身）
+                        if has_incomplete:
+                            self.logger.warning(
+                                "generate: 检测到不完整 <think> 块，max_tokens=%d 可能过小 "
+                                "[model=%s]",
+                                max_tokens, self.model,
+                            )
+                        think_content = re.sub(r"</?think>", "", text, flags=re.DOTALL).strip()
+                        if allow_think_only_fallback and think_content:
+                            text = think_content
+                        elif not allow_think_only_fallback:
+                            text = ""
+                        else:
+                            text = original_text
                         think_only = True
 
                 if think_only:
@@ -862,7 +882,9 @@ class LLMClient:
 
             raw_text = self._extract_text_from_response(response)
             cleaned_text = self._clean_thinking_model_output(raw_text)
-            json_obj = stdlib_json.loads(cleaned_text)
+            # 修复尾随逗号等常见模型 JSON 语法错误，再用 strict=False 容忍字面量控制字符
+            repaired_text = self._repair_json_text(cleaned_text)
+            json_obj = stdlib_json.loads(repaired_text, strict=False)
             json_obj = self._coerce_json_fields(json_obj)
             result = schema(**json_obj)
 
@@ -903,6 +925,19 @@ class LLMClient:
                     self.logger.info(
                         "JSON 字段救援成功：schema=%s rescued_keys=%s",
                         schema_name, sorted(rescued.keys()),
+                    )
+                    # 补充审计日志：救援路径同样写入 run.log，保证调用链路可追溯
+                    rescue_meta = dict(log_meta)
+                    rescue_meta["structured_output"] = True
+                    rescue_meta["schema"] = schema_name
+                    rescue_meta["method"] = "response_format+rescue"
+                    rescue_meta["protocol"] = "openai_chat"
+                    self._log_llm_call(
+                        prompt=prompt,
+                        response=cleaned_text,
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                        log_meta=rescue_meta,
                     )
                     return result
                 except Exception as rescue_err:
@@ -1147,6 +1182,30 @@ class LLMClient:
             text = text[json_start : json_end + 1]
 
         return text
+
+    @staticmethod
+    def _repair_json_text(text: str) -> str:
+        """
+        修复模型 JSON 输出中的常见语法错误。
+
+        设计目的：
+            在 json.loads 之前做轻量修复，消除两类已知的 MiniMax-M2.5 问题，
+            避免走字段级救援（rescue）路径浪费额外解析周期：
+            1. 尾随逗号（Trailing Comma）：{"a": 1,} 或 ["x",]
+               表现为 json 报 "Expecting property name" 于对象末尾，
+               通常出现在 referenced_section_ids 字段之后。
+            2. 字面量控制字符（如 \\n、\\r）嵌入字符串：
+               由调用方使用 strict=False 处理，此处不做替换，
+               避免误改 content 正文中有意义的空白。
+
+        参数：
+            text: 经过 _clean_thinking_model_output 处理后的 JSON 文本
+
+        返回：
+            修复后的 JSON 文本（不改变 JSON 语义）
+        """
+        # 移除对象或数组闭合括号之前的尾随逗号
+        return re.sub(r",(\s*[}\]])", r"\1", text)
 
     def _log_llm_call(
         self,

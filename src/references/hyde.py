@@ -102,7 +102,7 @@ class HyDEGenerator:
             prompt=_TASK_PROMPT.format(task=task[:1200]),
             label="task",
             llm_client=llm_client,
-            max_tokens=280,
+            max_tokens=2000,
         )
 
     def generate_for_section(
@@ -131,7 +131,7 @@ class HyDEGenerator:
             ),
             label=f"section:{section_title[:30]}",
             llm_client=llm_client,
-            max_tokens=120,
+            max_tokens=800,
         )
 
     def generate_for_memory(
@@ -161,7 +161,7 @@ class HyDEGenerator:
             prompt=_MEMORY_PROMPT.format(intent=intent[:400]),
             label="memory",
             llm_client=llm_client,
-            max_tokens=120,
+            max_tokens=800,
         )
 
     # ── 内部实现 ──────────────────────────────────────────────────────────────
@@ -184,10 +184,13 @@ class HyDEGenerator:
             return None
 
         try:
+            # allow_think_only_fallback=True：推理模型若只产出 <think> 内容，
+            # llm_client 会提取 think 块内容而非返回空串（见 llm_client.generate 的处理逻辑）
             text = llm_client.generate(
                 prompt=prompt,
                 temperature=0.3,
                 max_tokens=max_tokens,
+                allow_think_only_fallback=True,
                 log_meta={"caller": f"HyDEGenerator.{label}"},
             )
             text = text.strip()
