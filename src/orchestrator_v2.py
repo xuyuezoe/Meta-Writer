@@ -32,6 +32,8 @@ from .logging.run_logger import RunLogger
 from .memory.commitment_extractor import CommitmentExtractor
 from .memory.discourse_ledger import DiscourseLedger
 from .memory.dtg_store import DTGStore
+from .memory.neocortex_store import NeocortexStore
+from .memory.support_subset_builder import SupportSubsetBuilder
 from .metrics.alignment import AlignmentScorer
 from .validators.online_validator import OnlineValidator
 
@@ -70,6 +72,7 @@ class SelfCorrectingOrchestrator:
         memory_path: str = "./sessions",
         session_name: str = "session",
         output_dir: str = "./outputs",
+        similarity_service=None,
     ):
         """
         初始化自我修正协调器
@@ -90,6 +93,16 @@ class SelfCorrectingOrchestrator:
         self.logger           = logging.getLogger(__name__)
         self.run_logger       = RunLogger(output_dir=output_dir, session_name=session_name)
         self.dsl              = DiscourseLedger(llm_client=llm_client, run_logger=self.run_logger)
+        self.similarity_service = similarity_service
+        self.neocortex       = NeocortexStore(similarity_service=self.similarity_service)
+        self.llm_client      = llm_client
+        self.support_subset_builder = SupportSubsetBuilder(
+            dtg_store=self.dtg,
+            discourse_ledger=self.dsl,
+            neocortex_store=self.neocortex,
+            similarity_service=self.similarity_service,
+        )
+        self.current_support_node_ids = []
 
         llm_client.attach_run_logger(self.run_logger)
 
@@ -177,6 +190,40 @@ class SelfCorrectingOrchestrator:
                 plan_state.add_intent(section_intent)
                 if self.run_logger is not None:
                     self.run_logger.log_planning(section_id, section_intent)
+
+                # 构建支持子集：第一版只记录，不改变 prompt / DSL 注入。
+                try:
+                    support_subset = self.support_subset_builder.build(section_intent)
+                    self.current_support_node_ids = list(support_subset.get("node_ids", []))
+
+                    self._log_event_safe(
+                        "support_subset_built",
+                        {
+                            "section_id": section_id,
+                            "node_count": len(self.current_support_node_ids),
+                            "dsl_count": len(support_subset.get("dsl_entries", [])),
+                            "neocortex_count": len(support_subset.get("neocortex_items", [])),
+                        }
+                    )
+
+                    debug_trace = support_subset.get("debug_trace", {})
+                    self._log_event_safe(
+                        "support_subset_detail",
+                        {
+                            "section_id": section_id,
+                            **debug_trace,
+                        }
+                    )
+
+                except Exception as e:
+                    self.current_support_node_ids = []
+                    self._log_event_safe(
+                        "support_subset_error",
+                        {
+                            "section_id": section_id,
+                            "error": str(e),
+                        }
+                    )
 
                 # 准备 DSL 注入
                 self._update_dsl_injection(state, section_id, section_queue, current_idx)
@@ -686,12 +733,81 @@ class SelfCorrectingOrchestrator:
                 memory_trust=self.meta_state.memory_trust_level,
             )
 
+        # 新皮层知识巩固
+        try:
+            added_items = self.neocortex.consolidate_from_section_graph(
+                section_id=section_id,
+                dtg_store=self.dtg,
+                discourse_ledger=self.dsl,
+                generated_content=generated_content,
+                llm_client=self.llm_client,
+            )
+
+            self._log_event_safe(
+                "neocortex_consolidated",
+                {
+                    "section_id": section_id,
+                    "added_count": len(added_items),
+                }
+            )
+
+        except Exception as e:
+            self._log_event_safe(
+                "neocortex_error",
+                {
+                    "section_id": section_id,
+                    "error": str(e),
+                }
+            )
+
+        # 更新新皮层知识激活水平
+        try:
+            self.neocortex.update_activation_levels(
+                support_item_ids=self.current_support_node_ids
+            )
+        except Exception as e:
+            self._log_event_safe(
+                "neocortex_activation_error",
+                {
+                    "section_id": section_id,
+                    "error": str(e),
+                }
+            )
+
+        # 更新 DTG 动态边权
+        try:
+            self.dtg.update_edge_weights(
+                current_support_node_ids=self.current_support_node_ids,
+                dsl_store=self.dsl,
+            )
+        except Exception as e:
+            self._log_event_safe(
+                "dtg_edge_weight_update_error",
+                {
+                    "section_id": section_id,
+                    "error": str(e),
+                }
+            )
+
         self._log_postprocess_skipped(section_id)
         self._print_success(section_id, attempt + 1, dcas)
 
     # ------------------------------------------------------------------
     # 回退
     # ------------------------------------------------------------------
+
+    def _log_event_safe(self, event_type: str, payload: Dict[str, Any]) -> None:
+        """
+        安全记录运行事件。
+        如果 run_logger 没有 log_event 方法，则退化为 logger.info。
+        """
+        if (
+            getattr(self, "run_logger", None) is not None
+            and hasattr(self.run_logger, "log_event")
+        ):
+            self.run_logger.log_event(event_type, payload)
+        else:
+            self.logger.info("[EVENT] %s %s", event_type, payload)
 
     def _log_postprocess_skipped(self, section_id: str) -> None:
         """记录 postprocess 默认关闭的原因。"""

@@ -67,6 +67,9 @@ class RunLogger:
         log_path.parent.mkdir(parents=True, exist_ok=True)
         self._file = open(log_path, "w", encoding="utf-8")
         self._log_path = log_path
+        self.memory_trace_path = Path(output_dir) / f"{session_name}_memory_trace.jsonl"
+        if self.memory_trace_path.exists():
+            self.memory_trace_path.unlink()
 
     def close(self) -> None:
         """
@@ -103,6 +106,36 @@ class RunLogger:
         """
         for line in lines:
             self._write(indent + line)
+
+    def log_memory_event(self, event_type: str, payload: dict) -> None:
+        """
+        记录支持子集 / 新皮层 / 动态边权相关的详细结构化事件。
+        写入 memory_trace.jsonl。
+        """
+        event = {
+            "timestamp": datetime.datetime.now().isoformat(),
+            "event": event_type,
+            "payload": payload,
+        }
+        with open(self.memory_trace_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(event, ensure_ascii=False, default=str) + "\n")
+
+    def log_event(self, event_type: str, payload: dict) -> None:
+        """
+        通用事件入口。
+        对 memory 相关事件写入 memory_trace.jsonl；
+        同时在普通 run.log 里写一行摘要。
+        """
+        memory_prefixes = (
+            "support_subset",
+            "neocortex",
+            "dtg_edge_weight",
+        )
+        if event_type.startswith(memory_prefixes):
+            self.log_memory_event(event_type, payload)
+
+        section = payload.get("section_id", "-") if isinstance(payload, dict) else "-"
+        self._write(f"[EVENT] {event_type} section={section}")
 
     # ------------------------------------------------------------------
     # 运行级别日志

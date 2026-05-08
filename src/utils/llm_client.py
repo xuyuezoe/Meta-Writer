@@ -22,6 +22,7 @@ import time
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Type, TypeVar
+from urllib.parse import urlparse
 
 import openai
 import requests
@@ -236,8 +237,30 @@ class LLMClient:
             "o3",
             "o4",
             "omni",
+            "glm",
         )
         return lowered.startswith(openai_prefixes)
+
+    def _prefers_messages_protocol(self) -> bool:
+        """
+        判断当前网关是否应优先使用 Anthropic Messages 协议。
+
+        ai.lehe.com 的 glm 通道走 OpenAI Chat 更稳定；
+        sub2api 这类网关虽然模型名也可能是 glm，但通常挂在 /v1/messages。
+        """
+        if not self.base_url:
+            return False
+
+        host = urlparse(self.base_url).netloc.lower()
+        model_lower = self.model.strip().lower()
+
+        if "ai.lehe.com" in host:
+            return False
+        if "sub2api" in host:
+            return True
+        if model_lower.startswith("glm") and host:
+            return True
+        return False
 
     def _candidate_protocols(self) -> List[str]:
         """
@@ -251,6 +274,9 @@ class LLMClient:
 
         if not self.base_url:
             return ["openai_chat"]
+
+        if self._prefers_messages_protocol():
+            return ["anthropic_messages", "openai_chat"]
 
         if self._looks_like_openai_model():
             return ["openai_chat", "anthropic_messages"]
@@ -267,6 +293,8 @@ class LLMClient:
         """
         if not self.base_url:
             return True
+        if self._prefers_messages_protocol():
+            return False
         return self._looks_like_openai_model()
 
     def _retry_delay(self, round_index: int) -> float:
@@ -454,12 +482,18 @@ class LLMClient:
         self.request_count += 1
         endpoint = self._build_openai_chat_endpoint()
         started_at = time.time()
+        model_lower = self.model.lower()
+        effective_max_tokens = max_tokens
+        if model_lower.startswith("glm") and max_tokens > 8192:
+            effective_max_tokens = 8192
+
         self._trace_api_event(
             {
                 "phase": "request",
                 "protocol": "openai_chat",
                 "endpoint": endpoint,
                 "max_tokens": max_tokens,
+                "effective_max_tokens": effective_max_tokens,
                 "temperature": temperature,
                 "response_format": response_format["type"] if response_format else None,
             }
@@ -469,10 +503,10 @@ class LLMClient:
             "model": self.model,
             "messages": [{"role": "user", "content": prompt}],
             "temperature": temperature,
-            "max_tokens": max_tokens,
+            "max_tokens": effective_max_tokens,
             "stop": stop_sequences or None,
         }
-        if response_format is not None:
+        if response_format is not None and not model_lower.startswith("glm"):
             request_kwargs["response_format"] = response_format
 
         try:

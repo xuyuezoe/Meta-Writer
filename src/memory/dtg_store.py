@@ -16,7 +16,7 @@ import json
 import logging
 import time
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from ..core.decision import Decision
 
@@ -72,6 +72,9 @@ class DTGStore:
 
         # DERIVED_FROM 边：intent_node_id → List[dsl_entry_id]
         self.derived_from_edges: Dict[str, List[str]] = {}
+
+        # Weighted edge cache: (source, target, edge_type) -> weight
+        self.edge_weights: Dict[Tuple[str, str, str], float] = {}
 
         # 回退历史
         self.rollback_history: List[Dict] = []
@@ -270,6 +273,33 @@ class DTGStore:
         chain.sort(key=lambda d: d.timestamp)
         return chain
 
+    def get_decision_for_section(self, section_id: str) -> Optional[Decision]:
+        """
+        获取指定节对应的决策
+
+        参数：
+            section_id: 节 ID
+
+        返回值：
+            Decision 或 None（未找到时）
+        """
+        decision_id = self.section_to_decision.get(section_id)
+        if not decision_id:
+            return None
+        return self.decision_by_id.get(decision_id)
+
+    def get_content_node_id(self, section_id: str) -> str:
+        """
+        获取内容节点 ID
+
+        参数：
+            section_id: 节 ID
+
+        返回值：
+            str: content:{section_id} 格式的节点 ID
+        """
+        return f"content:{section_id}"
+
     def get_intent_node(self, section_id: str) -> Optional[Dict]:
         """
         获取指定节的 intent_node
@@ -303,6 +333,139 @@ class DTGStore:
     # ------------------------------------------------------------------
     # 第三阶段：回退
     # ------------------------------------------------------------------
+
+    def _edge_key(self, source: str, target: str, edge_type: str) -> Tuple[str, str, str]:
+        return (source, target, edge_type)
+
+    def _get_or_init_edge_weight(
+        self,
+        source: str,
+        target: str,
+        edge_type: str,
+        initial_weight: float,
+    ) -> float:
+        key = self._edge_key(source, target, edge_type)
+        if key not in self.edge_weights:
+            self.edge_weights[key] = initial_weight
+        return self.edge_weights[key]
+
+    def get_weighted_edges(self, dsl_store=None) -> List[Dict]:
+        """
+        Return all DTG edges with weights for support-subset expansion.
+        """
+        edges: List[Dict] = []
+
+        for decision in self.decision_log:
+            source = decision.decision_id
+            target = f"content:{decision.target_section}"
+            edge_type = "GENERATES"
+            weight = self._get_or_init_edge_weight(
+                source,
+                target,
+                edge_type,
+                decision.confidence,
+            )
+            edges.append({
+                "source": source,
+                "target": target,
+                "type": edge_type,
+                "weight": weight,
+            })
+
+            for ref in decision.referenced_sections:
+                if isinstance(ref, tuple):
+                    ref_section_id = ref[0]
+                else:
+                    ref_section_id = ref
+
+                source = f"content:{ref_section_id}"
+                target = decision.decision_id
+                edge_type = "REFERENCES"
+                weight = self._get_or_init_edge_weight(
+                    source,
+                    target,
+                    edge_type,
+                    0.5,
+                )
+                edges.append({
+                    "source": source,
+                    "target": target,
+                    "type": edge_type,
+                    "weight": weight,
+                })
+
+        intent_by_id = {}
+        for node in self.intent_by_section.values():
+            if isinstance(node, dict) and "id" in node:
+                intent_by_id[node["id"]] = node
+
+        for intent_node_id, decision_ids in self.guides_edges.items():
+            intent_node = intent_by_id.get(intent_node_id, {})
+            initial_weight = intent_node.get("confidence", 0.5)
+            for decision_id in decision_ids:
+                edge_type = "GUIDES"
+                weight = self._get_or_init_edge_weight(
+                    intent_node_id,
+                    decision_id,
+                    edge_type,
+                    initial_weight,
+                )
+                edges.append({
+                    "source": intent_node_id,
+                    "target": decision_id,
+                    "type": edge_type,
+                    "weight": weight,
+                })
+
+        for intent_node_id, dsl_entry_ids in self.derived_from_edges.items():
+            for dsl_entry_id in dsl_entry_ids:
+                initial_weight = 0.5
+                if dsl_store is not None:
+                    dsl_entry = dsl_store.get_entry(dsl_entry_id)
+                    if dsl_entry is not None:
+                        initial_weight = getattr(dsl_entry, "trust_level", 0.5)
+
+                edge_type = "DERIVED_FROM"
+                weight = self._get_or_init_edge_weight(
+                    intent_node_id,
+                    dsl_entry_id,
+                    edge_type,
+                    initial_weight,
+                )
+                edges.append({
+                    "source": intent_node_id,
+                    "target": dsl_entry_id,
+                    "type": edge_type,
+                    "weight": weight,
+                })
+
+        return edges
+
+    def get_adjacent_weighted_edges(self, node_id: str, dsl_store=None) -> List[Dict]:
+        return [
+            edge for edge in self.get_weighted_edges(dsl_store)
+            if edge["source"] == node_id or edge["target"] == node_id
+        ]
+
+    def update_edge_weights(
+        self,
+        current_support_node_ids: List[str],
+        dsl_store=None,
+        momentum: float = 0.85,
+        decay: float = 0.95,
+        retrieval_gain: float = 0.15,
+    ) -> None:
+        support_ids = set(current_support_node_ids)
+
+        for edge in self.get_weighted_edges(dsl_store):
+            source = edge["source"]
+            target = edge["target"]
+            edge_type = edge["type"]
+            old_weight = edge["weight"]
+            r = 1.0 if source in support_ids and target in support_ids else 0.0
+            new_weight = momentum * decay * old_weight + retrieval_gain * r
+            new_weight = max(0.0, min(1.0, new_weight))
+            self.edge_weights[self._edge_key(source, target, edge_type)] = new_weight
 
     def rollback_to_section(self, last_valid_section: Optional[str]) -> None:
         """

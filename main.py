@@ -351,11 +351,22 @@ def _run_single_task(
         model=str(runtime_settings["model"]),
         base_url=runtime_settings["base_url"],
     )
+    from lightrag.llm.openai import openai_embed
+    from src.memory.lightrag_similarity import LightRAGSimilarityService
+
+    class EmbeddingWrapper:
+        def embedding_func(self, text):
+            return openai_embed(text)
+
+    rag = EmbeddingWrapper()
+    similarity_service = LightRAGSimilarityService(rag)
+
     orchestrator = SelfCorrectingOrchestrator(
         client,
         memory_path=str(memory_dir),
         session_name=session_name,
         output_dir=str(output_dir),
+        similarity_service=similarity_service,
     )
 
     final_text, _decisions, correction_log = orchestrator.generate_with_self_correction(

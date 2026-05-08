@@ -756,6 +756,22 @@ class DiscourseLedger:
     def get_active_entries(self) -> List[LedgerEntry]:
         return [e for e in self._entries.values() if e.is_active()]
 
+    def get_neocortex_candidate_entries(self) -> List[LedgerEntry]:
+        """
+        获取可以进入新皮层候选池的 DSL 条目。
+        """
+        return [
+            e for e in self._entries.values()
+            if e.is_active()
+            and e.trust_level >= 0.7
+            and e.commitment_type in {
+                CommitmentType.FACT,
+                CommitmentType.STYLE_POLICY,
+                CommitmentType.COMMITMENT,
+            }
+            and not e.is_consolidated
+        ]
+
     def get_entry(self, entry_id: str) -> Optional[LedgerEntry]:
         return self._entries.get(entry_id)
 

@@ -91,6 +91,8 @@ class LedgerEntry:
         resolved_in: 闭合此线索的节 ID
         revoked_by: 若已被撤销，记录撤销节 ID
         revision_history: 历次修订记录
+        activation_level: 新皮层激活水平 [0.0, 1.0]
+        is_consolidated: 是否已经被巩固进新皮层
 
     关键实现细节：
         salience_score 不在此处存储，由 DiscourseLedger.compute_salience() 运行时计算
@@ -107,6 +109,8 @@ class LedgerEntry:
     support_span: List[str] = field(default_factory=list)
     stability_score: float = 1.0
     trust_level: float = 1.0
+    activation_level: float = 0.6
+    is_consolidated: bool = False
 
     is_resolved: bool = False
     resolved_in: Optional[str] = None
@@ -170,6 +174,8 @@ class LedgerEntry:
             "support_span":      self.support_span,
             "stability_score":   round(self.stability_score, 3),
             "trust_level":       round(self.trust_level, 3),
+            "activation_level":  round(self.activation_level, 3),
+            "is_consolidated":   self.is_consolidated,
             "is_resolved":       self.is_resolved,
             "resolved_in":       self.resolved_in,
             "revoked_by":        self.revoked_by,
