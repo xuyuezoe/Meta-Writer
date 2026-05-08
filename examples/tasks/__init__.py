@@ -1,10 +1,4 @@
-"""任务注册表。
-
-新增任务步骤：
-  1. 在 `examples/tasks/` 下创建新文件，并实现 `get_task_config()`
-  2. 在此处 import 并注册到 `TASK_REGISTRY`
-  3. 如需正式 benchmark 样本入口，优先通过 `benchmark_template` 动态注册
-"""
+"""Task registry for the local example bundle."""
 
 from __future__ import annotations
 
@@ -18,13 +12,7 @@ from ..benchmark_template import build_benchmark_task_config, list_benchmark_tas
 
 
 def _build_benchmark_task_factory(task_id: str) -> Callable[[], Dict[str, object]]:
-    """
-    构造 benchmark 任务工厂函数。
-
-    设计目的：
-        让每个 benchmark 样本都能在任务注册表里表现成一个普通任务入口，
-        这样 `main.py --task-id ...` 与主流程无需再维护两套任务加载逻辑。
-    """
+    """Build a task factory so each benchmark sample behaves like a normal task."""
 
     def _task_factory() -> Dict[str, object]:
         return build_benchmark_task_config(task_id)

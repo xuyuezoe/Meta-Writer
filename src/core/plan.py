@@ -58,6 +58,7 @@ class SectionIntent:
     dsl_trust_at_generation: float
     created_at: int
     revision_count: int = 0
+    word_target: Optional[int] = None
 
     @classmethod
     def create(
@@ -71,6 +72,7 @@ class SectionIntent:
         success_criteria: List[str],
         source_dsl_entry_ids: List[str],
         dsl_trust_at_generation: float,
+        word_target: Optional[int] = None,
     ) -> "SectionIntent":
         """工厂方法：创建新的 Section Intent"""
         return cls(
@@ -85,35 +87,39 @@ class SectionIntent:
             source_dsl_entry_ids=source_dsl_entry_ids,
             dsl_trust_at_generation=dsl_trust_at_generation,
             created_at=int(time.time()),
+            word_target=word_target,
         )
 
     def to_prompt_text(self) -> str:
         """将 Section Intent 转换为可注入 prompt 的自然语言描述"""
-        lines = [f"## Local Plan For This Section ({self.section_id})"]
-        lines.append(f"Goal: {self.local_goal}")
+        lines = [f"## Section Intent ({self.section_id})"]
+        lines.append(f"**Goal**: {self.local_goal}")
 
         if self.scope_boundary:
-            lines.append(f"\nScope boundary: {self.scope_boundary}")
+            lines.append(f"\n**Do not cross this boundary**: {self.scope_boundary}")
 
         if self.open_loops_to_advance:
-            lines.append("\nOpen loops to advance:")
+            lines.append("\n**Open loops to advance**:")
             for item in self.open_loops_to_advance:
                 lines.append(f"- {item}")
 
         if self.commitments_to_maintain:
-            lines.append("\nCommitments to maintain:")
+            lines.append("\n**Commitments to maintain**:")
             for item in self.commitments_to_maintain:
                 lines.append(f"- {item}")
 
         if self.risks_to_avoid:
-            lines.append("\nRisks to avoid:")
+            lines.append("\n**Risks to avoid**:")
             for item in self.risks_to_avoid:
                 lines.append(f"- {item}")
 
         if self.success_criteria:
-            lines.append("\nMinimum success criteria:")
+            lines.append("\n**Minimum success criteria**:")
             for item in self.success_criteria:
                 lines.append(f"- {item}")
+
+        if self.word_target is not None:
+            lines.append(f"\n**Word count target**: This section should be approximately {self.word_target} words.")
 
         return "\n".join(lines)
 
@@ -132,6 +138,7 @@ class SectionIntent:
             "dsl_trust_at_generation":  round(self.dsl_trust_at_generation, 3),
             "created_at":               self.created_at,
             "revision_count":           self.revision_count,
+            "word_target":              self.word_target,
         }
 
 

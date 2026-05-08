@@ -1,6 +1,11 @@
+from __future__ import annotations
+
 from dataclasses import dataclass, field
-from typing import List, Optional, Dict
+from typing import TYPE_CHECKING, Dict, List, Optional
 from enum import Enum
+
+if TYPE_CHECKING:
+    from ..references.types import SectionReferenceReport
 
 """
 作用：
@@ -44,6 +49,7 @@ class ValidationReport:
     suspected_source: Optional[object] = None   # Decision，避免循环导入用object
     suggested_strategy: str = ""
     strategy_params: Dict = field(default_factory=dict)
+    reference_report: Optional["SectionReferenceReport"] = None
 
     def __str__(self) -> str:
         """格式化输出（用于日志）"""

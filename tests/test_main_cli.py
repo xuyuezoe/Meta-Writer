@@ -22,9 +22,15 @@ class MainCliTests(unittest.TestCase):
             print_response=False,
         )
 
-    def test_resolve_default_task(self) -> None:
+    def test_resolve_default_tasks_runs_full_benchmark_batch(self) -> None:
         args = self._make_args()
-        self.assertEqual(main._resolve_requested_task_names(args), [main.TASK_NAME])
+        self.assertEqual(
+            main._resolve_requested_task_names(args),
+            [
+                f"{main.BENCHMARK_TASK_PREFIX}{task_id}"
+                for task_id in main.list_benchmark_task_ids()
+            ],
+        )
 
     def test_resolve_single_benchmark_task_id(self) -> None:
         args = self._make_args(task_id="med_s010")

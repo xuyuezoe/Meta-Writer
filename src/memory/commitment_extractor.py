@@ -105,30 +105,35 @@ class CommitmentExtractor:
         返回值：
             str：完整 prompt 字符串
         """
-        context_block = f"Existing summary:\n{existing_summary}\n\n" if existing_summary else ""
+        context_block = (
+            f"Prior content summary:\n{existing_summary}\n\n"
+            if existing_summary
+            else ""
+        )
         return (
-            "You are a narrative analysis assistant. Extract all discourse commitments from the text below. "
-            "Return a JSON array only, with no explanation.\n\n"
+            "You are a narrative analysis assistant. Extract every discourse commitment object "
+            "from the text below and return a JSON array only.\n\n"
+            "All content values must be in English.\n\n"
             f"{context_block}"
             f"Current section content:\n{section_content}\n\n"
-            "Each item must use this schema:\n"
+            "Each commitment object must use this schema:\n"
             "{\n"
-            '  "content": "A concise English description of the commitment, under 60 words",\n'
+            '  "content": "a concise commitment summary",\n'
             '  "commitment_type": "fact"|"commitment"|"open_loop"|"hypothesis"|"style_policy",\n'
             '  "constraint_type": "immutable"|"stateful"|"soft"\n'
             "}\n\n"
-            "Type definitions:\n"
-            "  fact         - established facts such as character traits, world rules, and completed events\n"
-            "  commitment   - explicit commitments about later narrative moves, actions, or outcomes\n"
-            "  open_loop    - unresolved questions, tensions, or unfinished threads\n"
-            "  hypothesis   - guesses or inferences that should not constrain later sections\n"
-            "  style_policy - global style requirements such as perspective, tone, or formatting\n\n"
-            "Constraint strength definitions:\n"
-            "  immutable - narratively irreversible information that later sections must not contradict\n"
-            "  stateful  - states that may evolve lawfully but must remain coherent over time\n"
-            "  soft      - stylistic preferences or non-core details that may be adjusted\n\n"
-            "All content values must be in English.\n"
-            "Return the JSON array only:"
+            "Type guide:\n"
+            "  fact         - an established fact that later sections should not contradict\n"
+            "  commitment   - a forward-looking commitment about what the text will do next\n"
+            "  open_loop    - an unresolved question, tension, or dangling thread\n"
+            "  hypothesis   - a speculation or inference that should stay tentative\n"
+            "  style_policy - a global style rule such as tone, viewpoint, or formatting\n\n"
+            "Constraint strength guide:\n"
+            "  immutable - a stable setting or event that should remain fixed later\n"
+            "  stateful  - a condition that may evolve but must stay coherent over time\n"
+            "  soft      - a preference or lower-priority detail that may be adjusted\n\n"
+            "Current section content must be analyzed together with the prior summary when provided.\n"
+            "Return a JSON array only."
         )
 
     def _parse_output(self, raw: str) -> List[dict]:

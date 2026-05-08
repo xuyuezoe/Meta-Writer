@@ -6,10 +6,10 @@
 from __future__ import annotations
 
 import math
-import re
 from dataclasses import asdict
 from typing import Dict, List, Optional, Tuple
 
+from metabench.local_metrics import count_length_units
 from metabench.schemas import EvalMetrics, InputSample, ModelOutput, ScoreBreakdown
 
 
@@ -37,13 +37,7 @@ def _word_count(text: str) -> int:
         使 benchmark 中“目标字数”与实际评分口径更一致。
     """
 
-    stripped_text = text.strip()
-    if stripped_text == "":
-        return 0
-
-    cjk_count = len(re.findall(r"[\u4e00-\u9fff]", stripped_text))
-    latin_token_count = len(re.findall(r"[A-Za-z0-9]+(?:[-_/][A-Za-z0-9]+)*", stripped_text))
-    return cjk_count + latin_token_count
+    return count_length_units(text)
 
 
 def compute_s_stability(eval_metrics: EvalMetrics) -> float:

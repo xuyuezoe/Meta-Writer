@@ -1,28 +1,103 @@
-# Meta-Writer
-
-Meta-Writer 是一个面向长文本生成的自我修正写作系统。它不把长文生成看作一次性输出，而是拆成“规划、生成、验证、诊断、修复”的连续过程，在生成中间就发现问题并做局部修正，从而提升长文本的连贯性、约束遵守能力与可追溯性。
-
-项目当前已经具备可运行的工程形态，既可以执行示例写作任务，也可以接入仓库内置的 benchmark 样本进行批量运行和评估。
+# MetaWriter
+Self-Correcting Long-Form Generation via Decision Trace Graphs
 
 ## 核心特性
 
-- 自我修正生成：每个 section 生成后立即验证，失败时自动重试或局部修复
-- 决策追溯：用 DTG（Decision Trace Graph）记录生成决策及依赖关系
-- 动态约束记忆：用 DSL（Discourse Ledger）维护承诺、开放问题和跨段约束
-- 多任务支持：支持创意写作、议论文、综述论文和 benchmark 样本
-- 结果可落盘：自动保存文本、运行日志、修正日志、DTG 和运行摘要
+MetaWriter 是一个长文本自我修正生成系统，核心创新在于引入 **决策追溯图（DTG）** 追踪生成过程中的决策依赖，并在验证失败时执行有针对性的修正策略。
+
+- **在线自我修正**：生成过程中实时验证，发现问题立即修正
+- **决策追溯图（DTG）**：记录每次生成决策及其依赖关系
+- **分层修复策略**：根据错误类型自动选择重试、加强约束或局部回退
+- **完整可追溯**：运行日志、修正日志、DTG 和 session 都会落盘
+
+## 快速开始
+
+### 1. 克隆项目
+
+```bash
+git clone <your-repo>
+cd metawriter
+```
+
+### 2. 安装依赖
+
+```bash
+pip install -r requirements.txt
+```
+
+### 3. 配置 API
+
+```bash
+cp .env.example .env
+# 编辑 .env，填入 API_KEY、MODEL、BASE_URL
+```
+
+### 4. 运行
+
+普通任务：
+
+```bash
+python main.py --task survey_paper
+python main.py --task argumentative_essay
+python -m main --task scifi_story
+```
+
+benchmark：
+
+```bash
+python main.py --task-id med_s010
+python main.py --all
+python -m main --task-id med_s010
+```
+
+默认情况下，`python main.py` / `python -m main` 会直接运行完整的 metabench 批量任务，也就是与 `--all` 相同的正式 benchmark 主链路。
+
+### 5. 查看结果
+
+每次运行会自动清理对应 `session_name` 下的旧输出，避免历史结果混入当前实验。
+
+常见产物如下：
+
+| 文件 | 内容 |
+|---|---|
+| `outputs/{session_name}_text.txt` | 生成的完整文本 |
+| `outputs/{session_name}_correction_log.json` | 修正行为日志 |
+| `outputs/{session_name}_dtg.json` | 决策追溯图 |
+| `outputs/{session_name}_summary.json` | 单次运行摘要 |
+| `outputs/{session_name}_benchmark_eval.json` | benchmark 评估结果 |
+| `outputs/{session_name}_run.log` | 完整运行日志 |
+| `sessions/{session_name}.json` | 完整 session |
+
+## Benchmark
+
+benchmark 的正式入口已经接入 `main.py`，不再依赖单独的 demo 脚本。
+
+设计上分两层：
+
+- `examples/benchmark_template.py`：负责加载本地 benchmark 样本，并提供本地评估函数
+- `main.py`：负责把 benchmark 样本接进 MetaWriter 的真实生成主循环
+
+运行 `--task-id` 或 `--all` 时，流程会：
+
+1. 从本地 `metabench/examples/samples.jsonl` 加载样本
+2. 通过 `TASK_REGISTRY` 动态注册为正式任务
+3. 走 MetaWriter 的真实生成、验证、修正主循环
+4. 对真实生成结果调用 `evaluate_output()` 做本地评估
 
 ## 项目结构
 
 ```text
-Meta-Writer/
+metawriter/
 ├── main.py
 ├── examples/
 │   ├── benchmark_template.py
 │   └── tasks/
+│       ├── argumentative_essay.py
+│       ├── metabench_sample.py
+│       ├── scifi_story.py
+│       └── survey_paper.py
 ├── metabench/
 │   ├── examples/
-│   ├── config/
 │   └── src/metabench/
 ├── src/
 │   ├── agents/
@@ -37,123 +112,52 @@ Meta-Writer/
 │   └── orchestrator_v2.py
 ├── outputs/
 ├── sessions/
-└── tests/
-```
-
-## 运行环境
-
-本项目默认在 `conda` 环境 `metawriter` 中运行。
-
-启动前请先激活环境：
-
-```bash
-conda activate metawriter
-```
-
-然后安装依赖：
-
-```bash
-pip install -r requirements.txt
+└── README.md
 ```
 
 ## 配置说明
 
-项目使用 `.env` 管理模型调用配置。可先复制模板文件：
-
-```bash
-cp .env.example .env
-```
-
-最小配置如下：
+在 `.env` 中配置：
 
 ```bash
 API_KEY=your_api_key_here
-BASE_URL=https://api.example.com/v1
 MODEL=your-model-name
+BASE_URL=https://...
 ```
 
-说明：
+系统默认优先兼容 OpenAI Chat Completions，也支持通过同一个 `BASE_URL` 自动探测兼容 Anthropic Messages 的网关。
 
-- `API_KEY` 必填
-- `BASE_URL` 为模型服务地址
-- `MODEL` 为所使用的模型名称
+如果需要核对请求是否真的打到了服务端，可以查看：
 
-## 快速开始
-
-### 查看可用任务
-
-```bash
-python3 main.py --list-tasks
+```text
+outputs/llm_api_trace.jsonl
 ```
 
-### 运行普通任务
+这个 trace 会记录每次请求的时间、协议、endpoint 和状态。
 
-```bash
-python3 main.py --task survey_paper
-python3 main.py --task argumentative_essay
-python3 main.py --task scifi_story
-```
+## 故障排查
 
-### 运行单个 benchmark 样本
+**Q: 报错说没有 API_KEY**
 
-```bash
-python3 main.py --task-id med_s010
-```
+A: 检查 `.env` 中是否正确设置了 `API_KEY`。
 
-### 批量运行全部 benchmark 样本
+**Q: benchmark 跑的是不是 demo 结果而不是真实生成？**
 
-```bash
-python3 main.py --all
-```
+A: 不是。`main.py --task-id ...` / `main.py --all` 会走 MetaWriter 的真实生成主循环，评估也基于真实生成文本而不是预存输出。
 
-### 打印完整生成结果
+**Q: 如何确认请求是否真的发出？**
 
-```bash
-python3 main.py --task survey_paper --print-response
-```
+A: 除了服务端面板，还可以直接检查 `outputs/llm_api_trace.jsonl` 与 `outputs/{session_name}_run.log`。
 
-默认情况下，直接执行：
+## 共创原则
 
-```bash
-python3 main.py
-```
+- 禁止直接提交到 `main`
+- 每个任务创建独立分支
+- 分支命名：类型/简短描述
+- 使用中文描述
+- 注释除了说明功能，也尽量说明设计目的
+- 提交前先自测，合并前先沟通
 
-会运行一个内置 benchmark 样本，便于快速验证主流程是否可用。
-
-## 输出结果
-
-运行完成后，项目会在 `outputs/` 和 `sessions/` 下保存相关产物。常见文件包括：
-
-- `outputs/{session_name}_text.txt`：最终生成文本
-- `outputs/{session_name}_run.log`：完整运行日志
-- `outputs/{session_name}_correction_log.json`：修正记录
-- `outputs/{session_name}_dtg.json`：决策追溯图
-- `outputs/{session_name}_summary.json`：单次运行摘要
-- `outputs/{session_name}_benchmark_eval.json`：benchmark 任务评估结果
-- `sessions/{session_name}.json`：会话持久化结果
-
-## Benchmark 说明
-
-项目内置了最小 benchmark 子模块，样本位于 `metabench/examples/samples.jsonl`。
-
-当使用 `--task-id` 或 `--all` 时，系统会：
-
-1. 读取本地 benchmark 样本
-2. 将样本转换为 Meta-Writer 可执行任务
-3. 走真实生成主流程
-4. 对生成结果执行本地评估
-
-因此，benchmark 运行结果基于真实生成输出，而不是预置答案回放。
-
-## 适用场景
-
-Meta-Writer 适合用于：
-
-- 长篇综述或分析类文本生成
-- 对结构、约束和一致性要求较高的写作任务
-- 需要研究“生成中自我修正”机制的实验型项目
-- 需要将生成过程记录为可分析工件的场景
-
-## License
+## 许可
 
 MIT License

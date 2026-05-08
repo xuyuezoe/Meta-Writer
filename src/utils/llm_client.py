@@ -94,11 +94,12 @@ class LLMClient:
     @staticmethod
     def _normalize_proxy_env_vars() -> None:
         """
-        规范化代理环境变量，兼容 httpx 对 SOCKS 代理 scheme 的要求。
+        Normalize proxy env vars for httpx/OpenAI SDK compatibility.
 
         设计目的：
-            一些本地代理工具会导出 `socks://host:port`，但 httpx / OpenAI SDK
-            只接受 `socks5://...`。这里仅做最小修正，避免客户端在构造阶段直接崩溃。
+            某些本地代理工具会把 SOCKS 代理写成 `socks://...`，但 httpx
+            只接受 `socks5://...`。这里在客户端初始化前做一次轻量修正，
+            避免任务在真正发出 API 请求前就因代理 scheme 非法而崩溃。
         """
         proxy_env_names = (
             "ALL_PROXY",
@@ -108,10 +109,13 @@ class LLMClient:
             "HTTPS_PROXY",
             "https_proxy",
         )
-        for env_name in proxy_env_names:
-            proxy_value = os.getenv(env_name)
-            if proxy_value and proxy_value.startswith("socks://"):
-                os.environ[env_name] = "socks5://" + proxy_value[len("socks://") :]
+        for name in proxy_env_names:
+            value = os.environ.get(name)
+            if not value:
+                continue
+            stripped = value.strip()
+            if stripped.lower().startswith("socks://"):
+                os.environ[name] = "socks5://" + stripped[len("socks://") :]
 
     def _normalize_openai_base_url(self, base_url: Optional[str]) -> Optional[str]:
         """
@@ -261,6 +265,24 @@ class LLMClient:
         if model_lower.startswith("glm") and host:
             return True
         return False
+    def _prefers_openai_chat(self) -> bool:
+        """
+        判断当前配置是否应优先使用 OpenAI Chat Completions。
+
+        设计目的：
+            某些第三方模型虽然不是 OpenAI 命名风格，但其网关只暴露
+            OpenAI 兼容接口。MiniMax 就属于这种情况；如果先打
+            Anthropic Messages，会稳定命中 `/messages` 404。
+        """
+        lowered_model = self.model.strip().lower()
+        if lowered_model.startswith("minimax"):
+            return True
+
+        base = (self.base_url or "").strip().lower()
+        if "api.minimaxi.com" in base:
+            return True
+
+        return self._looks_like_openai_model()
 
     def _candidate_protocols(self) -> List[str]:
         """
@@ -280,6 +302,7 @@ class LLMClient:
 
         if self._looks_like_openai_model():
             return ["openai_chat", "anthropic_messages"]
+        
         return ["anthropic_messages", "openai_chat"]
 
     def _should_attempt_response_format(self) -> bool:
@@ -783,11 +806,31 @@ class LLMClient:
 
                 think_only = False
                 if strip_think and "<think>" in text:
-                    visible = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
-                    if visible:
-                        text = visible
+                    # 第一步：剥离所有完整的 <think>...</think> 块，取剩余可见文本
+                    after_strip = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+                    has_incomplete = "<think>" in after_strip  # 残留 <think> 说明块未闭合
+
+                    if after_strip and not has_incomplete:
+                        # 正常路径：有可见文本且已清洁
+                        text = after_strip
                     else:
-                        text = original_text if allow_think_only_fallback else ""
+                        # 情形A：不完整 <think> 块（max_tokens 耗尽被截断，无 </think>）
+                        #         after_strip 仍含 <think> 前缀，无法直接使用
+                        # 情形B：完整 <think> 块 + 无可见文本（max_tokens 不足以生成正文）
+                        # 统一处理：提取所有 think 内容（剥去标签本身）
+                        if has_incomplete:
+                            self.logger.warning(
+                                "generate: 检测到不完整 <think> 块，max_tokens=%d 可能过小 "
+                                "[model=%s]",
+                                max_tokens, self.model,
+                            )
+                        think_content = re.sub(r"</?think>", "", text, flags=re.DOTALL).strip()
+                        if allow_think_only_fallback and think_content:
+                            text = think_content
+                        elif not allow_think_only_fallback:
+                            text = ""
+                        else:
+                            text = original_text
                         think_only = True
 
                 if think_only:
@@ -862,9 +905,21 @@ class LLMClient:
             self._preferred_protocol = "openai_chat"
             self._collect_usage(response)
 
+            # 检测 finish_reason：若为 "length" 说明 token 达限，JSON 大概率被截断
+            finish_reason = self._extract_finish_reason(response)
+            if finish_reason == "length":
+                self.logger.warning(
+                    "generate_structured: finish_reason=length，JSON 可能被截断 "
+                    "(model=%s max_tokens=%d)，先尝试 JSON 救援",
+                    self.model, max_tokens,
+                )
+
             raw_text = self._extract_text_from_response(response)
             cleaned_text = self._clean_thinking_model_output(raw_text)
-            json_obj = stdlib_json.loads(cleaned_text)
+            # 修复尾随逗号等常见模型 JSON 语法错误，再用 strict=False 容忍字面量控制字符
+            repaired_text = self._repair_json_text(cleaned_text)
+            json_obj = stdlib_json.loads(repaired_text, strict=False)
+            json_obj = self._coerce_json_fields(json_obj)
             result = schema(**json_obj)
 
             log_meta["structured_output"] = True
@@ -889,12 +944,169 @@ class LLMClient:
             return self._generate_structured_fallback(prompt, schema, temperature, max_tokens, log_meta)
 
         except (stdlib_json.JSONDecodeError, TypeError, ValueError) as parse_error:
+            schema_name = schema.__name__ if hasattr(schema, "__name__") else str(schema)
             self.logger.warning(
-                "response_format 返回内容无法解析为 %s，尝试降级到普通生成：%s",
-                schema.__name__ if hasattr(schema, "__name__") else str(schema),
-                parse_error,
+                "response_format 返回内容无法解析为 %s（位置 %s），先尝试字段级救援...",
+                schema_name, parse_error,
             )
+            # 先尝试从损坏的 JSON 中逐字段抢救，避免整体重新生成浪费一次 LLM 调用。
+            # 典型场景：content 字段过长导致 token 截断，或含未转义控制字符。
+            rescued = self._try_rescue_truncated_json(cleaned_text)
+            if rescued is not None:
+                try:
+                    rescued = self._coerce_json_fields(rescued)
+                    result = schema(**rescued)
+                    self.logger.info(
+                        "JSON 字段救援成功：schema=%s rescued_keys=%s",
+                        schema_name, sorted(rescued.keys()),
+                    )
+                    # 补充审计日志：救援路径同样写入 run.log，保证调用链路可追溯
+                    rescue_meta = dict(log_meta)
+                    rescue_meta["structured_output"] = True
+                    rescue_meta["schema"] = schema_name
+                    rescue_meta["method"] = "response_format+rescue"
+                    rescue_meta["protocol"] = "openai_chat"
+                    self._log_llm_call(
+                        prompt=prompt,
+                        response=cleaned_text,
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                        log_meta=rescue_meta,
+                    )
+                    return result
+                except Exception as rescue_err:
+                    self.logger.warning("JSON 字段救援构造 schema 失败：%s，降级到全量重生成", rescue_err)
+            else:
+                self.logger.warning("JSON 字段救援未提取到 content，降级到全量重生成")
+
             return self._generate_structured_fallback(prompt, schema, temperature, max_tokens, log_meta)
+
+    def _extract_finish_reason(self, response: Any) -> Optional[str]:
+        """
+        从 API 响应中提取 finish_reason。
+
+        设计目的：
+            finish_reason="length" 表示模型在 max_tokens 时被强制截断，
+            是 JSON 被截断的直接证据，需要在日志层面明确区分。
+        """
+        choices = getattr(response, "choices", None)
+        if isinstance(choices, list) and choices:
+            return getattr(choices[0], "finish_reason", None)
+        if isinstance(response, Mapping):
+            choices_data = response.get("choices", [])
+            if choices_data:
+                return choices_data[0].get("finish_reason")
+        return None
+
+    @staticmethod
+    def _extract_json_string_tolerant(text: str, start: int) -> str:
+        """
+        从 start 位置开始，解析一个 JSON 字符串直到遇到未转义的 `"` 或文本结尾。
+
+        设计目的：
+            正则无法正确处理 `\"` 转义 + 截断组合。此方法是一个最小化的
+            JSON string 解析器：正确反转义 \\ / \" / \n / \t / \r，
+            遇到截断（text 提前结束）时返回已解析的部分内容，而不是抛出异常。
+
+        参数：
+            text:  包含 JSON 内容的原始字符串
+            start: 字符串值的起始位置（即开头 `"` 之后的第一个字符）
+
+        返回：
+            解析出的字符串内容（可能是截断版本，但总是有效的 Python str）
+        """
+        buf: List[str] = []
+        i = start
+        while i < len(text):
+            ch = text[i]
+            if ch == "\\" and i + 1 < len(text):
+                nxt = text[i + 1]
+                buf.append(
+                    '"' if nxt == '"' else
+                    '\n' if nxt == 'n' else
+                    '\t' if nxt == 't' else
+                    '\r' if nxt == 'r' else
+                    '\\' if nxt == '\\' else
+                    nxt
+                )
+                i += 2
+            elif ch == '"':
+                break  # 正常结束
+            else:
+                buf.append(ch)
+                i += 1
+        return "".join(buf).strip()
+
+    def _try_rescue_truncated_json(self, text: str) -> Optional[Dict[str, Any]]:
+        """
+        从截断或含非法字符的 JSON 文本中逐字段抢救可用内容。
+
+        设计目的：
+            当 response_format=json_object 被截断（finish_reason=length）或
+            content 字段含未转义控制字符时，json.loads 整体失败。
+            此方法用有限正则对各字段独立提取，只要拿到 content 就能继续。
+            缺失的元数据字段（decision/reasoning 等）填入安全默认值，
+            不会阻断生成主循环。
+
+        返回：
+            提取到 content 时返回字段 dict，否则返回 None。
+
+        关键约束：
+            - 只做字段提取，不尝试修复 JSON 语法（太脆弱）
+            - content 是必须字段；其余字段可用默认值兜底
+            - 日志中标注 "rescued" 以便追踪
+        """
+        recovered: Dict[str, Any] = {}
+
+        # 第一阶段：提取 string 类短字段（出现在 content 之前，一般不截断）
+        for key in ("decision", "reasoning", "expected_effect"):
+            m = re.search(
+                r'"' + re.escape(key) + r'"\s*:\s*"((?:[^"\\]|\\.)*?)"',
+                text, re.DOTALL,
+            )
+            if m:
+                try:
+                    recovered[key] = m.group(1).replace('\\"', '"')
+                except Exception:
+                    pass
+
+        # 第二阶段：提取 confidence（数字型，不会截断）
+        m = re.search(r'"confidence"\s*:\s*([0-9]*\.?[0-9]+)', text)
+        if m:
+            try:
+                recovered["confidence"] = float(m.group(1))
+            except ValueError:
+                pass
+
+        # 第三阶段：提取 content（可能被截断）
+        # 用字符级解析器而非正则：正确处理 \" 转义，在截断位置安全停止。
+        content_match = re.search(r'"content"\s*:\s*"', text)
+        if content_match:
+            recovered["content"] = self._extract_json_string_tolerant(
+                text, content_match.end()
+            )
+
+        # 第四阶段：提取 referenced_section_ids（列表型）
+        m = re.search(r'"referenced_section_ids"\s*:\s*(\[[^\]]*\])', text)
+        if m:
+            try:
+                recovered["referenced_section_ids"] = json.loads(m.group(1))
+            except Exception:
+                recovered["referenced_section_ids"] = []
+        else:
+            recovered.setdefault("referenced_section_ids", [])
+
+        # content 是必须字段；无法提取则放弃救援
+        if "content" not in recovered:
+            return None
+
+        # 为缺失的必须字段填入安全默认值
+        recovered.setdefault("decision", "Content generated (rescued from partial JSON output)")
+        recovered.setdefault("reasoning", "Original structured response was partially parsed.")
+        recovered.setdefault("expected_effect", "Deliver section content.")
+        recovered.setdefault("confidence", 0.6)
+
+        return recovered
 
     def _generate_structured_fallback(
         self,
@@ -939,9 +1151,47 @@ class LLMClient:
         try:
             cleaned_text = self._clean_thinking_model_output(response_text)
             json_obj = stdlib_json.loads(cleaned_text)
+            json_obj = self._coerce_json_fields(json_obj)
             return schema(**json_obj)
         except (stdlib_json.JSONDecodeError, TypeError, ValueError) as error:
             raise RuntimeError(f"结构化输出调用失败: {error}") from error
+
+    @staticmethod
+    def _coerce_json_fields(json_obj: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        修复 MiniMax-M2.5 等模型将 list 字段序列化为字符串的问题。
+
+        设计目的：
+            MiniMax-M2.5 在 response_format=json_object 模式下，偶尔将
+            List[str] 字段输出为 Python repr 字符串 "['a', 'b']" 或 JSON
+            字符串 '["a","b"]'，导致 Pydantic 验证抛出 ValueError。
+            在此做一次轻量强制转换：对所有字符串值，若其以 "[" 开头，
+            尝试 json.loads → ast.literal_eval，成功且结果为列表则替换。
+
+        参数：
+            json_obj: 已通过 json.loads 解析的原始字典
+
+        返回值：
+            Dict[str, Any]: 经过 list 字段修正的字典（原地修改并返回）
+        """
+        import ast as _ast
+        import json as _json
+
+        for key, value in json_obj.items():
+            if not isinstance(value, str):
+                continue
+            stripped = value.strip()
+            if not stripped.startswith("["):
+                continue
+            for parser in (_json.loads, _ast.literal_eval):
+                try:
+                    parsed = parser(stripped)
+                    if isinstance(parsed, list):
+                        json_obj[key] = parsed
+                        break
+                except Exception:
+                    continue
+        return json_obj
 
     def _clean_thinking_model_output(self, text: str) -> str:
         """
@@ -966,6 +1216,30 @@ class LLMClient:
             text = text[json_start : json_end + 1]
 
         return text
+
+    @staticmethod
+    def _repair_json_text(text: str) -> str:
+        """
+        修复模型 JSON 输出中的常见语法错误。
+
+        设计目的：
+            在 json.loads 之前做轻量修复，消除两类已知的 MiniMax-M2.5 问题，
+            避免走字段级救援（rescue）路径浪费额外解析周期：
+            1. 尾随逗号（Trailing Comma）：{"a": 1,} 或 ["x",]
+               表现为 json 报 "Expecting property name" 于对象末尾，
+               通常出现在 referenced_section_ids 字段之后。
+            2. 字面量控制字符（如 \\n、\\r）嵌入字符串：
+               由调用方使用 strict=False 处理，此处不做替换，
+               避免误改 content 正文中有意义的空白。
+
+        参数：
+            text: 经过 _clean_thinking_model_output 处理后的 JSON 文本
+
+        返回：
+            修复后的 JSON 文本（不改变 JSON 语义）
+        """
+        # 移除对象或数组闭合括号之前的尾随逗号
+        return re.sub(r",(\s*[}\]])", r"\1", text)
 
     def _log_llm_call(
         self,

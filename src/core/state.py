@@ -81,8 +81,8 @@ class GenerationState:
         lines = [
             "## Current Generation State",
             f"- Current section: {self.current_section}",
-            f"- Overall progress: {self.progress:.0%} "
-            f"({len(self.generated_sections)}/{len(self.outline)} sections completed)",
+            f"- Overall progress: {self.progress:.0%}"
+            f" ({len(self.generated_sections)}/{len(self.outline)} sections completed)",
         ]
 
         if self.global_constraints:
@@ -91,7 +91,7 @@ class GenerationState:
                 lines.append(f"- {c}")
 
         if self.dsl_injection:
-            lines.append("\n## Discourse State (Must Be Respected)")
+            lines.append("\n## DSL State To Follow")
             lines.append(self.dsl_injection)
 
         if self.pending_goals:
@@ -100,7 +100,7 @@ class GenerationState:
                 lines.append(f"- {g}")
 
         if self.generated_sections:
-            lines.append("\n## Completed Sections")
+            lines.append("\n## Generated Sections")
             lines.append(", ".join(self.generated_sections))
 
         if self.flagged_issues:

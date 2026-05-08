@@ -116,7 +116,7 @@ class AlignmentScorer:
         }
 
         self.logger.info(
-            "DCAS computed: coverage=%.3f consistency=%.3f effectiveness=%.3f -> dcas=%.3f",
+            "DCAS计算完成: coverage=%.3f consistency=%.3f effectiveness=%.3f → dcas=%.3f",
             coverage, consistency, effectiveness, dcas,
         )
         return result
@@ -148,20 +148,20 @@ class AlignmentScorer:
             三个二元组：((评分, 是否 fallback), ...)
         """
         prompt = (
-            "You are a narrative quality evaluator. Score how well the generated content follows the decision.\n\n"
-            f"Decision: {decision.decision}\n"
+            "You are a narrative quality evaluator.\n\n"
+            f"Writing decision: {decision.decision}\n"
             f"Reasoning: {decision.reasoning}\n"
             f"Expected effect: {decision.expected_effect}\n"
             f"Generated content: {content}\n\n"
             "Score the following dimensions on a 0.0 to 1.0 scale:\n"
-            "1. coverage_score: how fully the content implements the decision\n"
-            "   1.0=fully, 0.8=mostly, 0.6=partially, 0.0=not implemented\n"
-            "2. consistency_score: how consistent the content is with the reasoning\n"
-            "   1.0=fully consistent, 0.8=mostly consistent, 0.6=partially consistent, 0.0=strong contradiction\n"
-            "3. effectiveness_score: how fully the content achieves the expected effect\n"
-            "   1.0=fully achieved, 0.8=mostly achieved, 0.6=partially achieved, 0.0=not achieved\n\n"
-            "Return this JSON only, replacing the placeholder values with numbers:\n"
-            "{\"coverage_score\": 0.0, \"consistency_score\": 0.0, \"effectiveness_score\": 0.0}"
+            "1. coverage_score: how fully the content realizes the decision's intent\n"
+            "   1.0 = fully realized, 0.8 = mostly realized, 0.6 = partially realized, 0.0 = not realized\n"
+            "2. consistency_score: how well the reasoning stays consistent with the content\n"
+            "   1.0 = fully consistent, 0.8 = mostly consistent, 0.6 = partially consistent, 0.0 = clearly contradictory\n"
+            "3. effectiveness_score: how well the content achieves the expected effect\n"
+            "   1.0 = fully achieved, 0.8 = mostly achieved, 0.6 = partially achieved, 0.0 = not achieved\n\n"
+            "Return JSON only with numeric values for all three fields:\n"
+            '{"coverage_score": 0.0, "consistency_score": 0.0, "effectiveness_score": 0.0}'
         )
 
         try:
@@ -178,16 +178,16 @@ class AlignmentScorer:
                 },
             )
         except Exception as e:
-            self.logger.warning("DCAS batch scoring call failed; falling back on all dimensions: %s", e)
+            self.logger.warning("DCAS 批量评分 LLM 调用失败，全部降级：%s", e)
             return (
                 (_FALLBACK_SCORE, True),
                 (_FALLBACK_SCORE, True),
                 (_FALLBACK_SCORE, True),
             )
 
-        coverage      = self._parse_json_field(response, "coverage_score", "coverage")
-        consistency   = self._parse_json_field(response, "consistency_score", "consistency")
-        effectiveness = self._parse_json_field(response, "effectiveness_score", "effectiveness")
+        coverage      = self._parse_json_field(response, "coverage_score",      "意图覆盖度")
+        consistency   = self._parse_json_field(response, "consistency_score",   "逻辑一致性")
+        effectiveness = self._parse_json_field(response, "effectiveness_score", "效果达成度")
 
         return coverage, consistency, effectiveness
 
@@ -246,8 +246,8 @@ class AlignmentScorer:
                 if 0.0 <= score <= 1.0:
                     return score, False
 
-            raise ValueError(f"unable to extract field '{field}' from response")
+            raise ValueError(f"无法从响应中提取字段 '{field}'")
 
         except Exception as e:
-            self.logger.warning("%s score parsing failed; falling back to %.2f: %s", dimension, _FALLBACK_SCORE, e)
+            self.logger.warning("%s 评分解析失败，降级为 %.1f：%s", dimension, _FALLBACK_SCORE, e)
             return _FALLBACK_SCORE, True

@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Dict, List, Optional
 
 from ..core.plan import SectionIntent
@@ -53,6 +54,7 @@ class SectionPlanner:
         section_summaries: str,
         source_dsl_entry_ids: List[str],
         dsl_trust_at_generation: float,
+        word_target: Optional[int] = None,
     ) -> SectionIntent:
         """
         为指定节生成 SectionIntent，并注册到 DTG
@@ -83,6 +85,7 @@ class SectionPlanner:
             task_description=task_description,
             dsl_context=dsl_context,
             section_summaries=section_summaries,
+            word_target=word_target,
         )
 
         raw = self._llm.generate(
@@ -103,6 +106,7 @@ class SectionPlanner:
             section_id=section_id,
             source_dsl_entry_ids=source_dsl_entry_ids,
             dsl_trust_at_generation=dsl_trust_at_generation,
+            word_target=word_target,
         )
 
         # 注册到 DTG 为 intent_node
@@ -121,6 +125,7 @@ class SectionPlanner:
         task_description: str,
         dsl_context: str,
         section_summaries: str,
+        word_target: Optional[int] = None,
     ) -> str:
         """
         构建 SectionIntent 生成 prompt
@@ -140,23 +145,28 @@ class SectionPlanner:
             else ""
         )
         dsl_block = (
-            f"Current discourse state (top 8 entries by salience):\n{dsl_context}\n\n"
+            f"Current DSL state (top 8 entries by salience):\n{dsl_context}\n\n"
             if dsl_context
             else ""
         )
 
+        word_target_line = (
+            f"Word count target for this section: approximately {word_target} words.\n"
+            if word_target is not None else ""
+        )
         return (
-            "Create a local plan for the upcoming section based on the context below. "
-            "Return exactly one JSON object. Do not use markdown code fences, XML, or extra explanation.\n\n"
-            f"Global task:\n{task_description}\n"
-            f"Section responsibility:\n{section_title}\n\n"
-            f"{dsl_block}"
+            "Create a local plan for the section that will be written next. "
+            "Output only one JSON object. Do not use markdown code fences, XML, or extra explanation.\n\n"
+            f"Task goal: {task_description}\n"
+            f"Section responsibility: {section_title}\n"
+            f"{word_target_line}"
+            f"\n{dsl_block}"
             f"{summaries_block}"
-            "Important principles:\n"
-            "1. The local plan must stay within this section's responsibility and must not plan content for later sections.\n"
-            "2. If there is a main conflict, this section may advance it but must not fully resolve it unless this section is explicitly the ending.\n"
-            "3. Do not repeat core material that has already been covered in completed sections.\n"
-            "4. Every natural-language string and every array item must be written in English.\n\n"
+            "[Important principles]\n"
+            "1. Keep the local plan strictly inside this section's responsibility; do not plan material that belongs to later sections.\n"
+            "2. If there is a main conflict, this section may advance it but must not fully resolve it unless the outline explicitly marks this section as the ending.\n"
+            "3. Do not repeat content that has already been handled in completed sections.\n"
+            "4. The success_criteria must include an explicit word count requirement matching the word count target above.\n\n"
             "Output format (strict JSON):\n"
             "{\n"
             "  \"local_goal\": \"...\",\n"
@@ -166,7 +176,7 @@ class SectionPlanner:
             "  \"risks_to_avoid\": [\"...\"],\n"
             "  \"success_criteria\": [\"...\"]\n"
             "}\n"
-            "If a list is empty, return [] rather than a placeholder string. Do not output markdown code fences."
+            "If a list field is empty, return []. Do not write \"none\". Do not output markdown code fences."
         )
 
     def _parse_intent(
@@ -175,6 +185,7 @@ class SectionPlanner:
         section_id: str,
         source_dsl_entry_ids: List[str],
         dsl_trust_at_generation: float,
+        word_target: Optional[int] = None,
     ) -> SectionIntent:
         """
         解析 LLM 输出的 XML 格式 SectionIntent
@@ -194,25 +205,29 @@ class SectionPlanner:
         """
         payload = self._extract_json_object(raw)
         if not payload:
-            return self._build_default_intent(section_id, source_dsl_entry_ids, dsl_trust_at_generation)
+            return self._build_default_intent(section_id, source_dsl_entry_ids, dsl_trust_at_generation, word_target)
 
         data = self._safe_parse_intent_json(payload)
         if data is None:
-            return self._build_default_intent(section_id, source_dsl_entry_ids, dsl_trust_at_generation)
+            return self._build_default_intent(section_id, source_dsl_entry_ids, dsl_trust_at_generation, word_target)
 
         def _norm_list(value) -> List[str]:
             if isinstance(value, list):
                 return [str(item).strip() for item in value if str(item).strip()]
             return []
 
-        local_goal = str(data.get("local_goal", "")).strip() or f"Draft the content for section {section_id}."
-        scope_boundary = str(data.get("scope_boundary", "")).strip()
-        open_loops = _norm_list(data.get("open_loops_to_advance"))
-        commitments = _norm_list(data.get("commitments_to_maintain"))
-        risks = _norm_list(data.get("risks_to_avoid"))
-        success_criteria = _norm_list(data.get("success_criteria")) or [
-            "The content stays within scope and does not create major constraint violations."
-        ]
+        def _first_value(*keys: str):
+            for key in keys:
+                if key in data:
+                    return data.get(key)
+            return None
+
+        local_goal = str(_first_value("local_goal", "goal") or "").strip() or f"Complete the content for section {section_id}"
+        scope_boundary = str(_first_value("scope_boundary", "scope") or "").strip()
+        open_loops = _norm_list(_first_value("open_loops_to_advance", "open_loops"))
+        commitments = _norm_list(_first_value("commitments_to_maintain", "commitments_to_preserve"))
+        risks = _norm_list(_first_value("risks_to_avoid", "risks"))
+        success_criteria = _norm_list(_first_value("success_criteria", "criteria")) or ["The content matches the section goal and does not violate major constraints."]
 
         return SectionIntent.create(
             section_id=section_id,
@@ -224,6 +239,7 @@ class SectionPlanner:
             success_criteria=success_criteria,
             source_dsl_entry_ids=source_dsl_entry_ids,
             dsl_trust_at_generation=dsl_trust_at_generation,
+            word_target=word_target,
         )
 
     def _extract_json_object(self, raw: str) -> Optional[str]:
@@ -257,23 +273,40 @@ class SectionPlanner:
         try:
             return json.loads(payload)
         except json.JSONDecodeError:
-            return None
+            repaired = self._repair_common_json_escapes(payload)
+            if repaired == payload:
+                return None
+            try:
+                return json.loads(repaired)
+            except json.JSONDecodeError:
+                return None
+
+    def _repair_common_json_escapes(self, payload: str) -> str:
+        """
+        Repair common near-JSON escape mistakes emitted by models.
+
+        The main observed failure mode is backslash-escaped apostrophes inside
+        double-quoted JSON strings, such as Alzheimer\'s, which is invalid JSON.
+        """
+        return re.sub(r"\\'", "'", payload)
 
     def _build_default_intent(
         self,
         section_id: str,
         source_dsl_entry_ids: List[str],
         dsl_trust_at_generation: float,
+        word_target: Optional[int] = None,
     ) -> SectionIntent:
         """构造保守默认 SectionIntent"""
         return SectionIntent.create(
             section_id=section_id,
-            local_goal=f"Draft the content for section {section_id}.",
+            local_goal=f"Complete the content for section {section_id}",
             scope_boundary="",
             open_loops_to_advance=[],
             commitments_to_maintain=[],
             risks_to_avoid=[],
-            success_criteria=["The content stays within scope and avoids major constraint violations."],
+            success_criteria=["The content matches the section goal and does not violate major constraints."],
             source_dsl_entry_ids=source_dsl_entry_ids,
             dsl_trust_at_generation=dsl_trust_at_generation,
+            word_target=word_target,
         )

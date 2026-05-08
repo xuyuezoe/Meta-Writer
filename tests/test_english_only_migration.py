@@ -65,10 +65,10 @@ class EnglishOnlyMigrationTests(unittest.TestCase):
 
         prompt = generator._build_prompt(state, "Write the mechanism section.", "Recent English content.", intent)
 
-        self.assertIn("All natural-language fields must be written in English.", prompt)
         self.assertIn("Current state:", prompt)
         self.assertIn("Recent content:", prompt)
         self.assertIn("Current task:", prompt)
+        self.assertIn("Return a JSON object with the following fields:", prompt)
         self.assertNotIn("当前", prompt)
         self.assertNotIn("本节", prompt)
 
@@ -84,10 +84,36 @@ class EnglishOnlyMigrationTests(unittest.TestCase):
         default_intent = planner._build_default_intent("sec3", [], 0.8)
 
         self.assertIn("Create a local plan", prompt)
-        self.assertIn("Every natural-language string and every array item must be written in English.", prompt)
-        self.assertEqual(default_intent.local_goal, "Draft the content for section sec3.")
-        self.assertIn("avoids major constraint violations", default_intent.success_criteria[0])
+        self.assertIn("Output format (strict JSON):", prompt)
+        self.assertEqual(default_intent.local_goal, "Complete the content for section sec3")
+        self.assertIn("does not violate major constraints", default_intent.success_criteria[0])
         self.assertNotIn("完成", default_intent.local_goal)
+
+    def test_section_planner_parses_relaxed_json_and_commitment_alias(self) -> None:
+        planner = SectionPlanner(FakeLLM("{}"), FakeDTG())
+        raw = (
+            '{"local_goal":"Define Alzheimer\\\'s disease in the older-adult care context.",'
+            '"scope_boundary":"Do not introduce treatment protocols yet.",'
+            '"open_loops_to_advance":["Clarify diagnostic boundary questions"],'
+            '"commitments_to_preserve":["Keep the review scholarly and English-only"],'
+            '"risks_to_avoid":["Do not resolve later controversies"],'
+            '"success_criteria":["The conceptual frame is clear."]}'
+        )
+
+        intent = planner._parse_intent(raw, "sec1", [], 0.9)
+
+        self.assertEqual(
+            intent.local_goal,
+            "Define Alzheimer's disease in the older-adult care context.",
+        )
+        self.assertEqual(
+            intent.commitments_to_maintain,
+            ["Keep the review scholarly and English-only"],
+        )
+        self.assertEqual(
+            intent.open_loops_to_advance,
+            ["Clarify diagnostic boundary questions"],
+        )
 
     def test_commitment_extractor_prompt_requires_english_content(self) -> None:
         extractor = CommitmentExtractor(FakeLLM())
@@ -168,10 +194,10 @@ class EnglishOnlyMigrationTests(unittest.TestCase):
             "sec2",
         )
 
-        self.assertEqual(issues[0].description, "Content is too short (5 chars < 20)")
+        self.assertEqual(issues[0].description, "Content is too short (1 words < minimum 200)")
         self.assertTrue(satisfied)
         self.assertIsNone(reason)
-        self.assertIn("Answer with true or false only.", validator_llm.prompts[0])
+        self.assertIn("Reply with only true or false.", validator_llm.prompts[0])
         self.assertNotIn("判断章节内容", validator_llm.prompts[0])
 
 

@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 import json
+import sys
+import types
 import unittest
+
+sys.modules.setdefault("openai", types.ModuleType("openai"))
 
 from src.core.ledger import CommitmentType, ConstraintType, LedgerEntry
 from src.memory.discourse_ledger import DiscourseLedger
