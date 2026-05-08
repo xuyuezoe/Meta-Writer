@@ -656,7 +656,7 @@ class SelfCorrectingOrchestrator:
         )
         if injectable:
             state.dsl_injection = "\n".join(
-                f"- [{e.commitment_type.value}/{e.constraint_type.value}] {e.content}"
+                f"- {{{e.commitment_type.value}|{e.constraint_type.value}}} {e.content}"
                 for e in injectable
             )
         else:
