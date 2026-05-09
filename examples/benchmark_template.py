@@ -13,6 +13,8 @@ import sys
 from pathlib import Path
 from typing import Dict, List, Union, cast
 
+from .citation_quality import evaluate_citation_quality
+
 
 BENCHMARK_ROOT: Path = Path(__file__).resolve().parent.parent / "metabench"
 METABENCH_SRC_ROOT: Path = BENCHMARK_ROOT / "src"
@@ -66,6 +68,21 @@ def is_document_level_constraint(requirement: str) -> bool:
 def _mark_document_level_constraint(requirement: str) -> str:
     """Prefix a document-level benchmark requirement for the validator layer."""
     return f"{DOCUMENT_LEVEL_CONSTRAINT_PREFIX}{requirement}"
+
+
+def _extract_citation_quality_config(reference: Dict[str, object]) -> object:
+    """Extract optional citation-quality metadata from benchmark reference data."""
+    if "citation_quality" in reference:
+        return reference["citation_quality"]
+    if "citation_manifest" in reference or "section_map" in reference:
+        return {
+            "paper_type": reference.get("paper_type", "review"),
+            "section_map": reference.get("section_map", []),
+            "citation_manifest": reference.get("citation_manifest"),
+            "judge_flags": reference.get("judge_flags", {}),
+            "required_claims": reference.get("required_claims", []),
+        }
+    return None
 
 
 def _extract_paragraph_blocks(text: str) -> List[str]:
@@ -587,12 +604,16 @@ def evaluate_output(
         + 0.25 * length_score,
     )
     constraint_violation_rate = 1.0 - min(entity_consistency_score, length_score)
+    citation_quality = evaluate_citation_quality(
+        normalized_text, _extract_citation_quality_config(normalized_reference)
+    )
 
     return {
         "constraint_violation_rate": constraint_violation_rate,
         "entity_consistency_score": entity_consistency_score,
         "logical_coherence": logical_coherence,
         "length_score": length_score,
+        "citation_quality": citation_quality,
         "diagnostics": {
             "matched_keywords": matched_keywords,
             "missing_keywords": [
