@@ -11,6 +11,7 @@
 """
 from __future__ import annotations
 
+import json
 import re
 from typing import Dict, List, Optional
 
@@ -33,12 +34,12 @@ class SectionPlanner:
 
     关键实现细节：
         温度固定 0.3（规划阶段需要保守确定性）。
-        max_tokens 512（局部计划不需要长输出）。
-        LLM 以 XML 格式输出 SectionIntent 字段，解析失败时返回保守默认值。
+        max_tokens 32768（放宽上限，防止长上下文导致截断）。
+        LLM 输出 JSON 结构描述局部计划，解析失败时返回保守默认值。
     """
 
     _TEMPERATURE = 0.3
-    _MAX_TOKENS = 512
+    _MAX_TOKENS = 32768
 
     def __init__(self, llm_client: LLMClient, dtg_store: DTGStore):
         self._llm = llm_client
@@ -53,13 +54,14 @@ class SectionPlanner:
         section_summaries: str,
         source_dsl_entry_ids: List[str],
         dsl_trust_at_generation: float,
+        word_target: Optional[int] = None,
     ) -> SectionIntent:
         """
         为指定节生成 SectionIntent，并注册到 DTG
 
         功能：
             1. 构建规划 prompt，调用 LLM 生成结构化局部计划
-            2. 解析 XML 格式输出为 SectionIntent
+            2. 解析 JSON 格式输出为 SectionIntent
             3. 将 SectionIntent 注册为 DTG 的 intent_node（建立 DERIVED_FROM 边）
 
         参数：
@@ -83,12 +85,20 @@ class SectionPlanner:
             task_description=task_description,
             dsl_context=dsl_context,
             section_summaries=section_summaries,
+            word_target=word_target,
         )
 
         raw = self._llm.generate(
             prompt,
             temperature=self._TEMPERATURE,
             max_tokens=self._MAX_TOKENS,
+            strip_think=True,
+            allow_think_only_fallback=False,
+            log_meta={
+                "component": "SectionPlanner",
+                "section_id": section_id,
+                "intent_title": section_title,
+            },
         )
 
         intent = self._parse_intent(
@@ -96,6 +106,7 @@ class SectionPlanner:
             section_id=section_id,
             source_dsl_entry_ids=source_dsl_entry_ids,
             dsl_trust_at_generation=dsl_trust_at_generation,
+            word_target=word_target,
         )
 
         # 注册到 DTG 为 intent_node
@@ -114,6 +125,7 @@ class SectionPlanner:
         task_description: str,
         dsl_context: str,
         section_summaries: str,
+        word_target: Optional[int] = None,
     ) -> str:
         """
         构建 SectionIntent 生成 prompt
@@ -128,35 +140,43 @@ class SectionPlanner:
             str：完整 prompt 字符串
         """
         summaries_block = (
-            f"已完成章节摘要：\n{section_summaries}\n\n"
+            f"Completed section summaries:\n{section_summaries}\n\n"
             if section_summaries
             else ""
         )
         dsl_block = (
-            f"当前话语状态（按显著性筛选的前 8 条）：\n{dsl_context}\n\n"
+            f"Current DSL state (top 8 entries by salience):\n{dsl_context}\n\n"
             if dsl_context
             else ""
         )
 
+        word_target_line = (
+            f"Word count target for this section: approximately {word_target} words.\n"
+            if word_target is not None else ""
+        )
         return (
-            "根据以下信息，为即将生成的章节制定局部计划。"
-            "请严格按照 XML 格式输出，不要任何额外文字。\n\n"
-            f"任务目标：{task_description}\n"
-            f"本节大纲职责：{section_title}\n\n"
-            f"{dsl_block}"
+            "Create a local plan for the section that will be written next. "
+            "Output only one JSON object. Do not use markdown code fences, XML, or extra explanation.\n\n"
+            f"Task goal: {task_description}\n"
+            f"Section responsibility: {section_title}\n"
+            f"{word_target_line}"
+            f"\n{dsl_block}"
             f"{summaries_block}"
-            "【重要原则】\n"
-            "1. 本节局部计划必须严格限定在本节大纲职责范围内，不得规划属于后续章节的内容。\n"
-            "2. 如果故事中存在主要冲突，本节应推进该冲突，但不得在本节内完整解决；"
-            "除非本节大纲明确标注为结局节。\n"
-            "3. 已完成章节中已处理的内容不应在本节重复叙述。\n\n"
-            "输出格式：\n"
-            "<local_goal>本节需要实现的具体目标，不超过 50 字</local_goal>\n"
-            "<scope_boundary>本节明确不应涉及的内容（避免越界），不超过 30 字</scope_boundary>\n"
-            "<open_loops_to_advance>本节应推进的未闭合线索，用分号分隔，无则填「无」</open_loops_to_advance>\n"
-            "<commitments_to_maintain>本节必须维护的承诺，用分号分隔，无则填「无」</commitments_to_maintain>\n"
-            "<risks_to_avoid>本节需避免的高风险冲突，用分号分隔，无则填「无」</risks_to_avoid>\n"
-            "<success_criteria>本节通过验证的最低标准（1-2 条），用分号分隔</success_criteria>"
+            "[Important principles]\n"
+            "1. Keep the local plan strictly inside this section's responsibility; do not plan material that belongs to later sections.\n"
+            "2. If there is a main conflict, this section may advance it but must not fully resolve it unless the outline explicitly marks this section as the ending.\n"
+            "3. Do not repeat content that has already been handled in completed sections.\n"
+            "4. The success_criteria must include an explicit word count requirement matching the word count target above.\n\n"
+            "Output format (strict JSON):\n"
+            "{\n"
+            "  \"local_goal\": \"...\",\n"
+            "  \"scope_boundary\": \"...\",\n"
+            "  \"open_loops_to_advance\": [\"...\"],\n"
+            "  \"commitments_to_maintain\": [\"...\"],\n"
+            "  \"risks_to_avoid\": [\"...\"],\n"
+            "  \"success_criteria\": [\"...\"]\n"
+            "}\n"
+            "If a list field is empty, return []. Do not write \"none\". Do not output markdown code fences."
         )
 
     def _parse_intent(
@@ -165,6 +185,7 @@ class SectionPlanner:
         section_id: str,
         source_dsl_entry_ids: List[str],
         dsl_trust_at_generation: float,
+        word_target: Optional[int] = None,
     ) -> SectionIntent:
         """
         解析 LLM 输出的 XML 格式 SectionIntent
@@ -182,22 +203,31 @@ class SectionPlanner:
         返回值：
             SectionIntent 实例
         """
-        def extract(tag: str) -> str:
-            m = re.search(rf"<{tag}>(.*?)</{tag}>", raw, re.DOTALL)
-            return m.group(1).strip() if m else ""
+        payload = self._extract_json_object(raw)
+        if not payload:
+            return self._build_default_intent(section_id, source_dsl_entry_ids, dsl_trust_at_generation, word_target)
 
-        def split_list(text: str) -> List[str]:
-            if not text or text == "无":
-                return []
-            return [item.strip() for item in text.split("；") if item.strip() and item.strip() != "无"]
+        data = self._safe_parse_intent_json(payload)
+        if data is None:
+            return self._build_default_intent(section_id, source_dsl_entry_ids, dsl_trust_at_generation, word_target)
 
-        local_goal = extract("local_goal") or f"完成 {section_id} 节的内容生成"
-        scope_boundary = extract("scope_boundary") or ""
-        open_loops = split_list(extract("open_loops_to_advance"))
-        commitments = split_list(extract("commitments_to_maintain"))
-        risks = split_list(extract("risks_to_avoid"))
-        criteria_raw = extract("success_criteria")
-        success_criteria = split_list(criteria_raw) or ["内容符合节目标，无严重约束违反"]
+        def _norm_list(value) -> List[str]:
+            if isinstance(value, list):
+                return [str(item).strip() for item in value if str(item).strip()]
+            return []
+
+        def _first_value(*keys: str):
+            for key in keys:
+                if key in data:
+                    return data.get(key)
+            return None
+
+        local_goal = str(_first_value("local_goal", "goal") or "").strip() or f"Complete the content for section {section_id}"
+        scope_boundary = str(_first_value("scope_boundary", "scope") or "").strip()
+        open_loops = _norm_list(_first_value("open_loops_to_advance", "open_loops"))
+        commitments = _norm_list(_first_value("commitments_to_maintain", "commitments_to_preserve"))
+        risks = _norm_list(_first_value("risks_to_avoid", "risks"))
+        success_criteria = _norm_list(_first_value("success_criteria", "criteria")) or ["The content matches the section goal and does not violate major constraints."]
 
         return SectionIntent.create(
             section_id=section_id,
@@ -209,4 +239,74 @@ class SectionPlanner:
             success_criteria=success_criteria,
             source_dsl_entry_ids=source_dsl_entry_ids,
             dsl_trust_at_generation=dsl_trust_at_generation,
+            word_target=word_target,
+        )
+
+    def _extract_json_object(self, raw: str) -> Optional[str]:
+        """提取首个合法 JSON 对象文本，失败返回 None"""
+        if not raw:
+            return None
+        raw = raw.strip()
+        # 先尝试整体解析
+        try:
+            json.loads(raw)
+            return raw
+        except Exception:
+            pass
+
+        start = raw.find("{")
+        if start == -1:
+            return None
+        depth = 0
+        for idx in range(start, len(raw)):
+            ch = raw[idx]
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    return raw[start:idx + 1]
+        return None
+
+    def _safe_parse_intent_json(self, payload: str) -> Optional[Dict]:
+        """解析 JSON，失败返回 None"""
+        try:
+            return json.loads(payload)
+        except json.JSONDecodeError:
+            repaired = self._repair_common_json_escapes(payload)
+            if repaired == payload:
+                return None
+            try:
+                return json.loads(repaired)
+            except json.JSONDecodeError:
+                return None
+
+    def _repair_common_json_escapes(self, payload: str) -> str:
+        """
+        Repair common near-JSON escape mistakes emitted by models.
+
+        The main observed failure mode is backslash-escaped apostrophes inside
+        double-quoted JSON strings, such as Alzheimer\'s, which is invalid JSON.
+        """
+        return re.sub(r"\\'", "'", payload)
+
+    def _build_default_intent(
+        self,
+        section_id: str,
+        source_dsl_entry_ids: List[str],
+        dsl_trust_at_generation: float,
+        word_target: Optional[int] = None,
+    ) -> SectionIntent:
+        """构造保守默认 SectionIntent"""
+        return SectionIntent.create(
+            section_id=section_id,
+            local_goal=f"Complete the content for section {section_id}",
+            scope_boundary="",
+            open_loops_to_advance=[],
+            commitments_to_maintain=[],
+            risks_to_avoid=[],
+            success_criteria=["The content matches the section goal and does not violate major constraints."],
+            source_dsl_entry_ids=source_dsl_entry_ids,
+            dsl_trust_at_generation=dsl_trust_at_generation,
+            word_target=word_target,
         )

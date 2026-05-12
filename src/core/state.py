@@ -79,32 +79,32 @@ class GenerationState:
             str：格式化的状态描述字符串
         """
         lines = [
-            "## 当前生成状态",
-            f"- 当前章节：{self.current_section}",
-            f"- 整体进度：{self.progress:.0%}"
-            f"（已完成 {len(self.generated_sections)}/{len(self.outline)} 节）",
+            "## Current Generation State",
+            f"- Current section: {self.current_section}",
+            f"- Overall progress: {self.progress:.0%}"
+            f" ({len(self.generated_sections)}/{len(self.outline)} sections completed)",
         ]
 
         if self.global_constraints:
-            lines.append("\n## 全局约束")
+            lines.append("\n## Global Constraints")
             for c in self.global_constraints:
                 lines.append(f"- {c}")
 
         if self.dsl_injection:
-            lines.append("\n## 话语状态（必须遵守）")
+            lines.append("\n## DSL State To Follow")
             lines.append(self.dsl_injection)
 
         if self.pending_goals:
-            lines.append("\n## 待完成目标")
+            lines.append("\n## Pending Goals")
             for g in self.pending_goals:
                 lines.append(f"- {g}")
 
         if self.generated_sections:
-            lines.append("\n## 已生成章节")
-            lines.append("、".join(self.generated_sections))
+            lines.append("\n## Generated Sections")
+            lines.append(", ".join(self.generated_sections))
 
         if self.flagged_issues:
-            lines.append("\n## 已标记问题（需注意）")
+            lines.append("\n## Flagged Issues")
             for issue in self.flagged_issues:
                 lines.append(f"- {issue}")
 

@@ -463,7 +463,15 @@ class MRSD:
         )
 
         try:
-            raw = self._llm.generate(prompt, temperature=0.0, max_tokens=64)
+            raw = self._llm.generate(
+                prompt,
+                temperature=0.0,
+                max_tokens=32768,
+                log_meta={
+                    "component": "MRSD",
+                    "section_id": decision.target_section,
+                },
+            )
             return self._parse_conflict_json(raw)
         except Exception:
             return "no_conflict", 0.0

@@ -20,7 +20,8 @@ from __future__ import annotations
 
 import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, List
+import json
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 if TYPE_CHECKING:
     from ..core.decision import Decision
@@ -231,6 +232,62 @@ class RunLogger:
         self._write(f"  DSL 信任度：{intent.dsl_trust_at_generation:.3f}")
         self._write("")
 
+    def log_retrieval_event(self, event_type: str, **kwargs: Any) -> None:
+        """
+        记录检索过程中的关键事件（HyDE 伪文档、BM25 匹配情况等）。
+
+        参数：
+            event_type: 事件类型标识，如 "KW_BM25"、"HYDE_BM25"、"MINI_HYDE"
+            **kwargs:   任意键值对，按顺序逐行写入日志
+        """
+        self._write(f"[RETRIEVAL:{event_type}]")
+        for key, value in kwargs.items():
+            if isinstance(value, list):
+                self._write(f"  {key}:")
+                for item in value:
+                    self._write(f"    - {item}")
+            else:
+                text = str(value)
+                # 长文本截取前 300 字符，避免日志膨胀
+                if len(text) > 300:
+                    text = text[:300] + "..."
+                self._write(f"  {key}: {text}")
+        self._write("")
+
+    def log_global_index(self, global_index: Any) -> None:
+        """
+        记录全局参考索引（GlobalPaperIndex）
+
+        参数：
+            global_index: GlobalPaperIndex 对象（含 R1…RN 全局论文列表）
+        """
+        entries = getattr(global_index, "entries", [])
+        self._write(f"[GLOBAL REF INDEX]  total={len(entries)} 篇论文")
+        for entry in entries:
+            r_idx = getattr(entry, "r_index", "?")
+            pid   = getattr(entry, "paper_id", "?")
+            title = getattr(entry, "title", "")
+            score = getattr(entry, "retrieval_score", 0.0)
+            doi   = getattr(entry, "doi", "")
+            self._write(
+                f"  [R{r_idx}] score={score:.3f}  paper={pid}  doi={doi}  title={title[:60]}"
+            )
+        self._write("")
+
+    def log_reference_bundle(self, section_id: str, bundle: Any) -> None:
+        """向后兼容保留（旧架构路径使用）"""
+        items = getattr(bundle, "items", [])
+        query = getattr(bundle, "query", "")
+        self._write(f"[REF BUNDLE]  section={section_id}  items={len(items)}  query={query[:80]}")
+        for item in items:
+            pid   = getattr(item, "paper_id", "?")
+            cid   = getattr(item, "chunk_id", "?")
+            title = getattr(item, "title", "")
+            score = getattr(item, "retrieval_score", 0.0)
+            rank  = getattr(item, "rank", 0)
+            self._write(f"  [{rank}] score={score:.3f}  paper={pid}  chunk={cid}  title={title[:60]}")
+        self._write("")
+
     def log_dsl_injection(self, section_id: str, entries: List[Any]) -> None:
         """
         记录 DSL 注入条目详情
@@ -280,17 +337,100 @@ class RunLogger:
         self._write(f"  DSL 总活跃条目：{total_active_entries}  信任度：{memory_trust:.3f}")
         self._write("")
 
-    def log_section_degraded(self, section_id: str, total_attempts: int) -> None:
+    def log_section_degraded(self, section_id: str, total_attempts: int, reason: str) -> None:
         """
         记录节降级（超过最大重试次数，以最后一次内容继续）
 
         参数：
             section_id: 节 ID
             total_attempts: 本节总尝试次数
+            reason: 降级原因
         """
         self._write(
-            f"[DEGRADED] ✗  节 {section_id} 超过最大重试次数（{total_attempts} 次），以降级内容继续"
+            f"[DEGRADED] ✗  节 {section_id} 超过最大重试次数（{total_attempts} 次），以降级内容继续  原因：{reason}"
         )
+        self._write("")
+
+    def log_postprocess_skipped(self, section_id: str, reason: str) -> None:
+        """记录成功节跳过 postprocess 的原因。"""
+        self._write(f"[POSTPROCESS] 节 {section_id} 跳过后处理，原因：{reason}")
+        self._write("")
+
+    def log_dsl_relation_stats(
+        self,
+        section_id: str,
+        new_entries: int,
+        stats: Dict[str, Any],
+    ) -> None:
+        """记录 section 级 DSL 关系判断统计。"""
+        time_cost_ms = int(stats.get("time_cost_ms", 0))
+        self._write("[DSL RELATION]")
+        self._write(f"  section={section_id}")
+        self._write(f"  new_entries={new_entries}")
+        self._write(f"  raw_pairs_checked={stats.get('raw_pairs_checked', 0)}")
+        self._write(f"  pairs_dedup_skipped={stats.get('pairs_dedup_skipped', 0)}")
+        self._write(f"  pairs_prefilter_none={stats.get('pairs_prefilter_none', 0)}")
+        self._write(f"  pairs_cache_hit={stats.get('pairs_cache_hit', 0)}")
+        self._write(f"  pairs_enqueued={stats.get('pairs_enqueued', 0)}")
+        self._write(f"  pairs_sent_to_llm={stats.get('pairs_sent_to_llm', 0)}")
+        self._write(f"  pairs_none_llm={stats.get('pairs_none_llm', 0)}")
+        self._write(f"  pairs_supports={stats.get('pairs_supports', 0)}")
+        self._write(f"  pairs_conflicts={stats.get('pairs_conflicts', 0)}")
+        self._write(f"  pairs_resolves={stats.get('pairs_resolves', 0)}")
+        self._write(f"  remaining_queue={stats.get('remaining_queue', 0)}")
+        self._write(f"  time_cost={time_cost_ms / 1000.0:.2f}s")
+        self._write("")
+
+    def log_dsl_gate_pair(
+        self,
+        section_id: str,
+        source_id: str,
+        target_id: str,
+        keep: bool,
+        gate_score: float,
+        signals: Dict[str, Any],
+        note: str,
+        source_type: str = "-",
+        target_type: str = "-",
+        source_content: str = "",
+        target_content: str = "",
+    ) -> None:
+        """记录门一对单个 pair 的判定过程。"""
+        self._write("[DSL GATE]")
+        self._write(f"  section={section_id}")
+        self._write(f"  source_id={source_id}")
+        self._write(f"  source_type={source_type}")
+        self._write(f"  source_content={source_content}")
+        self._write(f"  target_id={target_id}")
+        self._write(f"  target_type={target_type}")
+        self._write(f"  target_content={target_content}")
+        self._write(f"  decision={'keep' if keep else 'drop'}")
+        self._write(f"  gate_score={gate_score:.3f}")
+        try:
+            serialized = json.dumps(signals, ensure_ascii=False, sort_keys=True)
+        except Exception:
+            serialized = str(signals)
+        self._write(f"  signals={serialized}")
+        self._write(f"  note={note}")
+        self._write("")
+
+    def log_dsl_relation_result(
+        self,
+        section_id: str,
+        source_id: str,
+        target_id: str,
+        relation_type: str,
+        confidence: float,
+        applied: bool,
+    ) -> None:
+        """记录门二对单个 pair 的关系结果。"""
+        self._write("[DSL RESULT]")
+        self._write(f"  section={section_id}")
+        self._write(f"  source_id={source_id}")
+        self._write(f"  target_id={target_id}")
+        self._write(f"  relation_type={relation_type}")
+        self._write(f"  confidence={confidence:.3f}")
+        self._write(f"  applied={'yes' if applied else 'no'}")
         self._write("")
 
     # ------------------------------------------------------------------
@@ -352,6 +492,36 @@ class RunLogger:
         for line in raw_text.split("\n"):
             self._write("  " + line)
         self._write("[/LLM 原始响应]")
+        self._write("")
+
+    def log_llm_call(
+        self,
+        component: str,
+        section_id: Optional[str],
+        attempt: Optional[int],
+        prompt_text: str,
+        response_text: str,
+        extra: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """记录一次 LLM 调用的 prompt 与响应"""
+        section_label = section_id if section_id is not None else "-"
+        attempt_label = attempt if attempt is not None else "-"
+        self._write(f"[LLM CALL] component={component} section={section_label} attempt={attempt_label}")
+        if extra:
+            try:
+                meta = json.dumps(extra, ensure_ascii=False)
+            except Exception:
+                meta = str(extra)
+            self._write(f"  meta: {meta}")
+        self._write("  [PROMPT]")
+        for line in prompt_text.split("\n"):
+            self._write("    " + line)
+        self._write("  [/PROMPT]")
+        self._write("  [RESPONSE]")
+        for line in response_text.split("\n"):
+            self._write("    " + line)
+        self._write("  [/RESPONSE]")
+        self._write("[/LLM CALL]")
         self._write("")
 
     def log_parsed_decision(
@@ -419,6 +589,15 @@ class RunLogger:
         status = "PASS" if passed else "FAIL"
         self._write(f"  {layer:<16}: {status}  {details}")
 
+    def log_validation_note(
+        self,
+        section_id: str,
+        attempt: int,
+        note: str,
+    ) -> None:
+        """记录验证过程中的附加说明"""
+        self._write(f"    · {note}")
+
     def log_validation_summary(
         self,
         section_id: str,
@@ -441,6 +620,30 @@ class RunLogger:
             self._write(f"  总计: FAIL  阻断问题 {len(blocking)} 个")
             for issue in blocking:
                 self._write(f"    ! [{issue.severity.upper()}] {issue.description}")
+        self._write("")
+
+    def log_reference_validation(self, section_id: str, attempt: int, ref_report: Any) -> None:
+        """
+        记录 section-level 引用验证详情（新架构：纯代码 [Rx] 范围检查）
+
+        参数：
+            section_id: 节 ID
+            attempt: 尝试次数（1-based）
+            ref_report: SectionReferenceReport 对象
+        """
+        self._write("[REF VALIDATION]")
+        self._write(f"  passed          : {getattr(ref_report, 'passed', '?')}")
+        self._write(f"  valid_markers   : {getattr(ref_report, 'valid_marker_count', 0)}")
+        self._write(f"  invalid_markers : {getattr(ref_report, 'invalid_marker_count', 0)}")
+        invalid_r = getattr(ref_report, "invalid_r_indices", set())
+        self._write(f"  invalid_r_set   : {sorted(invalid_r) if invalid_r else '[]'}")
+        issues = getattr(ref_report, "issues", [])
+        if issues:
+            self._write(f"  issues ({len(issues)}):")
+            for issue in issues:
+                sev  = getattr(issue, "severity", "?")
+                desc = getattr(issue, "description", "")
+                self._write(f"    ! [{sev.upper()}] {desc}")
         self._write("")
 
     # ------------------------------------------------------------------

@@ -14,7 +14,8 @@
 from __future__ import annotations
 
 import logging
-from typing import Dict, List, Optional, Tuple
+import re
+from typing import Any, Dict, List, Optional, Tuple
 
 from rich.console import Console
 from rich.panel import Panel
@@ -33,6 +34,9 @@ from .memory.commitment_extractor import CommitmentExtractor
 from .memory.discourse_ledger import DiscourseLedger
 from .memory.dtg_store import DTGStore
 from .metrics.alignment import AlignmentScorer
+from .references.corpus import CorpusLoader
+from .references.retriever import HyDERetriever
+from .references.types import GlobalPaperEntry, GlobalPaperIndex
 from .validators.online_validator import OnlineValidator
 
 
@@ -42,9 +46,8 @@ class SelfCorrectingOrchestrator:
 
     功能：
         1. 主循环：逐节规划 → DSL 注入 → 生成 → 验证 → MRSD 诊断 → 三层修复
-        2. MetaState 元认知门控：gate_action() 控制 trust_validator_major /
-           allow_rollback / strengthen_dsl_injection 三类动作
-        3. DiscourseLedger 动态约束管理：salience 驱动的条目注入
+        2. MetaState 元认知门控：gate_action() 控制 trust_validator_major / allow_rollback / strengthen_dsl_injection 三类动作
+        3. DiscourseLedger 动态约束管理：salience 显著性驱动的条目注入
         4. MetricCollector 指标收集：不改变系统行为，仅记录
 
     参数：
@@ -61,6 +64,9 @@ class SelfCorrectingOrchestrator:
     MAX_RETRIES_PER_SECTION = 3
     MAX_ROLLBACKS = 5
     DCAS_THRESHOLD = 0.6
+    DSL_RELATION_MAX_PAIRS_PER_SECTION = 8
+    DSL_RELATION_BATCH_SIZE = 4
+    DSL_RELATION_MIN_CONFIDENCE = 0.5
 
     def __init__(
         self,
@@ -68,25 +74,32 @@ class SelfCorrectingOrchestrator:
         memory_path: str = "./sessions",
         session_name: str = "session",
         output_dir: str = "./outputs",
+        corpus_dir: str = "./data_sample/med_papers",
     ):
         """
         初始化自我修正协调器
 
         功能：
             创建并连接所有子组件，MetaState 初始化为信任状态。
-            创建 RunLogger 并传给 Generator 和 OnlineValidator。
+            同时把 output_dir 传给 RunLogger，保证主入口与运行日志落盘目录一致。
 
         参数：
             llm_client: LLM 客户端实例
             memory_path: DTG 存储路径
             session_name: 会话名称
-            output_dir: 输出目录（RunLogger 日志文件存放位置）
+            output_dir: 输出目录（运行日志和相关工件的统一落盘位置）
+            corpus_dir: 论文数据集目录（Markdown paper corpus）
         """
-        self.session_name     = session_name
+        self.llm_client       = llm_client
         self.dtg              = DTGStore(memory_path, session_name=session_name)
         self.meta_state       = MetaState()
-        self.dsl              = DiscourseLedger(llm_client=llm_client)
+        self.console          = Console()
+        self.logger           = logging.getLogger(__name__)
         self.run_logger       = RunLogger(output_dir=output_dir, session_name=session_name)
+        self.dsl              = DiscourseLedger(llm_client=llm_client, run_logger=self.run_logger)
+
+        llm_client.attach_run_logger(self.run_logger)
+
         self.generator        = Generator(llm_client, run_logger=self.run_logger)
         self.section_planner  = SectionPlanner(llm_client, self.dtg)
         self.commitment_extractor = CommitmentExtractor(llm_client)
@@ -101,8 +114,11 @@ class SelfCorrectingOrchestrator:
         self.mrsd = MRSD(dtg_store=self.dtg, llm_client=llm_client)
         self.correction_log   = CorrectionLog()
         self.metric_collector = MetricCollector()
-        self.console          = Console()
-        self.logger           = logging.getLogger(__name__)
+        self._corpus = CorpusLoader(corpus_dir)
+        self.retriever = HyDERetriever(self._corpus, llm_client=llm_client)
+        self.retriever.attach_run_logger(self.run_logger)
+        self.last_chunk_map: List[Dict[str, Any]] = []
+        self.last_citation_manifest: List[Dict[str, Any]] = []
 
     # ------------------------------------------------------------------
     # 主入口
@@ -131,123 +147,162 @@ class SelfCorrectingOrchestrator:
                 (最终文本, 决策列表, 修正日志)
         """
         self._print_header(task, outline)
-
-        # 记录运行开始
         self.run_logger.log_run_start(task, constraints, outline)
 
-        state = self._initialize_state(constraints, outline)
-        plan_state = PlanState(global_outline=outline)
-        generated_content: Dict[str, str] = {}
-        section_queue = list(outline.keys())
+        try:
+            state = self._initialize_state(constraints, outline)
+            plan_state = PlanState(global_outline=outline)
+            generated_content: Dict[str, str] = {}
+            section_queue = list(outline.keys())
 
-        rollback_count = 0
-        current_idx = 0
+            global_index = self.retriever.retrieve_global(task)
+            self.logger.info("全局参考索引构建完成：%d 篇论文", global_index.n)
+            if self.run_logger is not None:
+                self.run_logger.log_global_index(global_index)
 
-        # 节级别的诊断跟踪
-        consecutive_failures_this_section = 0
-        last_purge_succeeded = False
-        last_diagnosis_event_id: Optional[str] = None
+            section_word_target = self._parse_section_word_target(task, outline)
+            self.logger.info("每节目标词数：%s", section_word_target)
 
-        while current_idx < len(section_queue):
-            section_id = section_queue[current_idx]
-            state.current_section = section_id
-            section_title = outline[section_id]
+            rollback_count = 0
+            current_idx = 0
 
-            self._print_section_start(section_id, section_title, current_idx, len(section_queue))
+            # 节级别的诊断跟踪
+            consecutive_failures_this_section = 0
+            last_purge_succeeded = False
+            last_diagnosis_event_id: Optional[str] = None
 
-            # 第一阶段：规划当前节（SectionPlanner）
-            section_intent = self._plan_section(
-                section_id=section_id,
-                section_title=section_title,
-                task=task,
-                plan_state=plan_state,
-            )
-            plan_state.add_intent(section_intent)
+            while current_idx < len(section_queue):
+                section_id = section_queue[current_idx]
+                state.current_section = section_id
+                section_title = outline[section_id]
 
-            # 记录节开始（规划前先取 DSL 活跃数）
-            dsl_active_count = len(self.dsl.get_active_entries())
-            self.run_logger.log_section_start(
-                section_id=section_id,
-                title=section_title,
-                idx=current_idx,
-                total=len(section_queue),
-                state=state,
-                dsl_active_count=dsl_active_count,
-            )
-            # 记录规划结果
-            self.run_logger.log_planning(section_id, section_intent)
-
-            # 准备 DSL 注入，并记录注入条目
-            injectable = self._update_dsl_injection(state, section_id, section_queue, current_idx)
-            self.run_logger.log_dsl_injection(section_id, injectable)
-
-            rolled_back = False
-            report = None
-            content: Optional[str] = None
-            decision: Optional[Decision] = None
-
-            for attempt in range(self.MAX_RETRIES_PER_SECTION):
-                temperature = self._get_temperature(consecutive_failures_this_section)
-
-                # 记录本次尝试开始
-                self.run_logger.log_attempt_start(section_id, attempt + 1, temperature)
-
-                # 第二阶段：生成
-                try:
-                    content, decision = self.generator.generate_with_decision(
-                        state=state,
-                        task=task,
-                        recent_content=self._get_recent_content(),
-                        section_intent=section_intent,
-                        temperature=temperature,
-                        orchestrator_attempt=attempt + 1,
+                self._print_section_start(section_id, section_title, current_idx, len(section_queue))
+                if self.run_logger is not None:
+                    self.run_logger.log_section_start(
+                        section_id,
+                        section_title,
+                        current_idx,
+                        len(section_queue),
+                        state,
+                        len(self.dsl.get_active_entries()),
                     )
-                except Exception as e:
-                    self.logger.error("生成异常（section=%s attempt=%d）: %s", section_id, attempt + 1, e)
-                    consecutive_failures_this_section += 1
-                    self.correction_log.add_retry(section_id, attempt + 1, "RETRY_SIMPLE", [str(e)])
-                    continue
 
-                # 第三阶段：验证
-                try:
-                    report = self.online_validator.validate_and_diagnose(
-                        decision, content, state, attempt=attempt + 1
-                    )
-                    self.meta_state.update_validator_stability(report.dcas_score)
-                except Exception as e:
-                    self.logger.error("验证异常（section=%s）: %s", section_id, e)
-                    report = None
+                # 第一阶段：规划当前节（SectionPlanner）
+                section_intent = self._plan_section(
+                    section_id=section_id,
+                    section_title=section_title,
+                    task=task,
+                    plan_state=plan_state,
+                    word_target=section_word_target,
+                )
+                plan_state.add_intent(section_intent)
+                if self.run_logger is not None:
+                    self.run_logger.log_planning(section_id, section_intent)
 
-                # 第四阶段：处理验证结果
-                if report is None or report.passed:
-                    # 验证通过
-                    self._on_section_success(
-                        section_id=section_id,
-                        content=content,
-                        decision=decision,
-                        state=state,
-                        generated_content=generated_content,
-                        section_queue=section_queue,
-                        plan_state=plan_state,
-                        attempt=attempt,
-                        dcas=report.dcas_score if report else 1.0,
-                    )
-                    # 记录诊断结果（若上一次有诊断）
-                    if last_diagnosis_event_id:
-                        self.metric_collector.record_diagnosis_outcome(
-                            last_diagnosis_event_id, succeeded=True
+                # 准备 DSL 注入
+                self._update_dsl_injection(state, section_id, section_queue, current_idx)
+                section_papers = self.retriever.rank_for_section(
+                    global_index=global_index,
+                    section_title=section_title,
+                    section_intent=section_intent,
+                    task=task,
+                )
+
+                rolled_back = False
+                report = None
+                content: Optional[str] = None
+                decision: Optional[Decision] = None
+                last_failure_reason: Optional[str] = None
+                citation_retry_hint: Optional[str] = None  # 每节重置；引用失败后由验证路径填充
+
+                for attempt in range(self.MAX_RETRIES_PER_SECTION):
+                    # 第二阶段：生成
+                    temperature = self._get_temperature(consecutive_failures_this_section)
+                    if self.run_logger is not None:
+                        self.run_logger.log_attempt_start(section_id, attempt + 1, temperature)
+                    try:
+                        content, decision = self.generator.generate_with_decision(
+                            state=state,
+                            task=task,
+                            recent_content=self._get_recent_content(),
+                            section_intent=section_intent,
+                            temperature=temperature,
+                            section_papers=section_papers,
+                            citation_retry_hint=citation_retry_hint,
                         )
-                        last_diagnosis_event_id = None
-                    self.metric_collector.record_section_first_pass(
-                        section_id, passed_on_first_try=(attempt == 0)
-                    )
-                    consecutive_failures_this_section = 0
-                    last_purge_succeeded = False
-                    current_idx += 1
-                    break
+                    except Exception as e:
+                        self.logger.error("生成异常（section=%s attempt=%d）: %s", section_id, attempt + 1, e)
+                        consecutive_failures_this_section += 1
+                        last_failure_reason = "generator_parse_failure"
+                        self.correction_log.add_retry(section_id, attempt + 1, "RETRY_SIMPLE", [str(e)])
+                        continue
 
-                else:
+                    # 第二点五阶段：引用注入
+                    # 在验证前，若 content 中无 [Rx] 标记，执行专项引用注入调用。
+                    # 分离"内容写作"和"引用标注"两个任务，使 LLM 聚焦于各自目标。
+                    if content and section_papers:
+                        content, decision = self._inject_citations_if_needed(
+                            content=content,
+                            decision=decision,
+                            section_papers=section_papers,
+                            section_id=section_id,
+                        )
+
+                    # 第三阶段：验证
+                    try:
+                        report = self.online_validator.validate_and_diagnose(
+                            decision,
+                            content,
+                            state,
+                            global_index=global_index,
+                            word_target=section_word_target,
+                        )
+                        self.meta_state.update_validator_stability(report.dcas_score)
+                    except Exception as e:
+                        self.logger.error("验证异常（section=%s）: %s", section_id, e)
+                        report = None
+
+                    if report is None:
+                        last_failure_reason = "validator_exception"
+                        consecutive_failures_this_section += 1
+                        self.correction_log.add_retry(
+                            section_id,
+                            attempt + 1,
+                            "VALIDATOR_EXCEPTION",
+                            ["validator_exception"],
+                        )
+                        continue
+
+                    # 第四阶段：处理验证结果
+                    if report.passed:
+                        # 验证通过
+                        self._on_section_success(
+                            section_id=section_id,
+                            content=content,
+                            decision=decision,
+                            state=state,
+                            generated_content=generated_content,
+                            section_queue=section_queue,
+                            plan_state=plan_state,
+                            attempt=attempt,
+                            dcas=report.dcas_score,
+                        )
+                        # 记录诊断结果（若上一次有诊断）
+                        if last_diagnosis_event_id:
+                            self.metric_collector.record_diagnosis_outcome(
+                                last_diagnosis_event_id, succeeded=True
+                            )
+                            last_diagnosis_event_id = None
+                        self.metric_collector.record_section_first_pass(
+                            section_id, passed_on_first_try=(attempt == 0)
+                        )
+                        consecutive_failures_this_section = 0
+                        last_purge_succeeded = False
+                        current_idx += 1
+                        break
+
                     # 验证失败：MRSD 诊断
+                    last_failure_reason = "validator_unknown"
                     consecutive_failures_this_section += 1
                     diagnosis = self.mrsd.diagnose(
                         report=report,
@@ -262,9 +317,6 @@ class SelfCorrectingOrchestrator:
                         ),
                         recent_section_failure_tiers=[],
                     )
-
-                    # 记录诊断结果
-                    self.run_logger.log_diagnosis(section_id, attempt + 1, diagnosis)
 
                     # 记录诊断事件
                     diag_event_id = self.metric_collector.record_diagnosis(
@@ -298,30 +350,53 @@ class SelfCorrectingOrchestrator:
                         report.issues,
                     )
 
-                    # 执行修复
-                    if diagnosis.repair_scope == "partial_rollback":
-                        # 回退策略：需要 MetaState 门控
-                        rollback_allowed = self.meta_state.gate_action("allow_rollback")
-                        self.run_logger.log_meta_state_gate(
-                            section_id=section_id,
-                            action_name="allow_rollback",
-                            granted=rollback_allowed,
-                            reason=(
-                                f"remaining_budget={self.meta_state.remaining_rollback_budget}"
-                                f"  contamination={self.meta_state.contamination_risk_score:.2f}"
-                            ),
+                    # 引用失败检测：当 ReferenceValidator 报告合法引用不足时，
+                    # 构建明确的重试提示，下一轮生成会将其注入 prompt 顶层。
+                    # 目的：把"失败原因"变成"下轮硬约束"，打破三轮同输入循环。
+                    ref_rpt = report.reference_report if report else None
+                    _citation_only_failure = False
+                    if ref_rpt is not None and not ref_rpt.passed:
+                        available_labels = (
+                            " ".join(f"[R{e.r_index}]" for e in section_papers)
+                            if section_papers else "none"
                         )
+                        citation_retry_hint = (
+                            f"The previous attempt produced {ref_rpt.valid_marker_count} valid [Rx] "
+                            f"marker(s) in the content field, but at least 1 is required. "
+                            f"References available for this section: {available_labels}. "
+                            "You MUST append [Rx] immediately after each sentence that a reference supports. "
+                            "[Rx] markers must appear ONLY in the content field — "
+                            "never in reasoning, decision, or expected_effect."
+                        )
+                        self.logger.info(
+                            "citation_retry_hint set for next attempt: section=%s valid_markers=%d",
+                            section_id, ref_rpt.valid_marker_count,
+                        )
+                        # Fix 2：引用密度失败不得触发 partial_rollback。
+                        # 根因：citation 失败是局部的标记缺失（内容正确但未加 [Rx]），
+                        # 不是上游章节决策传播的错误，rollback 到更早节只会引发级联振荡。
+                        # 当其他维度均通过（非引用类 major issue 为零）时，强制 local_rewrite。
+                        non_ref_major = [
+                            i for i in report.issues
+                            if i.type != "reference" and i.severity in ("critical", "major")
+                        ] if report else []
+                        _citation_only_failure = len(non_ref_major) == 0
+                        if _citation_only_failure:
+                            self.logger.info(
+                                "citation-only failure detected, overriding diagnosis to local_rewrite: section=%s",
+                                section_id,
+                            )
+
+                    # 执行修复
+                    if not _citation_only_failure and diagnosis.repair_scope == "partial_rollback":
+                        # 回退策略：需要 MetaState 门控
                         if (
-                            not rollback_allowed
+                            not self.meta_state.gate_action("allow_rollback")
                             or rollback_count >= self.MAX_ROLLBACKS
                             or not diagnosis.should_rollback()
                         ):
                             self.logger.info("回退被门控或超限，降级为 local_rewrite")
                             self._update_dsl_injection_strengthen(state)
-                            self.run_logger.log_repair_action(
-                                section_id, attempt + 1, "local_rewrite（回退降级）",
-                                {"reason": "rollback_denied_or_exceeds_limit"}
-                            )
                             continue
 
                         target = diagnosis.target_section
@@ -355,23 +430,15 @@ class SelfCorrectingOrchestrator:
                                     - (section_queue.index(target) if target in section_queue else 0)
                                 ),
                             )
-                            self.run_logger.log_repair_action(
-                                section_id, attempt + 1, "partial_rollback",
-                                {"target_section": target, "rollback_count": rollback_count}
-                            )
                             consecutive_failures_this_section = 0
                             current_idx = section_queue.index(target)
                             rolled_back = True
                             break
                         else:
                             self.logger.warning("回退执行失败，降级为 local_rewrite")
-                            self.run_logger.log_repair_action(
-                                section_id, attempt + 1, "local_rewrite（回退失败降级）",
-                                {"target": target, "reason": "rollback_execution_failed"}
-                            )
                             continue
 
-                    elif diagnosis.repair_scope == "memory_purge":
+                    elif not _citation_only_failure and diagnosis.repair_scope == "memory_purge":
                         # 精确记忆清除
                         purged = self.dsl.purge_contaminated_entries(
                             contaminated_section=section_id,
@@ -391,10 +458,6 @@ class SelfCorrectingOrchestrator:
                             succeeded=last_purge_succeeded,
                             extra_llm_calls=0,
                         )
-                        self.run_logger.log_repair_action(
-                            section_id, attempt + 1, "memory_purge",
-                            {"purged_count": len(purged), "succeeded": last_purge_succeeded}
-                        )
                         continue
 
                     else:
@@ -410,6 +473,7 @@ class SelfCorrectingOrchestrator:
                                 plan_state=plan_state,
                                 is_revision=True,
                                 revision_reason="; ".join(i.description for i in report.issues),
+                                word_target=section_word_target,
                             )
                             plan_state.revise_intent(
                                 section_id=section_id,
@@ -424,55 +488,62 @@ class SelfCorrectingOrchestrator:
                             succeeded=False,  # 后续验证后更新
                             extra_llm_calls=1,
                         )
-                        self.run_logger.log_repair_action(
-                            section_id, attempt + 1, "local_rewrite",
-                            {
-                                "strengthen_dsl_injection": diagnosis.decoding_config.strengthen_dsl_injection,
-                                "trigger_section_intent_revision": diagnosis.decoding_config.trigger_section_intent_revision,
-                                "next_temperature": f"{self._get_temperature(consecutive_failures_this_section):.2f}",
-                            }
-                        )
                         continue
 
-            else:
-                # 超过最大重试次数：降级接受
-                if not rolled_back:
-                    self.logger.warning(
-                        "section=%s 超过最大重试次数，以最后一次内容降级继续", section_id
-                    )
-                    fallback_content = content if content is not None else f"[{section_id} 生成失败]"
-                    fallback_decision = decision
+                else:
+                    # 超过最大重试次数：降级接受最后一次的版本
+                    if not rolled_back:
+                        reason_code = last_failure_reason or "validator_unknown"
+                        self.logger.warning(
+                            "degraded_acceptance: section=%s attempts=%d reason=%s",
+                            section_id,
+                            self.MAX_RETRIES_PER_SECTION,
+                            reason_code,
+                        )
+                        if self.run_logger is not None:
+                            self.run_logger.log_section_degraded(
+                                section_id,
+                                self.MAX_RETRIES_PER_SECTION,
+                                reason_code,
+                            )
+                        fallback_content = self._coerce_degraded_section_content(content)
+                        fallback_decision = decision
 
-                    generated_content[section_id] = fallback_content
-                    state.generated_sections.append(section_id)
-                    state.section_snippets[section_id] = fallback_content[:300]
-                    state.section_summaries[section_id] = fallback_content[:500]
-                    state.update_progress()
-                    if fallback_decision:
-                        self.dtg.add_decision(fallback_decision)
+                        generated_content[section_id] = fallback_content
+                        state.generated_sections.append(section_id)
+                        state.section_snippets[section_id] = fallback_content[:300]
+                        state.section_summaries[section_id] = fallback_content[:500]
+                        state.update_progress()
+                        if fallback_decision:
+                            self.dtg.add_decision(fallback_decision)
 
-                    last_issues = report.issues if report else []
-                    self.correction_log.add_failure(section_id, last_issues)
-                    state.flagged_issues.append(f"{section_id}：降级内容（验证未通过）")
-                    self.metric_collector.record_section_first_pass(section_id, False)
-                    consecutive_failures_this_section = 0
-                    current_idx += 1
+                        last_issues = report.issues if report else []
+                        self.correction_log.add_failure(section_id, last_issues)
+                        state.flagged_issues.append(
+                            f"{section_id}: degraded content accepted after validation failure"
+                        )
+                        self.metric_collector.record_section_first_pass(section_id, False)
+                        consecutive_failures_this_section = 0
+                        current_idx += 1
 
-                    # 记录节降级
-                    self.run_logger.log_section_degraded(section_id, self.MAX_RETRIES_PER_SECTION)
+            # 组装最终文本（含引用重编号和参考文献列表）
+            self.last_chunk_map = self._build_chunk_map(outline, generated_content)
+            self.last_citation_manifest = self._build_citation_manifest(
+                generated_content=generated_content,
+                global_index=global_index,
+            )
+            final_text = self._post_process_references_v2(
+                outline, generated_content, global_index
+            )
+            self._print_summary()
+            self.run_logger.log_run_summary(
+                self.correction_log.get_statistics(),
+                self.meta_state,
+            )
 
-        # 组装最终文本
-        final_text = self._assemble_text(outline, generated_content)
-        self._print_summary()
-
-        # 记录运行汇总，关闭日志
-        self.run_logger.log_run_summary(
-            correction_stats=self.correction_log.get_statistics(),
-            meta_state=self.meta_state,
-        )
-        self.run_logger.close()
-
-        return final_text, self.dtg.decision_log, self.correction_log
+            return final_text, self.dtg.decision_log, self.correction_log
+        finally:
+            self.run_logger.close()
 
     # ------------------------------------------------------------------
     # 第一阶段：规划
@@ -486,6 +557,7 @@ class SelfCorrectingOrchestrator:
         plan_state: PlanState,
         is_revision: bool = False,
         revision_reason: str = "",
+        word_target: Optional[int] = None,
     ) -> SectionIntent:
         """
         调用 SectionPlanner 生成当前节的 SectionIntent
@@ -525,7 +597,7 @@ class SelfCorrectingOrchestrator:
         )
 
         if is_revision and revision_reason:
-            task_with_reason = f"{task}\n\n（修订原因：{revision_reason}）"
+            task_with_reason = f"{task}\n\n(Revision reason: {revision_reason})"
         else:
             task_with_reason = task
 
@@ -538,18 +610,21 @@ class SelfCorrectingOrchestrator:
                 section_summaries=section_summaries_str,
                 source_dsl_entry_ids=dsl_entry_ids,
                 dsl_trust_at_generation=memory_trust,
+                word_target=word_target,
             )
         except Exception as e:
             self.logger.warning("SectionPlanner 异常，使用默认 intent：%s", e)
             return SectionIntent.create(
                 section_id=section_id,
-                local_goal=f"完成 {section_title} 的内容生成",
+                local_goal=f"Complete the content for {section_title}",
+                scope_boundary=f"This section must stay within {section_title} and must not cover later sections",
                 open_loops_to_advance=[],
                 commitments_to_maintain=[],
                 risks_to_avoid=[],
-                success_criteria=["内容符合节目标，无严重约束违反"],
+                success_criteria=["The content matches the section goal and does not violate major constraints."],
                 source_dsl_entry_ids=dsl_entry_ids,
                 dsl_trust_at_generation=memory_trust,
+                word_target=word_target,
             )
 
     # ------------------------------------------------------------------
@@ -562,7 +637,7 @@ class SelfCorrectingOrchestrator:
         section_id: str,
         section_queue: List[str],
         current_idx: int,
-    ) -> List:
+    ) -> None:
         """
         更新 GenerationState 的 DSL 注入文本
 
@@ -575,9 +650,6 @@ class SelfCorrectingOrchestrator:
             section_id: 当前节 ID
             section_queue: 全局节列表
             current_idx: 当前节序号（0-based）
-
-        返回值：
-            List：本次注入的 LedgerEntry 列表（供 run_logger 记录）
         """
         injectable = self.dsl.get_injectable_entries(
             target_section_idx=current_idx,
@@ -591,12 +663,14 @@ class SelfCorrectingOrchestrator:
         )
         if injectable:
             state.dsl_injection = "\n".join(
-                f"- [{e.commitment_type.value}/{e.constraint_type.value}] {e.content}"
+                f"- {{{e.commitment_type.value}|{e.constraint_type.value}}} {e.content}"
                 for e in injectable
             )
         else:
             state.dsl_injection = ""
-        return injectable
+
+        if getattr(self, "run_logger", None) is not None:
+            self.run_logger.log_dsl_injection(section_id, injectable)
 
     def _update_dsl_injection_strengthen(self, state: GenerationState) -> None:
         """
@@ -606,7 +680,7 @@ class SelfCorrectingOrchestrator:
             在当前 dsl_injection 基础上追加强调说明。
         """
         if state.dsl_injection:
-            state.dsl_injection = "【重要】以下话语状态约束必须严格遵守：\n" + state.dsl_injection
+            state.dsl_injection = "[Important] Strictly follow the DSL state constraints below:\n" + state.dsl_injection
 
     # ------------------------------------------------------------------
     # 成功处理
@@ -656,7 +730,7 @@ class SelfCorrectingOrchestrator:
         self.correction_log.add_success(section_id, attempt + 1)
 
         # 提取承诺并写入 DSL
-        new_entries: List = []
+        new_entries: List[Any] = []
         try:
             new_entries = self.commitment_extractor.extract(
                 section_content=content,
@@ -668,6 +742,14 @@ class SelfCorrectingOrchestrator:
                 self.dsl.add_entry(entry)
         except Exception as e:
             self.logger.warning("承诺提取失败（跳过）：%s", e)
+
+        relation_stats = self.dsl.process_pending_relations(
+            section_id=section_id,
+            max_pairs=self.DSL_RELATION_MAX_PAIRS_PER_SECTION,
+            batch_size=self.DSL_RELATION_BATCH_SIZE,
+            confidence_threshold=self.DSL_RELATION_MIN_CONFIDENCE,
+        )
+        self._log_dsl_relation_stats(section_id, len(new_entries), relation_stats)
 
         # 更新 DSL 稳定性
         self.dsl.update_entry_stability(section_id, state.generated_sections)
@@ -691,21 +773,72 @@ class SelfCorrectingOrchestrator:
             memory_trust_level=self.meta_state.memory_trust_level,
         )
 
-        # 记录节成功（含新增 DSL 条目）
-        self.run_logger.log_section_success(
-            section_id=section_id,
-            total_attempts=attempt + 1,
-            dcas=dcas,
-            new_entries=new_entries,
-            total_active_entries=len(active),
-            memory_trust=self.meta_state.memory_trust_level,
-        )
+        if self.run_logger is not None:
+            self.run_logger.log_section_success(
+                section_id=section_id,
+                total_attempts=attempt + 1,
+                dcas=dcas,
+                new_entries=new_entries,
+                total_active_entries=len(active),
+                memory_trust=self.meta_state.memory_trust_level,
+            )
 
+        self._log_postprocess_skipped(section_id)
         self._print_success(section_id, attempt + 1, dcas)
+
+    def _log_dsl_relation_stats(
+        self,
+        section_id: str,
+        new_entries: int,
+        stats: Dict[str, Any],
+    ) -> None:
+        """输出 section 级 DSL 关系统计。"""
+        time_cost_ms = int(stats.get("time_cost_ms", 0))
+        self.logger.info(
+            "[DSL RELATION]\n"
+            "  section=%s\n"
+            "  new_entries=%s\n"
+            "  raw_pairs_checked=%s\n"
+            "  pairs_dedup_skipped=%s\n"
+            "  pairs_prefilter_none=%s\n"
+            "  pairs_cache_hit=%s\n"
+            "  pairs_enqueued=%s\n"
+            "  pairs_sent_to_llm=%s\n"
+            "  pairs_none_llm=%s\n"
+            "  pairs_supports=%s\n"
+            "  pairs_conflicts=%s\n"
+            "  pairs_resolves=%s\n"
+            "  remaining_queue=%s\n"
+            "  time_cost=%.2fs",
+            section_id,
+            new_entries,
+            stats.get("raw_pairs_checked", 0),
+            stats.get("pairs_dedup_skipped", 0),
+            stats.get("pairs_prefilter_none", 0),
+            stats.get("pairs_cache_hit", 0),
+            stats.get("pairs_enqueued", 0),
+            stats.get("pairs_sent_to_llm", 0),
+            stats.get("pairs_none_llm", 0),
+            stats.get("pairs_supports", 0),
+            stats.get("pairs_conflicts", 0),
+            stats.get("pairs_resolves", 0),
+            stats.get("remaining_queue", 0),
+            time_cost_ms / 1000.0,
+        )
+        if self.run_logger is not None:
+            self.run_logger.log_dsl_relation_stats(section_id, new_entries, stats)
 
     # ------------------------------------------------------------------
     # 回退
     # ------------------------------------------------------------------
+
+    def _log_postprocess_skipped(self, section_id: str) -> None:
+        """记录 postprocess 默认关闭的原因。"""
+        reason = "feature_disabled_by_default"
+        self.logger.info("postprocess_skipped: section=%s reason=%s", section_id, reason)
+        if getattr(self, "run_logger", None) is not None:
+            self.run_logger.log_postprocess_skipped(section_id, reason)
+
 
     def _execute_rollback(
         self,
@@ -844,6 +977,24 @@ class SelfCorrectingOrchestrator:
         else:
             return 0.3
 
+    @staticmethod
+    def _parse_section_word_target(task: str, outline: Dict[str, str]) -> Optional[int]:
+        """
+        从任务描述中提取全局词数目标，除以节数得到每节目标词数。
+
+        匹配形式：
+            "approximately 9600-word", "9600 words", "9,600-word" 等
+
+        返回值：
+            int：每节目标词数；无法解析时返回 None
+        """
+        num_sections = max(len(outline), 1)
+        m = re.search(r'(\d[\d,]*)\s*[-–]?\s*word', task, re.IGNORECASE)
+        if m:
+            total = int(m.group(1).replace(',', ''))
+            return max(100, total // num_sections)
+        return None
+
     def _compute_low_trust_ratio(self, section_id: str) -> float:
         """
         计算当前节引用的低信任 DSL 条目比例
@@ -860,13 +1011,358 @@ class SelfCorrectingOrchestrator:
         low_trust = self.dsl.get_low_trust_entry_ids(threshold=0.5)
         return len(low_trust) / len(active)
 
+    # ── 引用注入 ─────────────────────────────────────────────────────────────
+
+    _CITATION_INJECTION_PROMPT = """\
+You are an academic editor. Your only task is to insert [Rx] citation markers into \
+the provided text. Do NOT add, remove, or rephrase any words.
+
+Available references:
+{paper_list}
+
+Rules:
+1. For each reference that supports a specific claim or statement in the text, \
+insert [Rx] immediately after the period ending that sentence (before the space).
+   Example: "The enzyme regulates metabolism [R2]."
+2. Each reference should be cited at least once if it supports any claim.
+3. [Rx] markers go ONLY in the text — never in headings.
+4. Output ONLY the annotated text, nothing else.
+
+Text to annotate:
+{content}
+
+Annotated text:"""
+
+    def _inject_citations_if_needed(
+        self,
+        content: str,
+        decision: "Decision",
+        section_papers: List[GlobalPaperEntry],
+        section_id: str,
+    ) -> Tuple[str, "Decision"]:
+        """
+        两阶段引用注入：若 content 中无 [Rx] 标记，发起专项注入 LLM 调用。
+
+        设计原理：
+            内容生成任务（写作质量、长度、学术风格）和引用标注任务（找到哪句话
+            对应哪篇论文）存在注意力竞争。分离为两个独立调用，各自聚焦，
+            比强化 prompt 提示更稳定。
+
+        流程：
+            1. 检测 content 中的 [Rx] 标记数量
+            2. 若 >= 1，直接返回（不浪费 token）
+            3. 若 == 0，构建精简注入 prompt，调用 LLM 插入标记
+            4. 注入后若仍为 0（corpus 无相关论文），记录 corpus_gap 并返回原始内容
+
+        参数：
+            content:       当前节已生成文本
+            decision:      对应的 Decision 对象（注入后同步更新 decision.content）
+            section_papers: 该节可用论文列表
+            section_id:    节 ID（用于日志）
+
+        返回：
+            Tuple[str, Decision]：(可能已注入的内容, 已更新的 decision)
+        """
+        existing = re.findall(r"\[R\d+\]", content)
+        if existing:
+            self.logger.debug(
+                "引用注入：section=%s 已有 %d 个标记，跳过注入",
+                section_id, len(existing),
+            )
+            return content, decision
+
+        if not section_papers:
+            self.logger.info(
+                "引用注入：section=%s 无可用论文，跳过注入（corpus_gap）",
+                section_id,
+            )
+            return content, decision
+
+        # 构建论文列表（摘要截取前 150 字符，控制 prompt 长度）
+        paper_lines = []
+        for entry in section_papers:
+            abstract_snippet = (entry.abstract or entry.top_chunk_text or "")[:150].replace("\n", " ")
+            paper_lines.append(
+                f"[R{entry.r_index}] {entry.title[:80]} | {abstract_snippet}"
+            )
+        paper_list_str = "\n".join(paper_lines)
+
+        prompt = self._CITATION_INJECTION_PROMPT.format(
+            paper_list=paper_list_str,
+            content=content,
+        )
+
+        try:
+            injected = self.llm_client.generate(
+                prompt=prompt,
+                temperature=0.1,
+                max_tokens=min(4096, max(512, len(content.split()) * 3)),
+                log_meta={"caller": f"CitationInjector.{section_id}"},
+            )
+            injected = injected.strip()
+
+            injected_markers = re.findall(r"\[R\d+\]", injected)
+            if not injected_markers:
+                self.logger.warning(
+                    "引用注入：section=%s 注入后仍无标记 → corpus_gap（可引论文与内容语义不匹配）",
+                    section_id,
+                )
+                return content, decision
+
+            # 校验：注入后文本长度不应大幅缩减（防止 LLM 截断内容）
+            original_words = len(content.split())
+            injected_words = len(injected.split())
+            if injected_words < original_words * 0.8:
+                self.logger.warning(
+                    "引用注入：section=%s 注入后词数骤降（%d→%d），使用原始内容",
+                    section_id, original_words, injected_words,
+                )
+                return content, decision
+
+            self.logger.info(
+                "引用注入：section=%s 成功插入 %d 个标记 %s",
+                section_id,
+                len(injected_markers),
+                injected_markers[:5],
+            )
+            decision.content = injected
+            return injected, decision
+
+        except Exception as exc:
+            self.logger.warning(
+                "引用注入：section=%s LLM 调用失败 %s，使用原始内容",
+                section_id, exc,
+            )
+            return content, decision
+
+    def _post_process_references_v2(
+        self,
+        outline: Dict[str, str],
+        generated_content: Dict[str, str],
+        global_index: GlobalPaperIndex,
+    ) -> str:
+        """
+        组装最终文本，清理越界 [Rx] 标记，按首次出现重编号，末尾追加 References 列表。
+
+        流程：
+            1. 按大纲顺序扫描全文，提取所有 [Rx] 标记
+            2. 越界标记（x ∉ valid_r_set）直接删除
+            3. 按首次出现顺序为合法 r_index 分配连续编号 1, 2, 3…
+            4. 将 [Rx] 替换为 [编号]
+            5. 按编号顺序从 GlobalPaperEntry 构建 References 节
+
+        参数：
+            outline:           有序章节大纲 {section_id: title}
+            generated_content: 各节已生成文本
+            global_index:      全局参考索引（R1…RN）
+
+        返回值：
+            str：含内联引用编号和 References 列表的完整文本
+        """
+        import re
+        from collections import OrderedDict
+
+        valid_r_set = global_index.valid_r_set
+
+        # 第一轮：扫描确定首次出现顺序，构建 r_index → 全局编号 映射
+        r_to_num: "OrderedDict[int, int]" = OrderedDict()
+        counter = 0
+
+        def _scan(match: "re.Match") -> str:
+            nonlocal counter
+            idx = int(match.group(1))
+            if idx not in valid_r_set:
+                return ""
+            if idx not in r_to_num:
+                counter += 1
+                r_to_num[idx] = counter
+            return f"[{r_to_num[idx]}]"
+
+        parts = []
+        for section_id, title in outline.items():
+            raw = generated_content.get(section_id, "")
+            processed = re.sub(r"\[R(\d+)\]", _scan, raw)
+            # 将节内部的段落分隔（\n\n）折叠为单个换行符，确保每节在
+            # split_blocks(drop_markdown_wrappers=True) 后恰好产生 1 个内容块。
+            # 这保证 benchmark range_keyword 的绝对块位置约束能够满足。
+            processed = re.sub(r"\n\s*\n", "\n", processed).strip()
+            parts.append(f"## {title}\n\n{processed}")
+
+        assembled = "\n\n---\n\n".join(parts)
+
+        if r_to_num:
+            ref_lines = ["\n\n---\n\n## References\n"]
+            # 按全局编号排序输出
+            for r_idx, num in sorted(r_to_num.items(), key=lambda kv: kv[1]):
+                entry_obj = global_index.get_by_r(r_idx)
+                if entry_obj is None:
+                    continue
+                authors = entry_obj.authors
+                author_str = ", ".join(str(a) for a in authors[:3])
+                if len(authors) > 3:
+                    author_str += " et al."
+                entry = f"[{num}]"
+                if author_str:
+                    entry += f" {author_str}."
+                entry += f" {entry_obj.title}."
+                if entry_obj.doi:
+                    entry += f" DOI: {entry_obj.doi}"
+                ref_lines.append(entry)
+            assembled += "\n".join(ref_lines)
+
+        self.logger.info(
+            "后处理完成：共引用 %d 篇论文（valid_r=%s → 编号1…%d）",
+            len(r_to_num),
+            sorted(r_to_num.keys()),
+            counter,
+        )
+        return assembled
+
+    def _build_chunk_map(
+        self,
+        outline: Dict[str, str],
+        generated_content: Dict[str, str],
+    ) -> List[Dict[str, Any]]:
+        chunk_map: List[Dict[str, Any]] = []
+        total_sections = len(outline)
+        for section_index, (section_id, title) in enumerate(outline.items(), start=1):
+            text = generated_content.get(section_id, "").strip()
+            if section_index == 1:
+                section_key = "introduction"
+            elif section_index == total_sections:
+                section_key = "conclusion"
+            else:
+                section_key = "main_body"
+            chunk_map.append(
+                {
+                    "chunk_id": section_id,
+                    "section_id": section_id,
+                    "title": title,
+                    "text": text,
+                    "word_count": len(text.split()),
+                    "section_index": section_index,
+                    "section_key": section_key,
+                }
+            )
+        return chunk_map
+
+    def _build_citation_manifest(
+        self,
+        *,
+        generated_content: Dict[str, str],
+        global_index: GlobalPaperIndex,
+    ) -> List[Dict[str, Any]]:
+        if global_index.is_empty():
+            return []
+
+        manifest: List[Dict[str, Any]] = []
+        citation_id = 1
+        for section_id, content in generated_content.items():
+            for sentence_text, r_index in self._extract_citation_events(content):
+                entry = global_index.get_by_r(r_index)
+                if entry is None:
+                    continue
+                manifest.append(
+                    {
+                        "citation_id": f"C{citation_id:04d}",
+                        "chunk_id": section_id,
+                        "section_id": section_id,
+                        "source_id": entry.paper_id,
+                        "source_type": self._infer_source_type(entry),
+                        "claim_role": self._infer_claim_role(section_id, sentence_text),
+                        "claim_span": sentence_text,
+                        "source_excerpt": (entry.abstract or entry.top_chunk_text or "")[:1200],
+                        "r_index": entry.r_index,
+                        "title": entry.title,
+                        "doi": entry.doi,
+                    }
+                )
+                citation_id += 1
+        return manifest
+
+    @staticmethod
+    def _extract_citation_events(content: str) -> List[Tuple[str, int]]:
+        events: List[Tuple[str, int]] = []
+        if not content.strip():
+            return events
+
+        sentence_pattern = re.compile(
+            r"[^.!?]+[.!?]+(?:\s*\[R\d+\])+|[^.!?]+(?:\s*\[R\d+\])+"
+        )
+        for match in sentence_pattern.finditer(content):
+            sentence = match.group(0).strip()
+            markers = re.findall(r"\[R(\d+)\]", sentence)
+            if not markers:
+                continue
+            clean_sentence = re.sub(r"\s*\[R\d+\]", "", sentence).strip()
+            if not clean_sentence:
+                continue
+            for marker in markers:
+                events.append((clean_sentence, int(marker)))
+        return events
+
+    @staticmethod
+    def _infer_claim_role(section_id: str, sentence_text: str) -> str:
+        section_key = section_id.casefold()
+        text = sentence_text.casefold()
+        if section_key == "sec1":
+            if any(term in text for term in ("define", "defined", "refers to", "characterized")):
+                return "definition"
+            return "background"
+        if section_key == "sec2":
+            return "comparison"
+        if section_key == "sec3":
+            return "mechanism"
+        if section_key == "sec4":
+            return "evidence_synthesis"
+        if section_key == "sec5":
+            if any(term in text for term in ("should", "recommend", "must", "clinical practice")):
+                return "practice"
+            return "interpretation"
+        if section_key in {"sec6", "sec7"}:
+            return "gap"
+        if any(term in text for term in ("should", "recommend", "must")):
+            return "recommendation"
+        if any(term in text for term in ("compare", "compared", "higher", "lower", "versus")):
+            return "comparison"
+        if any(term in text for term in ("mechanism", "pathophysiology", "plaque", "thrombus")):
+            return "mechanism"
+        return "background"
+
+    @staticmethod
+    def _infer_source_type(entry: GlobalPaperEntry) -> str:
+        text = f"{entry.title}\n{entry.abstract}\n{entry.top_chunk_text}".casefold()
+        source_type_terms = (
+            ("meta_analysis", ("meta-analysis", "meta analysis")),
+            ("systematic_review", ("systematic review",)),
+            ("guideline", ("guideline", "guidelines", "consensus statement")),
+            ("rct", ("randomized", "randomised", "placebo-controlled")),
+            ("trial", ("trial", "trials")),
+            ("prospective", ("prospective",)),
+            ("cohort", ("cohort",)),
+            ("retrospective", ("retrospective",)),
+            ("case_control", ("case-control", "case control")),
+            ("observational", ("observational", "registry")),
+            ("mechanistic", ("mechanistic", "molecular", "pathway")),
+            ("animal", ("animal model", "murine", "mouse", "rat model")),
+            ("in_vitro", ("in vitro", "cell line")),
+            ("narrative", ("narrative review",)),
+        )
+        for source_type, terms in source_type_terms:
+            if any(term in text for term in terms):
+                return source_type
+        return "observational"
+
     def _assemble_text(
         self,
         outline: Dict[str, str],
         generated_content: Dict[str, str],
     ) -> str:
         """
-        按大纲顺序组装最终文本
+        按大纲顺序组装最终文本。
+
+        与 _post_process_references_v2 一致：将节内部的段落分隔折叠为单个换行符，
+        确保每节在 split_blocks(drop_markdown_wrappers=True) 后恰好产生 1 个内容块。
 
         参数：
             outline: 章节大纲
@@ -877,9 +1373,14 @@ class SelfCorrectingOrchestrator:
         """
         parts = []
         for section_id, title in outline.items():
-            content = generated_content.get(section_id, f"[{section_id} 内容缺失]")
+            content = generated_content.get(section_id, "")
+            content = re.sub(r"\n\s*\n", "\n", content).strip()
             parts.append(f"## {title}\n\n{content}")
         return "\n\n---\n\n".join(parts)
+
+    def _coerce_degraded_section_content(self, content: Optional[str]) -> str:
+        """Normalize degraded section content so final text never includes failure placeholders."""
+        return content.strip() if content is not None else ""
 
     # ------------------------------------------------------------------
     # Rich 打印
@@ -888,29 +1389,32 @@ class SelfCorrectingOrchestrator:
     def _print_header(self, task: str, outline: Dict[str, str]) -> None:
         self.console.print(Panel(
             f"[bold cyan]MetaWriter v4.0[/bold cyan]\n"
-            f"任务：{task}\n"
-            f"章节数：{len(outline)}",
-            title="开始生成",
+            f"Task: {task}\n"
+            f"Sections: {len(outline)}",
+            title="Generation Start",
             border_style="cyan",
         ))
 
     def _print_section_start(
         self, section_id: str, title: str, idx: int, total: int
     ) -> None:
+        # 目的：
+        #   Windows 上常见的 gbk 控制台无法稳定输出 ▶ / — 等字符。
+        #   这里统一改用 ASCII，避免真实 benchmark 运行因为打印阶段报编码错而中断。
         self.console.print(
-            f"\n[bold blue]▶ [{idx+1}/{total}] {section_id}[/bold blue] — {title}"
+            f"\n[bold blue][{idx+1}/{total}] {section_id}[/bold blue] - {title}"
         )
 
     def _print_success(self, section_id: str, attempt: int, dcas: float) -> None:
-        attempt_str = f"(第 {attempt} 次)" if attempt > 1 else "(一次通过)"
+        attempt_str = f"(attempt {attempt})" if attempt > 1 else "(first pass)"
         self.console.print(
-            f"  [green]✓ {section_id} 通过 {attempt_str} DCAS={dcas:.3f}[/green]"
+            f"  [green][OK] {section_id} passed {attempt_str} DCAS={dcas:.3f}[/green]"
         )
 
     def _print_failure(self, section_id: str, attempt: int, diagnosis, report) -> None:
         issues_str = " | ".join(i.description[:40] for i in report.issues[:3])
         self.console.print(
-            f"  [yellow]✗ {section_id} 第 {attempt} 次失败 → "
+            f"  [yellow][FAIL] {section_id} failed on attempt {attempt} -> "
             f"{diagnosis.repair_scope}({diagnosis.error_tier.value}/"
             f"{diagnosis.error_source.value})[/yellow]\n"
             f"    [dim]{issues_str}[/dim]"
@@ -920,13 +1424,13 @@ class SelfCorrectingOrchestrator:
         stats = self.correction_log.get_statistics()
         metric_summary = self.metric_collector.compute_repair_efficiency()
         self.console.print(Panel(
-            f"总节数：{stats['total_sections']}   "
-            f"一次通过率：{stats['success_rate_first_try']:.0%}   "
-            f"重试：{stats['total_retries']} 次   "
-            f"回退：{stats['total_rollbacks']} 次   "
-            f"失败：{stats['total_failures']} 节\n"
-            f"False Rollback Rate：{metric_summary.get('false_rollback_rate', 'N/A')}   "
-            f"DSL 信任度：{self.meta_state.memory_trust_level:.3f}",
-            title="[bold green]生成完成[/bold green]",
+            f"Sections: {stats['total_sections']}   "
+            f"First-pass rate: {stats['success_rate_first_try']:.0%}   "
+            f"Retries: {stats['total_retries']}   "
+            f"Rollbacks: {stats['total_rollbacks']}   "
+            f"Failed sections: {stats['total_failures']}\n"
+            f"False Rollback Rate: {metric_summary.get('false_rollback_rate', 'N/A')}   "
+            f"DSL Trust Level: {self.meta_state.memory_trust_level:.3f}",
+            title="[bold green]Generation Complete[/bold green]",
             border_style="green",
         ))

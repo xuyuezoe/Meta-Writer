@@ -8,9 +8,9 @@
          任一维度解析失败时独立降级为 0.65（高于验证阈值 0.6），不阻断流程。
 """
 import json
-import re
-from typing import Dict, Tuple
 import logging
+import re
+from typing import Any, Dict, Tuple
 
 from ..core.decision import Decision
 
@@ -52,7 +52,7 @@ class AlignmentScorer:
     # 主入口
     # ------------------------------------------------------------------
 
-    def compute_dcas(self, decision: Decision, content: str) -> Dict[str, float]:
+    def compute_dcas(self, decision: Decision, content: str) -> Dict[str, Any]:
         """
         计算 DCAS（单次 LLM 调用，三维度批量评分）
 
@@ -69,10 +69,15 @@ class AlignmentScorer:
             'coverage': float,      # 意图覆盖度 [0, 1]
             'consistency': float,   # 逻辑一致性 [0, 1]
             'effectiveness': float, # 效果达成度 [0, 1]
-            'dcas': float           # 加权总分 [0, 1]
+            'dcas': float,          # 加权总分 [0, 1]
+            'score_source': str     # parsed/fallback_partial/fallback_all
             }
         """
-        coverage, consistency, effectiveness = self._compute_all_dimensions(decision, content)
+        (
+            (coverage, coverage_fb),
+            (consistency, consistency_fb),
+            (effectiveness, effectiveness_fb),
+        ) = self._compute_all_dimensions(decision, content)
 
         dcas = (
             coverage      * _W_COVERAGE +
@@ -80,11 +85,34 @@ class AlignmentScorer:
             effectiveness * _W_EFFECTIVENESS
         )
 
+        fallback_flags = {
+            "coverage": coverage_fb,
+            "consistency": consistency_fb,
+            "effectiveness": effectiveness_fb,
+        }
+        fallback_count = sum(1 for flag in fallback_flags.values() if flag)
+        if fallback_count == 0:
+            score_source = "parsed"
+        elif fallback_count == len(fallback_flags):
+            score_source = "fallback_all"
+        else:
+            score_source = "fallback_partial"
+
+        if fallback_count:
+            missing = [name for name, flag in fallback_flags.items() if flag]
+            log_label = "all" if score_source == "fallback_all" else "partial"
+            self.logger.warning(
+                "dcas_fallback: %s fields=%s",
+                log_label,
+                ",".join(missing),
+            )
+
         result = {
             "coverage":      round(coverage,      3),
             "consistency":   round(consistency,   3),
             "effectiveness": round(effectiveness, 3),
             "dcas":          round(dcas,          3),
+            "score_source":  score_source,
         }
 
         self.logger.info(
@@ -101,7 +129,7 @@ class AlignmentScorer:
         self,
         decision: Decision,
         content: str,
-    ) -> Tuple[float, float, float]:
+    ) -> Tuple[Tuple[float, bool], Tuple[float, bool], Tuple[float, bool]]:
         """
         单次 LLM 调用同时评估三个 DCAS 子维度
 
@@ -117,33 +145,45 @@ class AlignmentScorer:
             content: 生成内容
 
         返回值：
-            Tuple[float, float, float]：(coverage, consistency, effectiveness)
+            三个二元组：((评分, 是否 fallback), ...)
         """
         prompt = (
-            "你是一个叙事质量评估助手，请评估生成内容的质量。\n\n"
-            f"写作决策：{decision.decision}\n"
-            f"推理过程：{decision.reasoning}\n"
-            f"预期效果：{decision.expected_effect}\n"
-            f"实际内容：{content}\n\n"
-            "请评估以下三个维度（评分范围 0.0 到 1.0）：\n"
-            "1. coverage_score（意图覆盖度）：decision 的意图在 content 中实现的程度\n"
-            "   1.0=完整实现，0.8=大部分，0.6=部分实现，0.0=完全未实现\n"
-            "2. consistency_score（逻辑一致性）：reasoning 的逻辑与 content 是否一致\n"
-            "   1.0=完全一致，0.8=基本一致，0.6=部分一致，0.0=严重矛盾\n"
-            "3. effectiveness_score（效果达成度）：content 是否达到了 expected_effect\n"
-            "   1.0=完全达到，0.8=大部分，0.6=部分达到，0.0=完全未达到\n\n"
-            "仅输出以下 JSON，将三个中文描述词替换为你的实际评分数字，不要输出任何其他内容：\n"
-            "{\"coverage_score\": 覆盖度评分, \"consistency_score\": 一致性评分, "
-            "\"effectiveness_score\": 效果评分}"
+            "You are a narrative quality evaluator.\n\n"
+            f"Writing decision: {decision.decision}\n"
+            f"Reasoning: {decision.reasoning}\n"
+            f"Expected effect: {decision.expected_effect}\n"
+            f"Generated content: {content}\n\n"
+            "Score the following dimensions on a 0.0 to 1.0 scale:\n"
+            "1. coverage_score: how fully the content realizes the decision's intent\n"
+            "   1.0 = fully realized, 0.8 = mostly realized, 0.6 = partially realized, 0.0 = not realized\n"
+            "2. consistency_score: how well the reasoning stays consistent with the content\n"
+            "   1.0 = fully consistent, 0.8 = mostly consistent, 0.6 = partially consistent, 0.0 = clearly contradictory\n"
+            "3. effectiveness_score: how well the content achieves the expected effect\n"
+            "   1.0 = fully achieved, 0.8 = mostly achieved, 0.6 = partially achieved, 0.0 = not achieved\n\n"
+            "Return JSON only with numeric values for all three fields:\n"
+            '{"coverage_score": 0.0, "consistency_score": 0.0, "effectiveness_score": 0.0}'
         )
 
         try:
             # strip_think=False：MiniMax M2.5 等推理模型会将结构化评分结果放在 <think> 块内，
             # 保留原始输出（含 <think> 块）以便 _parse_json_field 从中提取评分
-            response = self.llm.generate(prompt, temperature=0.3, max_tokens=512, strip_think=False)
+            response = self.llm.generate(
+                prompt,
+                temperature=0.3,
+                max_tokens=32768,
+                strip_think=False,
+                log_meta={
+                    "component": "AlignmentScorer",
+                    "section_id": decision.target_section,
+                },
+            )
         except Exception as e:
             self.logger.warning("DCAS 批量评分 LLM 调用失败，全部降级：%s", e)
-            return _FALLBACK_SCORE, _FALLBACK_SCORE, _FALLBACK_SCORE
+            return (
+                (_FALLBACK_SCORE, True),
+                (_FALLBACK_SCORE, True),
+                (_FALLBACK_SCORE, True),
+            )
 
         coverage      = self._parse_json_field(response, "coverage_score",      "意图覆盖度")
         consistency   = self._parse_json_field(response, "consistency_score",   "逻辑一致性")
@@ -155,7 +195,7 @@ class AlignmentScorer:
     # 内部工具
     # ------------------------------------------------------------------
 
-    def _parse_json_field(self, response: str, field: str, dimension: str) -> float:
+    def _parse_json_field(self, response: str, field: str, dimension: str) -> Tuple[float, bool]:
         """
         从 LLM JSON 响应中提取指定字段的评分值
 
@@ -177,7 +217,7 @@ class AlignmentScorer:
             dimension: 维度名称（仅用于日志）
 
         返回值：
-            float：[0.0, 1.0] 范围内的评分，解析失败时返回 _FALLBACK_SCORE
+            (score, used_fallback)：used_fallback=True 表示降级取值
         """
         try:
             # 第零阶段：提取 <think> 块内容，与原文合并作为搜索文本
@@ -195,7 +235,7 @@ class AlignmentScorer:
                 if val is not None:
                     score = float(val)
                     if 0.0 <= score <= 1.0:
-                        return score
+                        return score, False
 
             # 第二阶段：字段名正则匹配
             # 匹配 "field_name": 0.8 或 "field_name":0.8 或 field_name: 0.8
@@ -204,10 +244,10 @@ class AlignmentScorer:
             if m:
                 score = float(m.group(1))
                 if 0.0 <= score <= 1.0:
-                    return score
+                    return score, False
 
             raise ValueError(f"无法从响应中提取字段 '{field}'")
 
         except Exception as e:
             self.logger.warning("%s 评分解析失败，降级为 %.1f：%s", dimension, _FALLBACK_SCORE, e)
-            return _FALLBACK_SCORE
+            return _FALLBACK_SCORE, True

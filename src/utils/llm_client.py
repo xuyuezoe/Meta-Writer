@@ -1,35 +1,723 @@
 """
-通用 LLM 客户端
+通用 LLM 客户端。
 
-支持所有兼容 OpenAI Chat Completions API 格式的服务，包括：
-OpenAI、MiniMax、DeepSeek、智谱、本地部署（vLLM / Ollama）等。
-通过 base_url 参数切换不同厂商或本地端点，无需修改任何其他代码。
+功能：
+    统一封装 MetaWriter 对外部模型服务的调用方式，默认兼容 OpenAI Chat
+    Completions，也支持兼容 Anthropic Messages 的网关。
+
+设计目的：
+    1. 让上层生成主循环只依赖一个 `generate()` / `generate_structured()` 接口。
+    2. 在客户端层吸收协议探测、有限重试、<think> 清洗和日志落盘这些脏活，
+       避免把网络侧兼容逻辑扩散到 orchestrator、generator 等核心模块。
+    3. 当用户怀疑“请求没有真的打到 API”时，提供可核对的本地 trace 文件。
 """
+
+from __future__ import annotations
+
+import json
+import logging
+import os
 import re
+import time
+from collections.abc import Mapping
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Type, TypeVar
+
 import openai
-from typing import Optional, List, Dict
+import requests
+
+T = TypeVar("T")
+
+
+class _ProtocolCallError(RuntimeError):
+    """
+    单次协议调用失败，用于区分“可重试”与“应立刻终止”的错误。
+
+    设计目的：
+        让客户端在协议探测和重试时能精确判断失败语义。
+        例如：
+        - 协议不兼容：应尝试另一种协议
+        - 服务端过载 / 无可用账号：应等待后重试
+        - 明确参数错误：应立刻终止并把错误抛给上层
+    """
+
+    def __init__(
+        self,
+        protocol: str,
+        message: str,
+        *,
+        retryable: bool = False,
+        status_code: Optional[int] = None,
+    ) -> None:
+        super().__init__(message)
+        self.protocol = protocol
+        self.retryable = retryable
+        self.status_code = status_code
 
 
 class LLMClient:
     """
-    通用 LLM 客户端
+    通用 LLM 客户端。
 
     参数：
-        api_key:  服务商提供的 API 密钥
-        model:    模型名称（如 gpt-4o、deepseek-chat、MiniMax-M2.5）
-        base_url: API 端点，None 则使用 OpenAI 官方默认地址
+        api_key: 服务商提供的 API 密钥
+        model: 模型名称（如 gpt-4o、MiniMax-M2.5、glm-4.6）
+        base_url: API 端点；自定义网关时可只配置这一项给主流程使用
 
     关键设计：
-        - 兼容所有遵循 OpenAI Chat Completions API 格式的服务
-        - 在客户端层统一处理推理模型的 <think> 标签剥离
-        - 统计 token 用量和请求次数，供调用方分析
+        - 优先兼容 OpenAI Chat Completions
+        - 自定义网关可自动探测并回退到 Anthropic Messages
+        - 统一处理推理模型的 <think> 块
+        - 统一统计 token、请求次数和本地 trace
+        - 结构化输出优先使用 response_format，失败时自动降级
     """
 
+    _MAX_RETRY_ROUNDS = 8
+    _MAX_RETRY_DELAY_SECONDS = 8.0
+
     def __init__(self, api_key: str, model: str, base_url: Optional[str] = None):
-        self._client      = openai.OpenAI(api_key=api_key, base_url=base_url)
-        self.model        = model
+        self._normalize_proxy_env_vars()
+        self.api_key = api_key
+        self.model = model
+        self.base_url = base_url.rstrip("/") if base_url else None
+        self._openai_base_url = self._normalize_openai_base_url(self.base_url)
+        self._client = openai.OpenAI(api_key=api_key, base_url=self._openai_base_url)
+        self._http = requests.Session()
+        self._preferred_protocol: Optional[str] = None
+        self._trace_file = self._resolve_trace_file()
+        self._run_logger = None
         self.total_tokens = 0
         self.request_count = 0
+        self.logger = logging.getLogger(__name__)
+
+    @staticmethod
+    def _normalize_proxy_env_vars() -> None:
+        """
+        Normalize proxy env vars for httpx/OpenAI SDK compatibility.
+
+        设计目的：
+            某些本地代理工具会把 SOCKS 代理写成 `socks://...`，但 httpx
+            只接受 `socks5://...`。这里在客户端初始化前做一次轻量修正，
+            避免任务在真正发出 API 请求前就因代理 scheme 非法而崩溃。
+        """
+        proxy_env_names = (
+            "ALL_PROXY",
+            "all_proxy",
+            "HTTP_PROXY",
+            "http_proxy",
+            "HTTPS_PROXY",
+            "https_proxy",
+        )
+        for name in proxy_env_names:
+            value = os.environ.get(name)
+            if not value:
+                continue
+            stripped = value.strip()
+            if stripped.lower().startswith("socks://"):
+                os.environ[name] = "socks5://" + stripped[len("socks://") :]
+
+    def _normalize_openai_base_url(self, base_url: Optional[str]) -> Optional[str]:
+        """
+        规范化传给 OpenAI SDK 的 base_url。
+
+        设计目的：
+            很多兼容服务要求 SDK 的根路径以 `/v1` 结尾，但实际配置里常常只给裸 host。
+            这里统一补全，避免“base_url 已配置但 SDK 实际打错路径”的隐性问题。
+        """
+        if not base_url:
+            return None
+
+        normalized = base_url.rstrip("/")
+        if normalized.endswith("/chat/completions"):
+            normalized = normalized[: -len("/chat/completions")]
+        elif normalized.endswith("/messages"):
+            normalized = normalized[: -len("/messages")]
+
+        if normalized.endswith("/v1"):
+            return normalized
+        return f"{normalized}/v1"
+
+    def attach_run_logger(self, run_logger) -> None:
+        """
+        在运行日志器创建后再挂接进客户端。
+
+        设计目的：
+            避免 `LLMClient` 与 `RunLogger` 相互构造造成初始化顺序耦合，
+            同时保证每次调用的 prompt / response 都能在统一日志里落盘。
+        """
+        self._run_logger = run_logger
+
+    def _resolve_trace_file(self) -> Optional[Path]:
+        """
+        解析 API 调用 trace 文件路径。
+
+        设计目的：
+            当用户怀疑“没有真实打到 API”时，可以直接看本地 JSONL trace，
+            不必只依赖服务端控制台或外部计费面板。
+        """
+        raw_path = os.getenv("LLM_API_TRACE_FILE", "").strip()
+        trace_path = Path(raw_path) if raw_path else Path.cwd() / "outputs" / "llm_api_trace.jsonl"
+
+        try:
+            trace_path.parent.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            return None
+        return trace_path
+
+    def _trace_api_event(self, event: Dict[str, Any]) -> None:
+        """
+        将单次 API 事件追加写入本地 JSONL trace。
+
+        设计目的：
+            把“请求是否发出”“使用了哪个协议”“返回了什么状态”变成可审计证据，
+            降低真实联调时的信息不对称。
+        """
+        if self._trace_file is None:
+            return
+
+        payload = {
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime()),
+            "model": self.model,
+            "base_url": self.base_url,
+            **event,
+        }
+        try:
+            with self._trace_file.open("a", encoding="utf-8") as trace_file:
+                trace_file.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        except OSError:
+            return
+
+    def _build_openai_chat_endpoint(self) -> str:
+        """
+        根据 base_url 生成 OpenAI Chat Completions 的展示用 endpoint。
+
+        设计目的：
+            trace 日志里要明确记录实际命中的接口地址，便于排查代理或网关路由问题。
+            这里的地址主要用于日志展示，不改变 openai SDK 的真实请求行为。
+        """
+        if not self.base_url:
+            return "https://api.openai.com/v1/chat/completions"
+
+        if self._openai_base_url and self._openai_base_url.endswith("/v1"):
+            return f"{self._openai_base_url}/chat/completions"
+        if self._openai_base_url:
+            return f"{self._openai_base_url}/chat/completions"
+        return f"{self.base_url}/v1/chat/completions"
+
+    def _build_messages_url(self) -> str:
+        """
+        根据 base_url 推导 Anthropic Messages 接口地址。
+
+        设计目的：
+            主流程只需要关心一个 `BASE_URL` 配置项，不需要知道底层是
+            `/v1/chat/completions` 还是 `/v1/messages`。
+        """
+        if not self.base_url:
+            raise RuntimeError("未配置 base_url，无法使用 Messages 协议")
+
+        normalized = self.base_url.rstrip("/")
+        if normalized.endswith("/chat/completions"):
+            normalized = normalized[: -len("/chat/completions")]
+        if normalized.endswith("/messages"):
+            return normalized
+        if normalized.endswith("/v1"):
+            return f"{normalized}/messages"
+        return f"{normalized}/v1/messages"
+
+    def _looks_like_openai_model(self) -> bool:
+        """
+        粗略判断当前模型是否更像 OpenAI 原生模型。
+
+        设计目的：
+            首次探测时优先把请求打到更可能成功的协议，减少无意义重试和额外时延。
+        """
+        lowered = self.model.strip().lower()
+        openai_prefixes = (
+            "gpt-",
+            "chatgpt",
+            "codex",
+            "o1",
+            "o3",
+            "o4",
+            "omni",
+        )
+        return lowered.startswith(openai_prefixes)
+
+    def _prefers_openai_chat(self) -> bool:
+        """
+        判断当前配置是否应优先使用 OpenAI Chat Completions。
+
+        设计目的：
+            某些第三方模型虽然不是 OpenAI 命名风格，但其网关只暴露
+            OpenAI 兼容接口。MiniMax 就属于这种情况；如果先打
+            Anthropic Messages，会稳定命中 `/messages` 404。
+        """
+        lowered_model = self.model.strip().lower()
+        if lowered_model.startswith("minimax"):
+            return True
+
+        base = (self.base_url or "").strip().lower()
+        if "api.minimaxi.com" in base:
+            return True
+
+        return self._looks_like_openai_model()
+
+    def _candidate_protocols(self) -> List[str]:
+        """
+        生成当前请求的候选协议顺序。
+
+        设计目的：
+            一旦某个协议成功过，后续请求尽量固定走它，避免每次都做双路探测。
+        """
+        if self._preferred_protocol is not None:
+            return [self._preferred_protocol]
+
+        if not self.base_url:
+            return ["openai_chat"]
+
+        if self._prefers_openai_chat():
+            return ["openai_chat", "anthropic_messages"]
+        return ["anthropic_messages", "openai_chat"]
+
+    def _should_attempt_response_format(self) -> bool:
+        """
+        判断当前模型和网关是否值得先尝试 response_format。
+
+        设计目的：
+            在自定义网关上跑非 OpenAI 家族模型时，`response_format` 常常会稳定失败，
+            然后又退回到普通生成，额外制造一批无意义的 503 请求。
+            这里提前跳过高风险路径，让真实 benchmark 更接近“稳定调用”。
+        """
+        if not self.base_url:
+            return True
+        return self._prefers_openai_chat()
+
+    def _retry_delay(self, round_index: int) -> float:
+        """
+        指数退避，给网关恢复时间。
+
+        设计目的：
+            服务端返回 503、无可用账号、限流等错误时，如果本地持续秒级猛打，
+            成功率通常只会更低。
+        """
+        return min(1.0 * (2**round_index), self._MAX_RETRY_DELAY_SECONDS)
+
+    def _is_retryable_message(self, message: str) -> bool:
+        """根据错误消息文本判断是否值得重试。"""
+        lowered = message.strip().lower()
+        if not lowered:
+            return False
+
+        retryable_markers = (
+            "temporarily unavailable",
+            "service temporarily unavailable",
+            "please retry later",
+            "upstream service overloaded",
+            "overloaded",
+            "no available accounts",
+            "try again later",
+            "timed out",
+            "timeout",
+            "connection error",
+            "connection reset",
+            "connection aborted",
+            "rate limit",
+            "server error",
+            "bad gateway",
+            "gateway timeout",
+        )
+        return any(marker in lowered for marker in retryable_markers)
+
+    def _is_retryable_status(self, status_code: Optional[int]) -> bool:
+        """根据 HTTP 状态码判断是否值得重试。"""
+        return status_code in {408, 409, 429, 500, 502, 503, 504}
+
+    def _extract_http_error(self, response: requests.Response) -> tuple[str, Optional[str]]:
+        """
+        尽可能从网关响应里抽取错误消息和错误类型。
+
+        设计目的：
+            不把错误处理绑死在某一个厂商格式上，尽量从代理 / 网关返回中
+            还原出“是否可重试”的信号。
+        """
+        body_text = response.text.strip()
+        try:
+            payload = response.json()
+        except ValueError:
+            preview = body_text[:240].replace("\n", " ")
+            return preview or f"HTTP {response.status_code}", None
+
+        if isinstance(payload, Mapping):
+            error_obj = payload.get("error")
+            if isinstance(error_obj, Mapping):
+                message = str(error_obj.get("message", "")).strip()
+                error_type = error_obj.get("type")
+                if isinstance(error_type, str):
+                    return message or f"HTTP {response.status_code}", error_type
+                return message or f"HTTP {response.status_code}", None
+
+            message = payload.get("message")
+            if isinstance(message, str) and message.strip():
+                return message.strip(), None
+
+        preview = body_text[:240].replace("\n", " ")
+        return preview or f"HTTP {response.status_code}", None
+
+    def _collect_usage(self, response: Any) -> None:
+        """
+        尽可能从不同响应形态中提取 token 用量。
+
+        设计目的：
+            不论底层走的是 OpenAI 还是 Messages 协议，上层看到的统计都应保持统一。
+        """
+        usage = getattr(response, "usage", None)
+        if usage is not None:
+            total_tokens = getattr(usage, "total_tokens", None)
+            if isinstance(total_tokens, int):
+                self.total_tokens += total_tokens
+                return
+
+        if isinstance(response, Mapping):
+            usage_object = response.get("usage")
+            if isinstance(usage_object, Mapping):
+                total_tokens = usage_object.get("total_tokens")
+                if isinstance(total_tokens, int):
+                    self.total_tokens += total_tokens
+                    return
+
+                anthropic_total = 0
+                for field_name in (
+                    "input_tokens",
+                    "output_tokens",
+                    "cache_creation_input_tokens",
+                    "cache_read_input_tokens",
+                ):
+                    value = usage_object.get(field_name)
+                    if isinstance(value, int):
+                        anthropic_total += value
+                if anthropic_total > 0:
+                    self.total_tokens += anthropic_total
+
+    def _extract_text_from_response(self, response: Any) -> str:
+        """
+        从不同协议和不同 SDK 返回对象中提取文本内容。
+
+        设计目的：
+            上层 orchestrator 只关心“文本输出”这个抽象，不应感知底层响应结构差异。
+        """
+        if isinstance(response, str):
+            lowered = response.lower()
+            if "<html" in lowered or "<!doctype html" in lowered:
+                preview = response[:160].replace("\n", " ")
+                raise RuntimeError(f"LLM API 返回了 HTML 页面而不是文本响应：{preview}")
+            return response
+
+        choices = getattr(response, "choices", None)
+        if isinstance(choices, list) and choices:
+            first_choice = choices[0]
+            message = getattr(first_choice, "message", None)
+            content = getattr(message, "content", None)
+            if isinstance(content, str):
+                return content
+
+        if isinstance(response, Mapping):
+            choices_object = response.get("choices")
+            if isinstance(choices_object, list) and len(choices_object) > 0:
+                first_choice = choices_object[0]
+                if isinstance(first_choice, Mapping):
+                    message = first_choice.get("message")
+                    if isinstance(message, Mapping):
+                        content = message.get("content")
+                        if isinstance(content, str):
+                            return content
+
+            content_blocks = response.get("content")
+            if isinstance(content_blocks, list):
+                thinking_parts: List[str] = []
+                visible_parts: List[str] = []
+                for block in content_blocks:
+                    if not isinstance(block, Mapping):
+                        continue
+                    block_type = block.get("type")
+                    if block_type == "thinking" and isinstance(block.get("thinking"), str):
+                        thinking_parts.append(block["thinking"])
+                    elif block_type == "text" and isinstance(block.get("text"), str):
+                        visible_parts.append(block["text"])
+
+                assembled_parts: List[str] = []
+                if thinking_parts:
+                    assembled_parts.append("<think>\n" + "\n\n".join(thinking_parts) + "\n</think>")
+                if visible_parts:
+                    assembled_parts.append("\n\n".join(visible_parts))
+                if assembled_parts:
+                    return "\n\n".join(assembled_parts).strip()
+
+            completion = response.get("completion")
+            if isinstance(completion, str):
+                return completion
+
+        raise RuntimeError(f"LLM API 返回了无法识别的响应类型：{type(response).__name__}")
+
+    def _call_openai_chat(
+        self,
+        prompt: str,
+        temperature: float,
+        max_tokens: int,
+        stop_sequences: Optional[List[str]],
+        *,
+        response_format: Optional[Dict[str, Any]] = None,
+    ) -> Any:
+        """
+        调用 OpenAI Chat Completions。
+
+        设计目的：
+            保持对 OpenAI 兼容服务的直接支持，同时把 trace、错误分类和统计逻辑
+            统一收敛在这一层。
+        """
+        self.request_count += 1
+        endpoint = self._build_openai_chat_endpoint()
+        started_at = time.time()
+        self._trace_api_event(
+            {
+                "phase": "request",
+                "protocol": "openai_chat",
+                "endpoint": endpoint,
+                "max_tokens": max_tokens,
+                "temperature": temperature,
+                "response_format": response_format["type"] if response_format else None,
+            }
+        )
+
+        request_kwargs: Dict[str, Any] = {
+            "model": self.model,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "stop": stop_sequences or None,
+        }
+        if response_format is not None:
+            request_kwargs["response_format"] = response_format
+
+        try:
+            response = self._client.chat.completions.create(**request_kwargs)
+            self._trace_api_event(
+                {
+                    "phase": "response",
+                    "protocol": "openai_chat",
+                    "endpoint": endpoint,
+                    "status": "ok",
+                    "duration_ms": round((time.time() - started_at) * 1000, 2),
+                }
+            )
+            return response
+        except openai.OpenAIError as error:
+            status_code = getattr(error, "status_code", None)
+            message = str(error)
+            self._trace_api_event(
+                {
+                    "phase": "response",
+                    "protocol": "openai_chat",
+                    "endpoint": endpoint,
+                    "status": "error",
+                    "status_code": status_code,
+                    "duration_ms": round((time.time() - started_at) * 1000, 2),
+                    "error": message,
+                }
+            )
+            raise _ProtocolCallError(
+                "openai_chat",
+                f"OpenAI Chat 调用失败：{message}",
+                retryable=self._is_retryable_status(status_code) or self._is_retryable_message(message),
+                status_code=status_code,
+            ) from error
+
+    def _call_anthropic_messages(
+        self,
+        prompt: str,
+        temperature: float,
+        max_tokens: int,
+        stop_sequences: Optional[List[str]],
+    ) -> Mapping[str, Any]:
+        """
+        调用 Anthropic Messages 兼容接口。
+
+        设计目的：
+            某些网关只把非 OpenAI 模型挂在 `/v1/messages`，这里提供协议级回退，
+            避免上层任务逻辑为了兼容网关而改写。
+        """
+        self.request_count += 1
+        endpoint = self._build_messages_url()
+        started_at = time.time()
+        self._trace_api_event(
+            {
+                "phase": "request",
+                "protocol": "anthropic_messages",
+                "endpoint": endpoint,
+                "max_tokens": max_tokens,
+                "temperature": temperature,
+            }
+        )
+
+        payload: Dict[str, Any] = {
+            "model": self.model,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+        }
+        if stop_sequences:
+            payload["stop_sequences"] = stop_sequences
+
+        try:
+            response = self._http.post(
+                endpoint,
+                headers={
+                    "Authorization": f"Bearer {self.api_key}",
+                    "Content-Type": "application/json",
+                    "anthropic-version": "2023-06-01",
+                },
+                json=payload,
+                timeout=90,
+            )
+        except requests.RequestException as error:
+            message = f"Anthropic Messages 调用失败：{error}"
+            self._trace_api_event(
+                {
+                    "phase": "response",
+                    "protocol": "anthropic_messages",
+                    "endpoint": endpoint,
+                    "status": "error",
+                    "duration_ms": round((time.time() - started_at) * 1000, 2),
+                    "error": message,
+                }
+            )
+            raise _ProtocolCallError(
+                "anthropic_messages",
+                message,
+                retryable=True,
+            ) from error
+
+        if not response.ok:
+            message, error_type = self._extract_http_error(response)
+            retryable = self._is_retryable_status(response.status_code) or self._is_retryable_message(message)
+            if error_type in {"api_error", "overloaded_error"}:
+                retryable = True
+            self._trace_api_event(
+                {
+                    "phase": "response",
+                    "protocol": "anthropic_messages",
+                    "endpoint": endpoint,
+                    "status": "error",
+                    "status_code": response.status_code,
+                    "duration_ms": round((time.time() - started_at) * 1000, 2),
+                    "error": message,
+                }
+            )
+            raise _ProtocolCallError(
+                "anthropic_messages",
+                f"Anthropic Messages 调用失败：HTTP {response.status_code} - {message}",
+                retryable=retryable,
+                status_code=response.status_code,
+            )
+
+        try:
+            payload_object = response.json()
+        except ValueError as error:
+            preview = response.text[:240].replace("\n", " ")
+            self._trace_api_event(
+                {
+                    "phase": "response",
+                    "protocol": "anthropic_messages",
+                    "endpoint": endpoint,
+                    "status": "error",
+                    "status_code": response.status_code,
+                    "duration_ms": round((time.time() - started_at) * 1000, 2),
+                    "error": f"non_json:{preview}",
+                }
+            )
+            raise _ProtocolCallError(
+                "anthropic_messages",
+                f"Anthropic Messages 返回了非 JSON 响应：{preview}",
+                retryable=False,
+                status_code=response.status_code,
+            ) from error
+
+        if not isinstance(payload_object, Mapping):
+            raise _ProtocolCallError(
+                "anthropic_messages",
+                f"Anthropic Messages 返回了无法识别的响应类型：{type(payload_object).__name__}",
+                retryable=False,
+                status_code=response.status_code,
+            )
+
+        if payload_object.get("type") == "error":
+            error_obj = payload_object.get("error")
+            message = ""
+            error_type = None
+            if isinstance(error_obj, Mapping):
+                message = str(error_obj.get("message", "")).strip()
+                maybe_type = error_obj.get("type")
+                if isinstance(maybe_type, str):
+                    error_type = maybe_type
+            self._trace_api_event(
+                {
+                    "phase": "response",
+                    "protocol": "anthropic_messages",
+                    "endpoint": endpoint,
+                    "status": "error",
+                    "status_code": response.status_code,
+                    "duration_ms": round((time.time() - started_at) * 1000, 2),
+                    "error": message or "unknown error",
+                }
+            )
+            raise _ProtocolCallError(
+                "anthropic_messages",
+                f"Anthropic Messages 返回错误：{message or 'unknown error'}",
+                retryable=self._is_retryable_message(message) or error_type in {"api_error", "overloaded_error"},
+                status_code=response.status_code,
+            )
+
+        self._trace_api_event(
+            {
+                "phase": "response",
+                "protocol": "anthropic_messages",
+                "endpoint": endpoint,
+                "status": "ok",
+                "status_code": response.status_code,
+                "duration_ms": round((time.time() - started_at) * 1000, 2),
+            }
+        )
+        return payload_object
+
+    def _invoke_protocol(
+        self,
+        protocol: str,
+        *,
+        prompt: str,
+        temperature: float,
+        max_tokens: int,
+        stop_sequences: Optional[List[str]],
+    ) -> Any:
+        """
+        按协议名分发到底层实现。
+
+        设计目的：
+            让 `generate()` 保持在编排层，而不是把具体网络细节散落到重试循环里。
+        """
+        if protocol == "openai_chat":
+            return self._call_openai_chat(
+                prompt,
+                temperature,
+                max_tokens,
+                stop_sequences,
+            )
+        if protocol == "anthropic_messages":
+            return self._call_anthropic_messages(
+                prompt,
+                temperature,
+                max_tokens,
+                stop_sequences,
+            )
+        raise RuntimeError(f"未知协议：{protocol}")
 
     def generate(
         self,
@@ -38,65 +726,540 @@ class LLMClient:
         max_tokens: int,
         stop_sequences: Optional[List[str]] = None,
         strip_think: bool = True,
+        allow_think_only_fallback: bool = False,
+        log_meta: Optional[Dict[str, Any]] = None,
     ) -> str:
         """
-        调用 LLM 生成文本
+        调用 LLM 生成文本。
 
-        参数：
-            prompt:         输入提示词
-            temperature:    采样温度
-            max_tokens:     最大输出 token 数
-            stop_sequences: 停止词列表（可选）
-            strip_think:    是否剥离 <think> 推理块（默认 True）
-
-                            生成叙事内容时应设为 True（推理过程不应混入输出）。
-                            LLM-as-judge 的评估调用应设为 False：推理模型（MiniMax M2.5、
-                            DeepSeek-R1 等）会将结构化评分结果放在 <think> 块内，
-                            剥离后仅剩确认语，导致评分无法被解析。
-
-        返回：
-            生成的文本字符串；strip_think=True 时已剥离 <think> 推理块
-
-        异常：
-            RuntimeError：API 调用失败时抛出，附带原始错误信息
+        设计目的：
+            把“协议探测”“传输层重试”“文本提取”“思维链清洗”“运行日志记录”
+            都收敛到客户端内部，让调用方继续保持一个简单稳定的文本生成接口。
         """
+        log_meta = dict(log_meta or {})
+        protocol_errors: List[str] = []
+
+        for round_index in range(self._MAX_RETRY_ROUNDS):
+            protocols = self._candidate_protocols()
+            round_retryable = False
+
+            for protocol_index, protocol in enumerate(protocols):
+                try:
+                    response = self._invoke_protocol(
+                        protocol,
+                        prompt=prompt,
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                        stop_sequences=stop_sequences,
+                    )
+                except _ProtocolCallError as error:
+                    protocol_errors.append(f"[{error.protocol}] {error}")
+                    round_retryable = round_retryable or error.retryable
+
+                    if (
+                        protocol_index == 0
+                        and protocol == "anthropic_messages"
+                        and error.retryable
+                        and len(protocols) > 1
+                    ):
+                        break
+                    continue
+
+                self._preferred_protocol = protocol
+                self._collect_usage(response)
+                text = self._extract_text_from_response(response)
+                original_text = text
+
+                think_only = False
+                if strip_think and "<think>" in text:
+                    # 第一步：剥离所有完整的 <think>...</think> 块，取剩余可见文本
+                    after_strip = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+                    has_incomplete = "<think>" in after_strip  # 残留 <think> 说明块未闭合
+
+                    if after_strip and not has_incomplete:
+                        # 正常路径：有可见文本且已清洁
+                        text = after_strip
+                    else:
+                        # 情形A：不完整 <think> 块（max_tokens 耗尽被截断，无 </think>）
+                        #         after_strip 仍含 <think> 前缀，无法直接使用
+                        # 情形B：完整 <think> 块 + 无可见文本（max_tokens 不足以生成正文）
+                        # 统一处理：提取所有 think 内容（剥去标签本身）
+                        if has_incomplete:
+                            self.logger.warning(
+                                "generate: 检测到不完整 <think> 块，max_tokens=%d 可能过小 "
+                                "[model=%s]",
+                                max_tokens, self.model,
+                            )
+                        think_content = re.sub(r"</?think>", "", text, flags=re.DOTALL).strip()
+                        if allow_think_only_fallback and think_content:
+                            text = think_content
+                        elif not allow_think_only_fallback:
+                            text = ""
+                        else:
+                            text = original_text
+                        think_only = True
+
+                if think_only:
+                    log_meta["think_only_output"] = True
+
+                log_meta["protocol"] = protocol
+                self._log_llm_call(
+                    prompt=prompt,
+                    response=text,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    log_meta=log_meta,
+                )
+                return text
+
+            if not round_retryable or round_index == self._MAX_RETRY_ROUNDS - 1:
+                break
+            time.sleep(self._retry_delay(round_index))
+
+        error_tail = "; ".join(protocol_errors[-6:]) if protocol_errors else "unknown error"
+        error_text = f"LLM API 调用失败：{error_tail}"
+        self._log_llm_call(
+            prompt=prompt,
+            response=f"[ERROR] {error_text}",
+            temperature=temperature,
+            max_tokens=max_tokens,
+            log_meta=log_meta,
+        )
+        raise RuntimeError(error_text)
+
+    def generate_structured(
+        self,
+        prompt: str,
+        schema: Type[T],
+        temperature: float = 0.7,
+        max_tokens: int = 32768,
+        log_meta: Optional[Dict[str, Any]] = None,
+    ) -> T:
+        """
+        调用 LLM 生成结构化输出（Pydantic）。
+
+        设计目的：
+            优先走 response_format 获取稳定 JSON；如果当前网关不支持、协议不兼容
+            或返回内容不可解析，再自动降级到普通文本生成 + 后处理 JSON。
+        """
+        import json as stdlib_json
+
+        log_meta = dict(log_meta or {})
+
+        if not self._should_attempt_response_format():
+            self.logger.info(
+                "skip response_format for model=%s base_url=%s and use fallback structured generation",
+                self.model,
+                self.base_url,
+            )
+            return self._generate_structured_fallback(
+                prompt,
+                schema,
+                temperature,
+                max_tokens,
+                log_meta,
+            )
+
         try:
-            response = self._client.chat.completions.create(
-                model=self.model,
-                messages=[{"role": "user", "content": prompt}],
+            response = self._call_openai_chat(
+                prompt=prompt,
                 temperature=temperature,
                 max_tokens=max_tokens,
-                stop=stop_sequences or None,
+                stop_sequences=None,
+                response_format={"type": "json_object"},
             )
-        except openai.OpenAIError as e:
-            raise RuntimeError(f"LLM API 调用失败：{e}") from e
+            self._preferred_protocol = "openai_chat"
+            self._collect_usage(response)
 
-        if response.usage is not None:
-            self.total_tokens += response.usage.total_tokens
-        self.request_count += 1
+            # 检测 finish_reason：若为 "length" 说明 token 达限，JSON 大概率被截断
+            finish_reason = self._extract_finish_reason(response)
+            if finish_reason == "length":
+                self.logger.warning(
+                    "generate_structured: finish_reason=length，JSON 可能被截断 "
+                    "(model=%s max_tokens=%d)，先尝试 JSON 救援",
+                    self.model, max_tokens,
+                )
 
-        text = response.choices[0].message.content or ""
+            raw_text = self._extract_text_from_response(response)
+            cleaned_text = self._clean_thinking_model_output(raw_text)
+            # 修复尾随逗号等常见模型 JSON 语法错误，再用 strict=False 容忍字面量控制字符
+            repaired_text = self._repair_json_text(cleaned_text)
+            json_obj = stdlib_json.loads(repaired_text, strict=False)
+            json_obj = self._coerce_json_fields(json_obj)
+            result = schema(**json_obj)
 
-        # 推理模型兼容（DeepSeek-R1、MiniMax M2.5 等输出 <think> 块的模型）
-        # strip_think=True（默认）：优先取可见输出；可见输出为空则回退到全文
-        # strip_think=False：返回原始全文（含 <think> 块），供评估调用自行解析
-        if strip_think and "<think>" in text:
-            visible = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
-            text = visible if visible else text
+            log_meta["structured_output"] = True
+            log_meta["schema"] = schema.__name__ if hasattr(schema, "__name__") else str(schema)
+            log_meta["method"] = "response_format"
+            log_meta["protocol"] = "openai_chat"
+            self._log_llm_call(
+                prompt=prompt,
+                response=cleaned_text,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                log_meta=log_meta,
+            )
+            return result
+
+        except _ProtocolCallError as api_error:
+            self.logger.warning(
+                "response_format 调用失败 ('%s' 可能不支持或协议不兼容): %s\n尝试降级使用普通生成 + 后处理...",
+                self.model,
+                api_error,
+            )
+            return self._generate_structured_fallback(prompt, schema, temperature, max_tokens, log_meta)
+
+        except (stdlib_json.JSONDecodeError, TypeError, ValueError) as parse_error:
+            schema_name = schema.__name__ if hasattr(schema, "__name__") else str(schema)
+            self.logger.warning(
+                "response_format 返回内容无法解析为 %s（位置 %s），先尝试字段级救援...",
+                schema_name, parse_error,
+            )
+            # 先尝试从损坏的 JSON 中逐字段抢救，避免整体重新生成浪费一次 LLM 调用。
+            # 典型场景：content 字段过长导致 token 截断，或含未转义控制字符。
+            rescued = self._try_rescue_truncated_json(cleaned_text)
+            if rescued is not None:
+                try:
+                    rescued = self._coerce_json_fields(rescued)
+                    result = schema(**rescued)
+                    self.logger.info(
+                        "JSON 字段救援成功：schema=%s rescued_keys=%s",
+                        schema_name, sorted(rescued.keys()),
+                    )
+                    # 补充审计日志：救援路径同样写入 run.log，保证调用链路可追溯
+                    rescue_meta = dict(log_meta)
+                    rescue_meta["structured_output"] = True
+                    rescue_meta["schema"] = schema_name
+                    rescue_meta["method"] = "response_format+rescue"
+                    rescue_meta["protocol"] = "openai_chat"
+                    self._log_llm_call(
+                        prompt=prompt,
+                        response=cleaned_text,
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                        log_meta=rescue_meta,
+                    )
+                    return result
+                except Exception as rescue_err:
+                    self.logger.warning("JSON 字段救援构造 schema 失败：%s，降级到全量重生成", rescue_err)
+            else:
+                self.logger.warning("JSON 字段救援未提取到 content，降级到全量重生成")
+
+            return self._generate_structured_fallback(prompt, schema, temperature, max_tokens, log_meta)
+
+    def _extract_finish_reason(self, response: Any) -> Optional[str]:
+        """
+        从 API 响应中提取 finish_reason。
+
+        设计目的：
+            finish_reason="length" 表示模型在 max_tokens 时被强制截断，
+            是 JSON 被截断的直接证据，需要在日志层面明确区分。
+        """
+        choices = getattr(response, "choices", None)
+        if isinstance(choices, list) and choices:
+            return getattr(choices[0], "finish_reason", None)
+        if isinstance(response, Mapping):
+            choices_data = response.get("choices", [])
+            if choices_data:
+                return choices_data[0].get("finish_reason")
+        return None
+
+    @staticmethod
+    def _extract_json_string_tolerant(text: str, start: int) -> str:
+        """
+        从 start 位置开始，解析一个 JSON 字符串直到遇到未转义的 `"` 或文本结尾。
+
+        设计目的：
+            正则无法正确处理 `\"` 转义 + 截断组合。此方法是一个最小化的
+            JSON string 解析器：正确反转义 \\ / \" / \n / \t / \r，
+            遇到截断（text 提前结束）时返回已解析的部分内容，而不是抛出异常。
+
+        参数：
+            text:  包含 JSON 内容的原始字符串
+            start: 字符串值的起始位置（即开头 `"` 之后的第一个字符）
+
+        返回：
+            解析出的字符串内容（可能是截断版本，但总是有效的 Python str）
+        """
+        buf: List[str] = []
+        i = start
+        while i < len(text):
+            ch = text[i]
+            if ch == "\\" and i + 1 < len(text):
+                nxt = text[i + 1]
+                buf.append(
+                    '"' if nxt == '"' else
+                    '\n' if nxt == 'n' else
+                    '\t' if nxt == 't' else
+                    '\r' if nxt == 'r' else
+                    '\\' if nxt == '\\' else
+                    nxt
+                )
+                i += 2
+            elif ch == '"':
+                break  # 正常结束
+            else:
+                buf.append(ch)
+                i += 1
+        return "".join(buf).strip()
+
+    def _try_rescue_truncated_json(self, text: str) -> Optional[Dict[str, Any]]:
+        """
+        从截断或含非法字符的 JSON 文本中逐字段抢救可用内容。
+
+        设计目的：
+            当 response_format=json_object 被截断（finish_reason=length）或
+            content 字段含未转义控制字符时，json.loads 整体失败。
+            此方法用有限正则对各字段独立提取，只要拿到 content 就能继续。
+            缺失的元数据字段（decision/reasoning 等）填入安全默认值，
+            不会阻断生成主循环。
+
+        返回：
+            提取到 content 时返回字段 dict，否则返回 None。
+
+        关键约束：
+            - 只做字段提取，不尝试修复 JSON 语法（太脆弱）
+            - content 是必须字段；其余字段可用默认值兜底
+            - 日志中标注 "rescued" 以便追踪
+        """
+        recovered: Dict[str, Any] = {}
+
+        # 第一阶段：提取 string 类短字段（出现在 content 之前，一般不截断）
+        for key in ("decision", "reasoning", "expected_effect"):
+            m = re.search(
+                r'"' + re.escape(key) + r'"\s*:\s*"((?:[^"\\]|\\.)*?)"',
+                text, re.DOTALL,
+            )
+            if m:
+                try:
+                    recovered[key] = m.group(1).replace('\\"', '"')
+                except Exception:
+                    pass
+
+        # 第二阶段：提取 confidence（数字型，不会截断）
+        m = re.search(r'"confidence"\s*:\s*([0-9]*\.?[0-9]+)', text)
+        if m:
+            try:
+                recovered["confidence"] = float(m.group(1))
+            except ValueError:
+                pass
+
+        # 第三阶段：提取 content（可能被截断）
+        # 用字符级解析器而非正则：正确处理 \" 转义，在截断位置安全停止。
+        content_match = re.search(r'"content"\s*:\s*"', text)
+        if content_match:
+            recovered["content"] = self._extract_json_string_tolerant(
+                text, content_match.end()
+            )
+
+        # 第四阶段：提取 referenced_section_ids（列表型）
+        m = re.search(r'"referenced_section_ids"\s*:\s*(\[[^\]]*\])', text)
+        if m:
+            try:
+                recovered["referenced_section_ids"] = json.loads(m.group(1))
+            except Exception:
+                recovered["referenced_section_ids"] = []
+        else:
+            recovered.setdefault("referenced_section_ids", [])
+
+        # content 是必须字段；无法提取则放弃救援
+        if "content" not in recovered:
+            return None
+
+        # 为缺失的必须字段填入安全默认值
+        recovered.setdefault("decision", "Content generated (rescued from partial JSON output)")
+        recovered.setdefault("reasoning", "Original structured response was partially parsed.")
+        recovered.setdefault("expected_effect", "Deliver section content.")
+        recovered.setdefault("confidence", 0.6)
+
+        return recovered
+
+    def _generate_structured_fallback(
+        self,
+        prompt: str,
+        schema: Type[T],
+        temperature: float,
+        max_tokens: int,
+        log_meta: Optional[Dict[str, Any]],
+    ) -> T:
+        """
+        结构化输出的降级方案：普通生成 + JSON 后处理。
+
+        设计目的：
+            当 response_format 在某些网关、代理或模型分组上不可用时，
+            主流程仍然可以继续运行，而不是直接中断整个 benchmark。
+        """
+        import json as stdlib_json
+
+        if schema is None:
+            raise RuntimeError("未提供可用的结构化 schema")
+
+        fallback_meta = dict(log_meta or {})
+        fallback_meta["structured_output"] = True
+        fallback_meta["schema"] = schema.__name__ if hasattr(schema, "__name__") else str(schema)
+        fallback_meta["method"] = "fallback_generate"
+
+        json_prompt = (
+            prompt
+            + "\n\n【重要】请直接返回一个有效的 JSON 对象，不要添加任何说明、代码块或额外文本。"
+            + "\n开始返回 JSON："
+        )
+
+        response_text = self.generate(
+            json_prompt,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            strip_think=True,
+            allow_think_only_fallback=False,
+            log_meta=fallback_meta,
+        )
+
+        try:
+            cleaned_text = self._clean_thinking_model_output(response_text)
+            json_obj = stdlib_json.loads(cleaned_text)
+            json_obj = self._coerce_json_fields(json_obj)
+            return schema(**json_obj)
+        except (stdlib_json.JSONDecodeError, TypeError, ValueError) as error:
+            raise RuntimeError(f"结构化输出调用失败: {error}") from error
+
+    @staticmethod
+    def _coerce_json_fields(json_obj: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        修复 MiniMax-M2.5 等模型将 list 字段序列化为字符串的问题。
+
+        设计目的：
+            MiniMax-M2.5 在 response_format=json_object 模式下，偶尔将
+            List[str] 字段输出为 Python repr 字符串 "['a', 'b']" 或 JSON
+            字符串 '["a","b"]'，导致 Pydantic 验证抛出 ValueError。
+            在此做一次轻量强制转换：对所有字符串值，若其以 "[" 开头，
+            尝试 json.loads → ast.literal_eval，成功且结果为列表则替换。
+
+        参数：
+            json_obj: 已通过 json.loads 解析的原始字典
+
+        返回值：
+            Dict[str, Any]: 经过 list 字段修正的字典（原地修改并返回）
+        """
+        import ast as _ast
+        import json as _json
+
+        for key, value in json_obj.items():
+            if not isinstance(value, str):
+                continue
+            stripped = value.strip()
+            if not stripped.startswith("["):
+                continue
+            for parser in (_json.loads, _ast.literal_eval):
+                try:
+                    parsed = parser(stripped)
+                    if isinstance(parsed, list):
+                        json_obj[key] = parsed
+                        break
+                except Exception:
+                    continue
+        return json_obj
+
+    def _clean_thinking_model_output(self, text: str) -> str:
+        """
+        清洗推理模型输出中的 <think> 块和 Markdown 包装。
+
+        设计目的：
+            不同推理模型喜欢把最终 JSON 包在思维链或 ```json 代码块里，
+            这里统一归一化，减少上层结构化解析失败率。
+        """
+        text = text.strip()
+        if "<think>" in text:
+            text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+
+        if text.startswith("```"):
+            text = re.sub(r"^```(?:json)?[\s\n]*", "", text)
+            text = re.sub(r"\s*```$", "", text)
+            text = text.strip()
+
+        json_start = text.find("{")
+        json_end = text.rfind("}")
+        if json_start != -1 and json_end != -1 and json_end > json_start:
+            text = text[json_start : json_end + 1]
 
         return text
 
-    def get_statistics(self) -> Dict:
+    @staticmethod
+    def _repair_json_text(text: str) -> str:
         """
-        返回调用统计
+        修复模型 JSON 输出中的常见语法错误。
+
+        设计目的：
+            在 json.loads 之前做轻量修复，消除两类已知的 MiniMax-M2.5 问题，
+            避免走字段级救援（rescue）路径浪费额外解析周期：
+            1. 尾随逗号（Trailing Comma）：{"a": 1,} 或 ["x",]
+               表现为 json 报 "Expecting property name" 于对象末尾，
+               通常出现在 referenced_section_ids 字段之后。
+            2. 字面量控制字符（如 \\n、\\r）嵌入字符串：
+               由调用方使用 strict=False 处理，此处不做替换，
+               避免误改 content 正文中有意义的空白。
+
+        参数：
+            text: 经过 _clean_thinking_model_output 处理后的 JSON 文本
 
         返回：
-            {
-                'total_tokens':  int,  # 累计消耗 token 数
-                'request_count': int,  # 累计请求次数
-            }
+            修复后的 JSON 文本（不改变 JSON 语义）
+        """
+        # 移除对象或数组闭合括号之前的尾随逗号
+        return re.sub(r",(\s*[}\]])", r"\1", text)
+
+    def _log_llm_call(
+        self,
+        prompt: str,
+        response: str,
+        temperature: float,
+        max_tokens: int,
+        log_meta: Dict[str, Any],
+    ) -> None:
+        """
+        将一次 LLM 调用写入 RunLogger。
+
+        设计目的：
+            把协议、温度、token 上限、结构化模式等上下文一并记录下来，
+            便于之后复盘 benchmark 运行过程。
+        """
+        if not self._run_logger:
+            return
+
+        component = str(log_meta.get("component", "LLMClient"))
+        section_id = log_meta.get("section_id")
+        attempt = log_meta.get("attempt")
+
+        extra = {
+            "model": self.model,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+        }
+        for key, value in log_meta.items():
+            if key in {"component", "section_id", "attempt"}:
+                continue
+            if isinstance(value, (str, int, float, bool)) or value is None:
+                extra[key] = value
+            else:
+                extra[key] = str(value)
+
+        self._run_logger.log_llm_call(
+            component=component,
+            section_id=section_id,
+            attempt=attempt,
+            prompt_text=prompt,
+            response_text=response,
+            extra=extra,
+        )
+
+    def get_statistics(self) -> Dict[str, int]:
+        """
+        返回调用统计。
+
+        设计目的：
+            给 benchmark 汇总阶段提供统一的 token / request 计数口径，
+            无需关心底层究竟走了哪种协议。
         """
         return {
-            "total_tokens":  self.total_tokens,
+            "total_tokens": self.total_tokens,
             "request_count": self.request_count,
         }

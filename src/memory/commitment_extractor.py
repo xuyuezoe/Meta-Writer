@@ -84,7 +84,7 @@ class CommitmentExtractor:
                 SOFT      → 0.6（风格偏好或非核心细节，较低初始可信度）
         """
         prompt = self._build_prompt(section_content, existing_summary)
-        raw = self._llm_client.generate(prompt, temperature=0.0, max_tokens=1024)
+        raw = self._llm_client.generate(prompt, temperature=0.0, max_tokens=32768)
         items = self._parse_output(raw)
 
         entries: List[LedgerEntry] = []
@@ -105,29 +105,35 @@ class CommitmentExtractor:
         返回值：
             str：完整 prompt 字符串
         """
-        context_block = f"已有内容摘要：\n{existing_summary}\n\n" if existing_summary else ""
+        context_block = (
+            f"Prior content summary:\n{existing_summary}\n\n"
+            if existing_summary
+            else ""
+        )
         return (
-            "你是一个叙事分析助手。请从以下文本中提取所有话语承诺对象，"
-            "以 JSON 数组格式输出，不要添加任何解释。\n\n"
+            "You are a narrative analysis assistant. Extract every discourse commitment object "
+            "from the text below and return a JSON array only.\n\n"
+            "All content values must be in English.\n\n"
             f"{context_block}"
-            f"当前节内容：\n{section_content}\n\n"
-            "每个承诺对象格式如下：\n"
+            f"Current section content:\n{section_content}\n\n"
+            "Each commitment object must use this schema:\n"
             "{\n"
-            '  "content": "承诺的简洁描述（不超过60字）",\n'
+            '  "content": "a concise commitment summary",\n'
             '  "commitment_type": "fact"|"commitment"|"open_loop"|"hypothesis"|"style_policy",\n'
             '  "constraint_type": "immutable"|"stateful"|"soft"\n'
             "}\n\n"
-            "类型说明：\n"
-            "  fact         — 已确立的客观事实（人物特征、世界设定等）\n"
-            "  commitment   — 对后文的明确承诺（角色行动、情节走向等）\n"
-            "  open_loop    — 未解决的悬念或未完成的线索\n"
-            "  hypothesis   — 角色的猜测或推断（不约束后文，不注入 prompt）\n"
-            "  style_policy — 全局风格要求（叙事视角、语气、格式等）\n\n"
-            "约束强度说明：\n"
-            "  immutable — 叙事上不可逆的设定（角色身份、世界规则、已发生事件等），后续节不得矛盾\n"
-            "  stateful  — 可随情节推进合法演变的状态（位置、关系、情绪等），更新须前后连贯\n"
-            "  soft      — 风格偏好或非核心细节，可酌情调整\n\n"
-            "输出 JSON 数组，无其他内容："
+            "Type guide:\n"
+            "  fact         - an established fact that later sections should not contradict\n"
+            "  commitment   - a forward-looking commitment about what the text will do next\n"
+            "  open_loop    - an unresolved question, tension, or dangling thread\n"
+            "  hypothesis   - a speculation or inference that should stay tentative\n"
+            "  style_policy - a global style rule such as tone, viewpoint, or formatting\n\n"
+            "Constraint strength guide:\n"
+            "  immutable - a stable setting or event that should remain fixed later\n"
+            "  stateful  - a condition that may evolve but must stay coherent over time\n"
+            "  soft      - a preference or lower-priority detail that may be adjusted\n\n"
+            "Current section content must be analyzed together with the prior summary when provided.\n"
+            "Return a JSON array only."
         )
 
     def _parse_output(self, raw: str) -> List[dict]:
