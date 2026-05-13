@@ -63,6 +63,7 @@ class Generator:
         orchestrator_attempt: int = 1,
         section_papers: Optional[List[GlobalPaperEntry]] = None,
         citation_retry_hint: Optional[str] = None,
+        length_retry_hint: Optional[str] = None,
     ) -> Tuple[str, Decision]:
         """
         生成内容并返回决策对象。
@@ -76,6 +77,7 @@ class Generator:
             orchestrator_attempt: 协调器层尝试序号（1-based）
             section_papers:      当节最相关的 GlobalPaperEntry 列表（可选）
             citation_retry_hint: 上一轮因引用密度不足失败时的强制提示；None 表示首次尝试
+            length_retry_hint:   上一轮因长度不达标失败时的强制提示；None 表示首次尝试
 
         返回值：
             Tuple[str, Decision]：(生成内容含 [Rx] 标记, 决策对象)
@@ -95,6 +97,7 @@ class Generator:
                 section_intent=section_intent,
                 section_papers=section_papers,
                 citation_retry_hint=citation_retry_hint,
+                length_retry_hint=length_retry_hint,
             )
             self.logger.debug(
                 "第 %d 次尝试生成，section=%s temp=%.2f papers=%d",
@@ -181,6 +184,7 @@ class Generator:
         section_intent: Optional[SectionIntent],
         section_papers: Optional[List[GlobalPaperEntry]] = None,
         citation_retry_hint: Optional[str] = None,
+        length_retry_hint: Optional[str] = None,
     ) -> str:
         """
         构建生成 prompt。
@@ -193,7 +197,8 @@ class Generator:
             5. 最近已生成内容
             6. 任务描述
             7. 引用重试警告（仅在上一轮因引用密度不足失败时出现，紧贴输出规范前）
-            8. JSON 输出要求
+            8. 长度重试警告（仅在上一轮因长度不达标失败时出现，紧贴输出规范前）
+            9. JSON 输出要求
         """
         state_desc = state.to_prompt()
         truncated = recent_content[-self.RECENT_CONTENT_LIMIT:] if recent_content else "(none)"
@@ -212,7 +217,7 @@ class Generator:
             if section_intent.word_target is not None:
                 word_count_instruction = (
                     f"\n[Length requirement] Write approximately {section_intent.word_target} words "
-                    f"for this section. Aim for at least {int(section_intent.word_target * 0.85)} words. "
+                    f"for this section. Aim for at least {int(section_intent.word_target * 0.72)} words. "
                     "Expand every key point with concrete examples, evidence, and analysis. "
                     "Do not truncate early.\n"
                 )
@@ -228,6 +233,14 @@ class Generator:
             "You must satisfy this requirement in the current response.\n"
         ) if citation_retry_hint else ""
 
+        # 长度重试警告：仅在 orchestrator 检测到上一轮长度不达标时注入，
+        # 同样紧贴 JSON 输出规范正前方。
+        length_warning = (
+            f"\n[!!LENGTH REQUIREMENT NOT MET IN PREVIOUS ATTEMPT!!]\n"
+            f"{length_retry_hint}\n"
+            "You must satisfy this length requirement in the current response.\n"
+        ) if length_retry_hint else ""
+
         return (
             "You are a long-form writing system.\n"
             f"\nCurrent state:\n{state_desc}"
@@ -239,6 +252,7 @@ class Generator:
             f"\nRecent content:\n{truncated}"
             f"\n\nCurrent task:\n{task}"
             f"{citation_warning}"
+            f"{length_warning}"
             "\n\nReturn a JSON object with the following fields:"
             "\n- decision: the core writing decision for this section"
             "\n- reasoning: the reasoning behind that decision, optionally citing earlier section IDs."

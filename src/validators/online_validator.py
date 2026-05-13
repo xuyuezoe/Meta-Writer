@@ -21,8 +21,6 @@ import logging
 import re
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
-from examples.benchmark_template import is_document_level_constraint
-
 from ..core.decision import Decision
 from ..core.meta_state import MetaState
 from ..core.state import GenerationState
@@ -66,6 +64,11 @@ class OnlineValidator:
 
     # 格式检查阈值（词数，不再用字符数）
     _MIN_WORDS = 200
+
+    # 长度惩罚比例阈值（相对于 word_target）
+    _LENGTH_SEVERE_FLOOR = 0.35   # 极度过短：低于此比例视为严重欠生成
+    _LENGTH_FLOOR = 0.72          # 过短下限
+    _LENGTH_CEIL = 1.3            # 过长上限
 
     # DCAS 阈值
     THRESHOLD_DCAS = 0.6
@@ -371,7 +374,44 @@ class OnlineValidator:
 
         word_count = len(content.split())
 
-        if word_count < self._MIN_WORDS:
+        if word_target is not None:
+            # 有目标词数时，使用比例阈值进行双侧惩罚
+            severe_floor = int(word_target * self._LENGTH_SEVERE_FLOOR)
+            floor = int(word_target * self._LENGTH_FLOOR)
+            ceil = int(word_target * self._LENGTH_CEIL)
+
+            if word_count < severe_floor:
+                issues.append(Issue(
+                    type="format",
+                    severity=IssueSeverity.MAJOR.value,
+                    description=(
+                        f"Content is severely under-generated "
+                        f"(actual={word_count} target={word_target}). "
+                        "Drastically expand with evidence, analysis, and examples."
+                    ),
+                ))
+            elif word_count < floor:
+                issues.append(Issue(
+                    type="format",
+                    severity=IssueSeverity.MAJOR.value,
+                    description=(
+                        f"Content is too short "
+                        f"(actual={word_count} target={word_target}). "
+                        "Expand with more evidence, analysis, and examples."
+                    ),
+                ))
+            elif word_count > ceil:
+                issues.append(Issue(
+                    type="format",
+                    severity=IssueSeverity.MAJOR.value,
+                    description=(
+                        f"Content is too long "
+                        f"(actual={word_count} target={word_target}). "
+                        "Condense by cutting redundancy while preserving all key arguments."
+                    ),
+                ))
+        elif word_count < self._MIN_WORDS:
+            # 无目标词数时，退回绝对下限
             issues.append(Issue(
                 type="format",
                 severity=IssueSeverity.MAJOR.value,
@@ -379,17 +419,6 @@ class OnlineValidator:
                     f"Content is too short ({word_count} words < minimum {self._MIN_WORDS})"
                 ),
             ))
-        elif word_target is not None:
-            floor = int(word_target * 0.5)
-            if word_count < floor:
-                issues.append(Issue(
-                    type="format",
-                    severity=IssueSeverity.MAJOR.value,
-                    description=(
-                        f"Content is too short ({word_count} words < 50% of target {word_target}). "
-                        "Expand with more evidence, analysis, and examples."
-                    ),
-                ))
 
         leftover_tags = re.findall(
             r"<(decision|reasoning|expected_effect|confidence|content)>", content

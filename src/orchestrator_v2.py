@@ -214,6 +214,7 @@ class SelfCorrectingOrchestrator:
                 decision: Optional[Decision] = None
                 last_failure_reason: Optional[str] = None
                 citation_retry_hint: Optional[str] = None  # 每节重置；引用失败后由验证路径填充
+                length_retry_hint: Optional[str] = None    # 每节重置；长度验证失败后由验证路径填充
 
                 for attempt in range(self.MAX_RETRIES_PER_SECTION):
                     # 第二阶段：生成
@@ -229,6 +230,7 @@ class SelfCorrectingOrchestrator:
                             temperature=temperature,
                             section_papers=section_papers,
                             citation_retry_hint=citation_retry_hint,
+                            length_retry_hint=length_retry_hint,
                         )
                     except Exception as e:
                         self.logger.error("生成异常（section=%s attempt=%d）: %s", section_id, attempt + 1, e)
@@ -386,6 +388,50 @@ class SelfCorrectingOrchestrator:
                                 "citation-only failure detected, overriding diagnosis to local_rewrite: section=%s",
                                 section_id,
                             )
+
+                    # 长度失败检测：从 format issue 中提取 actual/target 词数，构建 length_retry_hint。
+                    # 目的：让下轮生成明确知道上次的实际词数与目标的差距。
+                    length_format_issues = [
+                        i for i in (report.issues if report else [])
+                        if i.type == "format" and "actual=" in i.description
+                    ]
+                    if length_format_issues:
+                        _m_actual = re.search(r'actual=(\d+)', length_format_issues[0].description)
+                        _m_target = re.search(r'target=(\d+)', length_format_issues[0].description)
+                        if _m_actual and _m_target:
+                            _actual = int(_m_actual.group(1))
+                            _target = int(_m_target.group(1))
+                            if _actual < _target:
+                                if _actual < int(_target * 0.35):
+                                    length_retry_hint = (
+                                        f"Previous attempt was severely under-generated: "
+                                        f"only {_actual} words against a target of {_target} words. "
+                                        f"You MUST write approximately {_target} words. "
+                                        "Every paragraph must be fully developed with citations, "
+                                        "evidence, and in-depth analysis. Do not truncate early."
+                                    )
+                                else:
+                                    length_retry_hint = (
+                                        f"Previous attempt was too short: {_actual} words "
+                                        f"against a target of {_target} words. "
+                                        f"Write approximately {_target} words. "
+                                        "Expand every key point with concrete evidence, "
+                                        "analysis, and examples. Do not truncate early."
+                                    )
+                            else:
+                                length_retry_hint = (
+                                    f"Previous attempt was too long: {_actual} words "
+                                    f"against a target of {_target} words. "
+                                    f"Condense to approximately {_target} words. "
+                                    "Cut redundant phrasing and repetition while "
+                                    "preserving all key arguments and evidence."
+                                )
+                            self.logger.info(
+                                "length_retry_hint set for next attempt: section=%s actual=%d target=%d",
+                                section_id, _actual, _target,
+                            )
+                    else:
+                        length_retry_hint = None
 
                     # 执行修复
                     if not _citation_only_failure and diagnosis.repair_scope == "partial_rollback":
