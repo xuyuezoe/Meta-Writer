@@ -1,5 +1,5 @@
 """
-CorpusLoader — loads the metabench paper corpus and provides BM25 search.
+CorpusLoader — loads the local Markdown paper corpus and provides BM25 search.
 
 The BM25 index is built in memory at first call to load().  With 200 papers
 and typical chunk counts (~20 chunks/paper), the full index fits comfortably
@@ -91,7 +91,7 @@ class CorpusLoader:
 
     Usage
     -----
-    corpus = CorpusLoader("./metabench/output")
+    corpus = CorpusLoader("./data_sample/med_papers")
     corpus.load()           # parses all .md files, builds index
     results = corpus.search("treatment of mitochondrial disease", top_k=5)
 

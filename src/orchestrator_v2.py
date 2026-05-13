@@ -74,7 +74,7 @@ class SelfCorrectingOrchestrator:
         memory_path: str = "./sessions",
         session_name: str = "session",
         output_dir: str = "./outputs",
-        corpus_dir: str = "./metabench/output",
+        corpus_dir: str = "./data_sample/med_papers",
     ):
         """
         初始化自我修正协调器
@@ -88,7 +88,7 @@ class SelfCorrectingOrchestrator:
             memory_path: DTG 存储路径
             session_name: 会话名称
             output_dir: 输出目录（运行日志和相关工件的统一落盘位置）
-            corpus_dir: 论文数据集目录（metabench/output/*.md）
+            corpus_dir: 论文数据集目录（Markdown paper corpus）
         """
         self.llm_client       = llm_client
         self.dtg              = DTGStore(memory_path, session_name=session_name)
@@ -117,6 +117,8 @@ class SelfCorrectingOrchestrator:
         self._corpus = CorpusLoader(corpus_dir)
         self.retriever = HyDERetriever(self._corpus, llm_client=llm_client)
         self.retriever.attach_run_logger(self.run_logger)
+        self.last_chunk_map: List[Dict[str, Any]] = []
+        self.last_citation_manifest: List[Dict[str, Any]] = []
 
     # ------------------------------------------------------------------
     # 主入口
@@ -525,6 +527,11 @@ class SelfCorrectingOrchestrator:
                         current_idx += 1
 
             # 组装最终文本（含引用重编号和参考文献列表）
+            self.last_chunk_map = self._build_chunk_map(outline, generated_content)
+            self.last_citation_manifest = self._build_citation_manifest(
+                generated_content=generated_content,
+                global_index=global_index,
+            )
             final_text = self._post_process_references_v2(
                 outline, generated_content, global_index
             )
@@ -1210,6 +1217,141 @@ Annotated text:"""
             counter,
         )
         return assembled
+
+    def _build_chunk_map(
+        self,
+        outline: Dict[str, str],
+        generated_content: Dict[str, str],
+    ) -> List[Dict[str, Any]]:
+        chunk_map: List[Dict[str, Any]] = []
+        total_sections = len(outline)
+        for section_index, (section_id, title) in enumerate(outline.items(), start=1):
+            text = generated_content.get(section_id, "").strip()
+            if section_index == 1:
+                section_key = "introduction"
+            elif section_index == total_sections:
+                section_key = "conclusion"
+            else:
+                section_key = "main_body"
+            chunk_map.append(
+                {
+                    "chunk_id": section_id,
+                    "section_id": section_id,
+                    "title": title,
+                    "text": text,
+                    "word_count": len(text.split()),
+                    "section_index": section_index,
+                    "section_key": section_key,
+                }
+            )
+        return chunk_map
+
+    def _build_citation_manifest(
+        self,
+        *,
+        generated_content: Dict[str, str],
+        global_index: GlobalPaperIndex,
+    ) -> List[Dict[str, Any]]:
+        if global_index.is_empty():
+            return []
+
+        manifest: List[Dict[str, Any]] = []
+        citation_id = 1
+        for section_id, content in generated_content.items():
+            for sentence_text, r_index in self._extract_citation_events(content):
+                entry = global_index.get_by_r(r_index)
+                if entry is None:
+                    continue
+                manifest.append(
+                    {
+                        "citation_id": f"C{citation_id:04d}",
+                        "chunk_id": section_id,
+                        "section_id": section_id,
+                        "source_id": entry.paper_id,
+                        "source_type": self._infer_source_type(entry),
+                        "claim_role": self._infer_claim_role(section_id, sentence_text),
+                        "claim_span": sentence_text,
+                        "source_excerpt": (entry.abstract or entry.top_chunk_text or "")[:1200],
+                        "r_index": entry.r_index,
+                        "title": entry.title,
+                        "doi": entry.doi,
+                    }
+                )
+                citation_id += 1
+        return manifest
+
+    @staticmethod
+    def _extract_citation_events(content: str) -> List[Tuple[str, int]]:
+        events: List[Tuple[str, int]] = []
+        if not content.strip():
+            return events
+
+        sentence_pattern = re.compile(
+            r"[^.!?]+[.!?]+(?:\s*\[R\d+\])+|[^.!?]+(?:\s*\[R\d+\])+"
+        )
+        for match in sentence_pattern.finditer(content):
+            sentence = match.group(0).strip()
+            markers = re.findall(r"\[R(\d+)\]", sentence)
+            if not markers:
+                continue
+            clean_sentence = re.sub(r"\s*\[R\d+\]", "", sentence).strip()
+            if not clean_sentence:
+                continue
+            for marker in markers:
+                events.append((clean_sentence, int(marker)))
+        return events
+
+    @staticmethod
+    def _infer_claim_role(section_id: str, sentence_text: str) -> str:
+        section_key = section_id.casefold()
+        text = sentence_text.casefold()
+        if section_key == "sec1":
+            if any(term in text for term in ("define", "defined", "refers to", "characterized")):
+                return "definition"
+            return "background"
+        if section_key == "sec2":
+            return "comparison"
+        if section_key == "sec3":
+            return "mechanism"
+        if section_key == "sec4":
+            return "evidence_synthesis"
+        if section_key == "sec5":
+            if any(term in text for term in ("should", "recommend", "must", "clinical practice")):
+                return "practice"
+            return "interpretation"
+        if section_key in {"sec6", "sec7"}:
+            return "gap"
+        if any(term in text for term in ("should", "recommend", "must")):
+            return "recommendation"
+        if any(term in text for term in ("compare", "compared", "higher", "lower", "versus")):
+            return "comparison"
+        if any(term in text for term in ("mechanism", "pathophysiology", "plaque", "thrombus")):
+            return "mechanism"
+        return "background"
+
+    @staticmethod
+    def _infer_source_type(entry: GlobalPaperEntry) -> str:
+        text = f"{entry.title}\n{entry.abstract}\n{entry.top_chunk_text}".casefold()
+        source_type_terms = (
+            ("meta_analysis", ("meta-analysis", "meta analysis")),
+            ("systematic_review", ("systematic review",)),
+            ("guideline", ("guideline", "guidelines", "consensus statement")),
+            ("rct", ("randomized", "randomised", "placebo-controlled")),
+            ("trial", ("trial", "trials")),
+            ("prospective", ("prospective",)),
+            ("cohort", ("cohort",)),
+            ("retrospective", ("retrospective",)),
+            ("case_control", ("case-control", "case control")),
+            ("observational", ("observational", "registry")),
+            ("mechanistic", ("mechanistic", "molecular", "pathway")),
+            ("animal", ("animal model", "murine", "mouse", "rat model")),
+            ("in_vitro", ("in vitro", "cell line")),
+            ("narrative", ("narrative review",)),
+        )
+        for source_type, terms in source_type_terms:
+            if any(term in text for term in terms):
+                return source_type
+        return "observational"
 
     def _assemble_text(
         self,

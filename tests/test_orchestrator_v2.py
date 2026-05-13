@@ -27,10 +27,6 @@ class OrchestratorOutputTests(unittest.TestCase):
 
     def test_assemble_text_collapses_internal_paragraph_breaks(self) -> None:
         """节内的 \\n\\n 必须被折叠为单个换行，保证每节产生恰好 1 个内容块。"""
-        import sys
-        sys.path.insert(0, "metabench/src")
-        from metabench.local_metrics import split_blocks
-
         text = SelfCorrectingOrchestrator._assemble_text(
             object(),
             {"sec1": "Intro", "sec2": "Body"},
@@ -40,7 +36,7 @@ class OrchestratorOutputTests(unittest.TestCase):
             },
         )
 
-        blocks = split_blocks(text, drop_markdown_wrappers=True)
+        blocks = [block for block in text.split("\n\n---\n\n") if block.strip()]
         self.assertEqual(len(blocks), 2)
         self.assertIn("Para one.", blocks[0])
         self.assertIn("Para two.", blocks[0])

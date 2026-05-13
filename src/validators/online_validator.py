@@ -35,6 +35,15 @@ if TYPE_CHECKING:
     from ..logging.run_logger import RunLogger
 
 
+DOCUMENT_LEVEL_CONSTRAINT_PREFIX = "Document-level requirement: "
+
+
+def is_document_level_constraint(requirement: str) -> bool:
+    """Return whether the constraint is explicitly tagged as document-level."""
+
+    return requirement.startswith(DOCUMENT_LEVEL_CONSTRAINT_PREFIX)
+
+
 class OnlineValidator:
     """
     在线验证器
