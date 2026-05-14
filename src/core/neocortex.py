@@ -34,6 +34,7 @@ class NeocortexItem:
     item_id: str
     content: str
     source_id: str
+    source_kind: str = "unknown"
     activation_level: float = 0.6
     memory_state: str = "active"
     is_static: bool = False
@@ -44,6 +45,7 @@ class NeocortexItem:
         cls,
         content: str,
         source_id: str,
+        source_kind: str = "unknown",
         activation_level: float = 0.6,
         memory_state: str = "active",
         is_static: bool = False,
@@ -54,6 +56,7 @@ class NeocortexItem:
             item_id=str(uuid.uuid4()),
             content=content,
             source_id=source_id,
+            source_kind=source_kind,
             activation_level=activation_level,
             memory_state=memory_state,
             is_static=is_static,
@@ -66,6 +69,7 @@ class NeocortexItem:
             "item_id": self.item_id,
             "content": self.content,
             "source_id": self.source_id,
+            "source_kind": self.source_kind,
             "activation_level": round(self.activation_level, 3),
             "memory_state": self.memory_state,
             "is_static": self.is_static,
@@ -79,6 +83,7 @@ class NeocortexItem:
             item_id=data.get("item_id", data.get("id", str(uuid.uuid4()))),
             content=data.get("content", ""),
             source_id=data.get("source_id", ""),
+            source_kind=data.get("source_kind", "unknown"),
             activation_level=data.get("activation_level", 0.6),
             memory_state=data.get("memory_state", "active"),
             is_static=data.get("is_static", False),

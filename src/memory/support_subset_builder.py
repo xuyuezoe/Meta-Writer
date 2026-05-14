@@ -13,7 +13,10 @@
 被依赖：Orchestrator
 """
 
+import hashlib
 import logging
+import re
+import string
 from typing import Any, Dict, List, Set, Tuple
 
 
@@ -28,11 +31,13 @@ class SupportSubsetBuilder:
         similarity_service: 语义相似度服务，提供 compute_similarity()
     """
 
-    def __init__(self, dtg_store, discourse_ledger, neocortex_store, similarity_service):
+    def __init__(self, dtg_store, discourse_ledger, neocortex_store, similarity_service, llm_client=None):
         self.dtg_store = dtg_store
         self.discourse_ledger = discourse_ledger
         self.neocortex_store = neocortex_store
         self.similarity_service = similarity_service
+        self.llm_client = llm_client
+        self._abstract_cache: Dict[Tuple[str, str, str], str] = {}
         self.logger = logging.getLogger(__name__)
 
     def build_query_from_intent(self, section_intent) -> str:
@@ -43,14 +48,14 @@ class SupportSubsetBuilder:
         if local_goal:
             parts.append(str(local_goal))
 
-        open_loops = getattr(section_intent, "open_loops_to_advance", [])
+        open_loops = getattr(section_intent, "open_loops_to_advance", []) or []
         if open_loops:
             if isinstance(open_loops, (list, tuple, set)):
                 parts.extend(str(item) for item in open_loops if item)
             else:
                 parts.append(str(open_loops))
 
-        commitments = getattr(section_intent, "commitments_to_maintain", [])
+        commitments = getattr(section_intent, "commitments_to_maintain", []) or []
         if commitments:
             if isinstance(commitments, (list, tuple, set)):
                 parts.extend(str(item) for item in commitments if item)
@@ -105,9 +110,8 @@ class SupportSubsetBuilder:
 
         return ""
 
-    def retrieve_anchor_nodes(self, section_intent, top_k: int = 2) -> List[Dict]:
+    def retrieve_anchor_nodes(self, query_text: str, top_k: int = 2) -> List[Dict]:
         """Step1: 在 DTG 中召回语义相关锚点节点。"""
-        query_text = self.build_query_from_intent(section_intent)
         candidate_nodes = self.collect_retrievable_dtg_nodes()
         scored_nodes: List[Dict] = []
 
@@ -131,7 +135,7 @@ class SupportSubsetBuilder:
         self,
         anchor_nodes,
         node_budget: int = 6,
-    ) -> Tuple[Set[Tuple[str, str]], Set[Tuple[str, str, str]]]:
+    ) -> Tuple[Set[Tuple[str, str]], Set[Tuple[str, str, str]], List[Tuple[str, str]]]:
         """Step2: 从锚点沿高权重边扩展 DTG 支持节点。"""
         max_hops = 2
         top_b = 2
@@ -139,6 +143,7 @@ class SupportSubsetBuilder:
 
         selected_nodes: Set[Tuple[str, str]] = set()
         selected_edges: Set[Tuple[str, str, str]] = set()
+        selected_node_order: List[Tuple[str, str]] = []
         frontier: List[str] = []
 
         for anchor in anchor_nodes:
@@ -146,11 +151,14 @@ class SupportSubsetBuilder:
             if not node_id:
                 continue
             node_type = anchor.get("node_type") or self.infer_node_type(node_id)
-            selected_nodes.add((node_id, node_type))
+            node_tuple = (node_id, node_type)
+            if node_tuple not in selected_nodes:
+                selected_nodes.add(node_tuple)
+                selected_node_order.append(node_tuple)
             frontier.append(node_id)
 
         if len(selected_nodes) >= node_budget:
-            return selected_nodes, selected_edges
+            return selected_nodes, selected_edges, selected_node_order
 
         for hop in range(1, max_hops + 1):
             threshold = hop_thresholds[hop]
@@ -175,19 +183,22 @@ class SupportSubsetBuilder:
                     neighbor_type = self.infer_node_type(neighbor_id)
 
                     selected_edges.add((source, target, edge_type))
-                    selected_nodes.add((neighbor_id, neighbor_type))
+                    neighbor_tuple = (neighbor_id, neighbor_type)
+                    if neighbor_tuple not in selected_nodes:
+                        selected_nodes.add(neighbor_tuple)
+                        selected_node_order.append(neighbor_tuple)
 
                     if neighbor_id not in next_frontier:
                         next_frontier.append(neighbor_id)
 
                     if len(selected_nodes) >= node_budget:
-                        return selected_nodes, selected_edges
+                        return selected_nodes, selected_edges, selected_node_order
 
             frontier = next_frontier
             if not frontier:
                 break
 
-        return selected_nodes, selected_edges
+        return selected_nodes, selected_edges, selected_node_order
 
     def infer_node_type(self, node_id: str) -> str:
         """根据 node_id 和现有存储推断节点类型。"""
@@ -292,7 +303,9 @@ class SupportSubsetBuilder:
             active_budget=2,
             dormant_budget=1,
             archived_budget=1,
-            archived_sim_gate=0.85,
+            dormant_sim_gate=0.20,
+            archived_sim_gate=0.25,
+            decision_quota=1,
         )
 
         if isinstance(result, tuple) and len(result) == 2:
@@ -332,12 +345,256 @@ class SupportSubsetBuilder:
             "text_preview": self._preview(dsl_item.get("text", "")),
         }
 
-    def build(self, section_intent, node_budget: int = 6, dsl_budget: int = 4) -> Dict:
+    def _build_selected_dtg_nodes(
+        self,
+        selected_node_order: List[Tuple[str, str]],
+        query_text: str,
+        state=None,
+        node_budget: int = 6,
+    ) -> List[Dict]:
+        selected_dtg_nodes: List[Dict] = []
+        supported_types = {"content_node", "intent_node", "decision_node"}
+
+        for node_id, node_type in selected_node_order[:node_budget]:
+            if node_type not in supported_types:
+                continue
+
+            raw_text = self._get_selected_node_raw_text(node_id, node_type, state)
+            if not raw_text:
+                continue
+
+            abstract = self._abstract_selected_dtg_node(
+                node_id=node_id,
+                node_type=node_type,
+                raw_text=raw_text,
+                query_text=query_text,
+            )
+            selected_dtg_nodes.append({
+                "node_id": node_id,
+                "node_type": node_type,
+                "raw_text": raw_text,
+                "abstract": abstract,
+            })
+
+        return selected_dtg_nodes
+
+    def _get_selected_node_raw_text(self, node_id: str, node_type: str, state=None) -> str:
+        if node_type == "content_node":
+            if not node_id.startswith("content:") or state is None:
+                return ""
+            section_id = node_id.replace("content:", "", 1)
+            summary = getattr(state, "section_summaries", {}).get(section_id, "")
+            if summary:
+                return str(summary).strip()
+            snippet = getattr(state, "section_snippets", {}).get(section_id, "")
+            return str(snippet).strip()
+
+        if node_type == "intent_node":
+            if node_id.startswith("intent:"):
+                section_id = node_id.replace("intent:", "", 1)
+                intent_node = self.dtg_store.get_intent_node(section_id)
+            else:
+                intent_node = next(
+                    (
+                        node for node in self.dtg_store.intent_by_section.values()
+                        if isinstance(node, dict) and node.get("id") == node_id
+                    ),
+                    None,
+                )
+            if isinstance(intent_node, dict):
+                return str(intent_node.get("content", "")).strip()
+            return ""
+
+        if node_type == "decision_node":
+            decision = self.dtg_store.decision_by_id.get(node_id)
+            if decision is None:
+                return ""
+            return "\n".join([
+                str(getattr(decision, "decision", "")),
+                str(getattr(decision, "reasoning", "")),
+                str(getattr(decision, "expected_effect", "")),
+            ]).strip()
+
+        return ""
+
+    def _abstract_selected_dtg_node(
+        self,
+        node_id: str,
+        node_type: str,
+        raw_text: str,
+        query_text: str,
+    ) -> str:
+        text_hash = hashlib.sha256(raw_text.encode("utf-8")).hexdigest()
+        cache_key = (node_id, node_type, text_hash)
+        if cache_key in self._abstract_cache:
+            return self._abstract_cache[cache_key]
+
+        if self.llm_client is None:
+            fallback = self._fallback_selected_dtg_node_abstract(node_type, raw_text)
+            self._abstract_cache[cache_key] = fallback
+            return fallback
+
+        prompt = self._build_abstraction_prompt(node_type, raw_text, query_text)
+        for attempt in range(5):
+            try:
+                abstract = self.llm_client.generate(
+                    prompt,
+                    temperature=0.0,
+                    max_tokens=512,
+                    log_meta={
+                        "component": "SupportSubsetBuilder",
+                        "node_id": node_id,
+                        "node_type": node_type,
+                        "attempt": attempt + 1,
+                    },
+                ).strip()
+
+                if self._is_valid_abstract(abstract, raw_text, node_type):
+                    self._abstract_cache[cache_key] = abstract
+                    return abstract
+
+                self.logger.warning(
+                    "DTG abstraction invalid for %s/%s attempt %d/5",
+                    node_type,
+                    node_id,
+                    attempt + 1,
+                )
+            except Exception as e:
+                self.logger.warning(
+                    "DTG abstraction failed for %s/%s attempt %d/5: %s",
+                    node_type,
+                    node_id,
+                    attempt + 1,
+                    e,
+                )
+
+        fallback = self._fallback_selected_dtg_node_abstract(node_type, raw_text)
+        self._abstract_cache[cache_key] = fallback
+        return fallback
+
+    def _build_abstraction_prompt(self, node_type: str, raw_text: str, query_text: str) -> str:
+        base = (
+            "You are preparing retrieved memory for a writing system. "
+            "Return a concise declarative memory summary only. "
+            "Do not copy the source in full. Do not add new instructions.\n\n"
+            f"Current section retrieval query:\n{query_text}\n\n"
+            f"Source text:\n{raw_text}\n\n"
+        )
+
+        if node_type == "content_node":
+            return (
+                base +
+                "Task: Abstract this content memory into knowledge useful for the current section. "
+                "Preserve facts, arguments, and continuity cues. Do not restate the source in full.\n\n"
+                "Abstracted memory:"
+            )
+        if node_type == "intent_node":
+            return (
+                base +
+                "Task: Abstract this historical section intent into its planning core. "
+                "Keep only the topic goal and boundary. Do not preserve verbose writing instructions, "
+                "risk lists, success criteria, or 'do not cross' text verbatim.\n\n"
+                "Abstracted memory:"
+            )
+        return (
+            base +
+            "Task: Abstract this decision into declarative memory about useful writing decisions, "
+            "structure strategy, or cross-section continuity. Do not use instruction voice such as "
+            "'write', 'I must', 'the section requires', or 'this section must'.\n\n"
+            "Abstracted memory:"
+        )
+
+    def _is_valid_abstract(self, abstract: str, raw_text: str, node_type: str) -> bool:
+        cleaned = (abstract or "").strip()
+        if not cleaned:
+            return False
+
+        meaningful = cleaned.translate(str.maketrans("", "", string.punctuation)).strip()
+        if len(meaningful) < 8:
+            return False
+
+        template_markers = {
+            "abstracted memory:",
+            "abstracted knowledge point:",
+            "summary:",
+            "none",
+            "n/a",
+        }
+        if cleaned.lower() in template_markers:
+            return False
+
+        if node_type in {"intent_node", "decision_node"} and cleaned == raw_text.strip():
+            return False
+
+        return True
+
+    def _fallback_selected_dtg_node_abstract(self, node_type: str, raw_text: str) -> str:
+        if node_type == "content_node":
+            return raw_text.strip()
+        if node_type == "intent_node":
+            return self._fallback_intent_abstract(raw_text)
+        if node_type == "decision_node":
+            return self._fallback_decision_abstract(raw_text)
+        return raw_text.strip()
+
+    def _fallback_intent_abstract(self, raw_text: str) -> str:
+        lines = [line.strip() for line in raw_text.splitlines() if line.strip()]
+        for line in lines:
+            normalized = line.lower().replace("*", "").strip()
+            if normalized.startswith("goal:") or normalized.startswith("local_goal:"):
+                return self._clean_intent_fallback_line(line)
+
+        blocked = (
+            "do not cross",
+            "risk",
+            "success criteria",
+            "minimum success criteria",
+            "boundary",
+        )
+        for line in lines:
+            normalized = line.lower()
+            if any(marker in normalized for marker in blocked):
+                continue
+            if normalized.startswith("-"):
+                continue
+            return self._clean_intent_fallback_line(line)
+
+        return "Historical section intent established a prior planning goal."
+
+    def _clean_intent_fallback_line(self, line: str) -> str:
+        cleaned = line.strip()
+        cleaned = re.sub(r"^\s*[-*]+\s*", "", cleaned)
+        cleaned = cleaned.replace("**", "")
+        cleaned = re.sub(r"(?i)^local_goal\s*:\s*", "Goal: ", cleaned)
+        return cleaned.strip()
+
+    def _fallback_decision_abstract(self, raw_text: str) -> str:
+        text = raw_text.strip()
+        instruction_patterns = [
+            r"(?im)^\s*write\b.*$",
+            r"(?im)^\s*i must\b.*$",
+            r"(?im)^\s*the section requires\b.*$",
+            r"(?im)^\s*this section must\b.*$",
+        ]
+        for pattern in instruction_patterns:
+            text = re.sub(pattern, "", text)
+        text = re.sub(r"\n{2,}", "\n", text).strip()
+        if text:
+            return text
+        return "Prior decision established a structural or continuity strategy for the draft."
+
+    def build(self, section_intent, state=None, node_budget: int = 6, dsl_budget: int = 4) -> Dict:
         """Step5: 构建可用于 prompt 的支持子集结构。"""
         query_text = self.build_query_from_intent(section_intent)
-        anchor_nodes = self.retrieve_anchor_nodes(section_intent, top_k=2)
-        selected_nodes, selected_edges = self.expand_from_anchor_nodes(
+        anchor_nodes = self.retrieve_anchor_nodes(query_text, top_k=2)
+        selected_nodes, selected_edges, selected_node_order = self.expand_from_anchor_nodes(
             anchor_nodes,
+            node_budget=node_budget,
+        )
+        selected_dtg_nodes = self._build_selected_dtg_nodes(
+            selected_node_order=selected_node_order,
+            query_text=query_text,
+            state=state,
             node_budget=node_budget,
         )
         completed_nodes, selected_dsl = self.structural_completion_and_dsl_backtracking(
@@ -356,6 +613,7 @@ class SupportSubsetBuilder:
         return {
             "query_text": query_text,
             "anchor_nodes": anchor_nodes,
+            "selected_dtg_nodes": selected_dtg_nodes,
             "dtg_nodes": completed_nodes,
             "selected_edges": selected_edges,
             "dsl_entries": selected_dsl,
@@ -369,6 +627,13 @@ class SupportSubsetBuilder:
                 "dtg_nodes": [
                     {"node_id": node_id, "node_type": node_type}
                     for node_id, node_type in completed_nodes
+                ],
+                "selected_dtg_nodes": [
+                    {
+                        "node_id": item.get("node_id"),
+                        "node_type": item.get("node_type"),
+                    }
+                    for item in selected_dtg_nodes
                 ],
                 "selected_edges": [
                     self._compact_edge(edge) for edge in selected_edges

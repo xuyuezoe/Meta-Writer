@@ -175,7 +175,9 @@ class NeocortexStore:
         active_budget: int = 2,
         dormant_budget: int = 1,
         archived_budget: int = 1,
-        archived_sim_gate: float = 0.85,
+        dormant_sim_gate: float = 0.20,
+        archived_sim_gate: float = 0.25,
+        decision_quota: int = 1,
     ) -> Tuple[List[Dict], List[str]]:
         """
         检索知识项
@@ -185,7 +187,9 @@ class NeocortexStore:
             active_budget: 活跃状态预算
             dormant_budget: 休眠状态预算
             archived_budget: 归档状态预算
+            dormant_sim_gate: 休眠项相似度阈值
             archived_sim_gate: 归档项相似度阈值
+            decision_quota: decision 类型最大数量
 
         返回值：
             Tuple[List[Dict], List[str]]: (检索到的项目列表, 项目ID列表)
@@ -200,6 +204,7 @@ class NeocortexStore:
         active_candidates = []
         dormant_candidates = []
         archived_candidates = []
+        archived_all_candidates = []
 
         # 计算相似度并分类
         for item in self.items.values():
@@ -209,21 +214,32 @@ class NeocortexStore:
                 "item_id": item.item_id,
                 "content": item.content,
                 "source_id": item.source_id,
+                "source_kind": item.source_kind,
                 "sim_score": sim_score,
                 "memory_state": item.memory_state,
+                "activation_level": item.activation_level,
             }
 
             if item.memory_state == "active":
                 active_candidates.append(item_info)
             elif item.memory_state == "dormant":
-                dormant_candidates.append(item_info)
-            elif item.memory_state == "archived" and sim_score >= archived_sim_gate:
-                archived_candidates.append(item_info)
+                if sim_score >= dormant_sim_gate:
+                    dormant_candidates.append(item_info)
+            elif item.memory_state == "archived":
+                archived_all_candidates.append({
+                    "item_id": item.item_id,
+                    "source_id": item.source_id,
+                    "sim_score": sim_score,
+                    "activation_level": item.activation_level,
+                })
+                if sim_score >= archived_sim_gate:
+                    archived_candidates.append(item_info)
 
         # 按相似度降序排序
         active_candidates.sort(key=lambda x: x["sim_score"], reverse=True)
         dormant_candidates.sort(key=lambda x: x["sim_score"], reverse=True)
         archived_candidates.sort(key=lambda x: x["sim_score"], reverse=True)
+        archived_all_candidates.sort(key=lambda x: x["sim_score"], reverse=True)
 
         # 按预算选取
         selected_items = (
@@ -234,6 +250,38 @@ class NeocortexStore:
 
         # 再次按相似度降序排序
         selected_items.sort(key=lambda x: x["sim_score"], reverse=True)
+
+        # decision 类型配额过滤
+        decision_count = 0
+        quota_filtered = []
+        for item in selected_items:
+            kind = item.get("source_kind", "unknown")
+            if kind == "decision":
+                if decision_count >= decision_quota:
+                    continue
+                decision_count += 1
+            quota_filtered.append(item)
+
+        selected_items = quota_filtered
+
+        # 保底回补：确保至少 MIN_RETRIEVAL_GUARANTEE 个 item
+        MIN_RETRIEVAL_GUARANTEE = 2
+        if len(selected_items) < MIN_RETRIEVAL_GUARANTEE:
+            existing_ids = {item["item_id"] for item in selected_items}
+            backfill_pool = []
+            for item in active_candidates + dormant_candidates + archived_candidates:
+                if item["item_id"] in existing_ids:
+                    continue
+                if item.get("source_kind") == "decision" and decision_count >= decision_quota:
+                    continue
+                backfill_pool.append(item)
+            backfill_pool.sort(key=lambda x: x["sim_score"], reverse=True)
+            for candidate in backfill_pool:
+                selected_items.append(candidate)
+                if candidate.get("source_kind") == "decision":
+                    decision_count += 1
+                if len(selected_items) >= MIN_RETRIEVAL_GUARANTEE:
+                    break
 
         # 提取选中的项目ID
         selected_item_ids = [item["item_id"] for item in selected_items]
@@ -248,6 +296,7 @@ class NeocortexStore:
             "archived_candidates": [
                 self._compact_item_info(item) for item in archived_candidates
             ],
+            "archived_all_candidates": archived_all_candidates,
             "selected_items": [
                 self._compact_item_info(item) for item in selected_items
             ],
@@ -256,6 +305,7 @@ class NeocortexStore:
                 "active_budget": active_budget,
                 "dormant_budget": dormant_budget,
                 "archived_budget": archived_budget,
+                "dormant_sim_gate": dormant_sim_gate,
                 "archived_sim_gate": archived_sim_gate,
             },
         }
@@ -313,35 +363,33 @@ class NeocortexStore:
         """
         added_items = []
 
-        # Step 2: 处理 intent_node
-        intent_node = dtg_store.get_intent_node(section_id)
-        if intent_node and intent_node.get("confidence", 0) >= 0.7:
-            content = intent_node.get("content", "")
-            source_id = intent_node.get("id", "")
+        # Step 2: intent_node 不写入新皮层（intent 是写作指令，非长期知识）
 
-            if content:
-                if not self._is_duplicate_safe(content):
-                    item = NeocortexItem.create(
-                        content=content,
-                        source_id=source_id
-                    )
-                    self.add_item(item)
-                    added_items.append(item)
-
-        # Step 3: 处理 decision_node
+        # Step 3: 处理 decision_node（LLM 抽象后写入）
         decision = dtg_store.get_decision_for_section(section_id)
         if decision and decision.confidence >= 0.7:
-            content = f"{decision.decision} {decision.reasoning} {getattr(decision, 'expected_effect', '')}"
+            raw_content = f"{decision.decision} {decision.reasoning} {getattr(decision, 'expected_effect', '')}"
             source_id = decision.decision_id
 
-            if content:
-                if not self._is_duplicate_safe(content):
-                    item = NeocortexItem.create(
-                        content=content,
-                        source_id=source_id
-                    )
-                    self.add_item(item)
-                    added_items.append(item)
+            if raw_content:
+                abstraction_prompt = (
+                    "You are a knowledge abstraction assistant. "
+                    "Extract one key long-term knowledge point from the following text. "
+                    "Return only one sentence without explanation.\n\n"
+                    f"Text:\n{raw_content}\n\n"
+                    "Abstracted knowledge point:"
+                )
+                abstracted = llm_client.generate(abstraction_prompt, temperature=0.0, max_tokens=100).strip()
+
+                if abstracted:
+                    if not self._is_duplicate_safe(abstracted):
+                        item = NeocortexItem.create(
+                            content=abstracted,
+                            source_id=source_id,
+                            source_kind="decision",
+                        )
+                        self.add_item(item)
+                        added_items.append(item)
 
         # Step 4: 处理 content_node（需要 LLM 抽象）
         section_text = generated_content.get(section_id)
@@ -362,7 +410,8 @@ class NeocortexStore:
                 if not self._is_duplicate_safe(abstracted_content):
                     item = NeocortexItem.create(
                         content=abstracted_content,
-                        source_id=source_id
+                        source_id=source_id,
+                        source_kind="content",
                     )
                     self.add_item(item)
                     added_items.append(item)
@@ -395,7 +444,8 @@ class NeocortexStore:
                     if not self._is_duplicate_safe(content):
                         item = NeocortexItem.create(
                             content=content,
-                            source_id=source_id
+                            source_id=source_id,
+                            source_kind="dsl",
                         )
                         self.add_item(item)
                         added_items.append(item)

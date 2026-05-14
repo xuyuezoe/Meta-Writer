@@ -29,6 +29,7 @@ from .core.plan import PlanState, SectionIntent
 from .core.state import GenerationState
 from .evaluation.metric_collector import MetricCollector
 from .logging.correction_log import CorrectionLog
+from .logging.memory_reporter import MemoryReporter
 from .logging.run_logger import RunLogger
 from .memory.commitment_extractor import CommitmentExtractor
 from .memory.discourse_ledger import DiscourseLedger
@@ -99,6 +100,10 @@ class SelfCorrectingOrchestrator:
         self.console          = Console()
         self.logger           = logging.getLogger(__name__)
         self.run_logger       = RunLogger(output_dir=output_dir, session_name=session_name)
+        self.memory_reporter  = MemoryReporter(
+            output_dir=output_dir,
+            session_name=session_name,
+        )
         self.dsl              = DiscourseLedger(llm_client=llm_client, run_logger=self.run_logger)
         self.similarity_service = similarity_service
         self.neocortex       = NeocortexStore(similarity_service=self.similarity_service)
@@ -108,6 +113,7 @@ class SelfCorrectingOrchestrator:
             discourse_ledger=self.dsl,
             neocortex_store=self.neocortex,
             similarity_service=self.similarity_service,
+            llm_client=self.llm_client,
         )
         self.current_support_node_ids = []
 
@@ -211,9 +217,23 @@ class SelfCorrectingOrchestrator:
                     self.run_logger.log_planning(section_id, section_intent)
 
                 # 构建支持子集：第一版只记录，不改变 prompt / DSL 注入。
+                support_subset = None
                 try:
-                    support_subset = self.support_subset_builder.build(section_intent)
+                    support_subset = self.support_subset_builder.build(
+                        section_intent,
+                        state=state,
+                    )
                     self.current_support_node_ids = list(support_subset.get("node_ids", []))
+                    try:
+                        self.memory_reporter.write_section_support_subset(
+                            section_id=section_id,
+                            support_subset=support_subset,
+                        )
+                    except Exception as e:
+                        self.logger.warning(
+                            "memory_reporter.write_section_support_subset failed: %s",
+                            e,
+                        )
 
                     self._log_event_safe(
                         "support_subset_built",
@@ -274,6 +294,7 @@ class SelfCorrectingOrchestrator:
                             temperature=temperature,
                             section_papers=section_papers,
                             citation_retry_hint=citation_retry_hint,
+                            support_subset=support_subset,
                         )
                     except Exception as e:
                         self.logger.error("生成异常（section=%s attempt=%d）: %s", section_id, attempt + 1, e)
@@ -877,6 +898,19 @@ class SelfCorrectingOrchestrator:
                     "section_id": section_id,
                     "error": str(e),
                 }
+            )
+
+        try:
+            self.memory_reporter.write_neocortex_after_section(
+                section_id=section_id,
+                neocortex_store=self.neocortex,
+                dtg_store=self.dtg,
+                discourse_ledger=self.dsl,
+            )
+        except Exception as e:
+            self.logger.warning(
+                "memory_reporter.write_neocortex_after_section failed: %s",
+                e,
             )
 
         self._log_postprocess_skipped(section_id)

@@ -265,6 +265,7 @@ class LLMClient:
         if model_lower.startswith("glm") and host:
             return True
         return False
+    
     def _prefers_openai_chat(self) -> bool:
         """
         判断当前配置是否应优先使用 OpenAI Chat Completions。
@@ -275,12 +276,14 @@ class LLMClient:
             Anthropic Messages，会稳定命中 `/messages` 404。
         """
         lowered_model = self.model.strip().lower()
+        base = (self.base_url or "").strip().lower()
+
         if lowered_model.startswith("minimax"):
             return True
-
-        base = (self.base_url or "").strip().lower()
         if "api.minimaxi.com" in base:
             return True
+        if self._prefers_messages_protocol():
+            return False
 
         return self._looks_like_openai_model()
 
@@ -300,7 +303,7 @@ class LLMClient:
         if self._prefers_messages_protocol():
             return ["anthropic_messages", "openai_chat"]
 
-        if self._looks_like_openai_model():
+        if self._prefers_openai_chat():
             return ["openai_chat", "anthropic_messages"]
         
         return ["anthropic_messages", "openai_chat"]
@@ -318,7 +321,7 @@ class LLMClient:
             return True
         if self._prefers_messages_protocol():
             return False
-        return self._looks_like_openai_model()
+        return self._prefers_openai_chat()
 
     def _retry_delay(self, round_index: int) -> float:
         """

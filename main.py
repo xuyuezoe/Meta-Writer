@@ -326,6 +326,7 @@ def _run_single_task(
     show_preview: bool,
 ) -> Dict[str, object]:
     """运行单个任务。"""
+    from src.memory.bm25_similarity import BM25SimilarityService
     from src.orchestrator_v2 import SelfCorrectingOrchestrator
     from src.utils.llm_client import LLMClient
 
@@ -352,15 +353,7 @@ def _run_single_task(
         model=str(runtime_settings["model"]),
         base_url=runtime_settings["base_url"],
     )
-    from lightrag.llm.openai import openai_embed
-    from src.memory.lightrag_similarity import LightRAGSimilarityService
-
-    class EmbeddingWrapper:
-        def embedding_func(self, text):
-            return openai_embed(text)
-
-    rag = EmbeddingWrapper()
-    similarity_service = LightRAGSimilarityService(rag)
+    similarity_service = BM25SimilarityService()
 
     orchestrator = SelfCorrectingOrchestrator(
         client,
@@ -588,4 +581,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
->>>>>>> main
