@@ -6,6 +6,7 @@ from collections import OrderedDict
 from typing import Any
 
 from .content import ProxyQuestionSpec
+from .section_budget import build_section_budget
 from .schemas import GeneratedTask, TaskSpec
 
 
@@ -36,12 +37,21 @@ def _clean_text(text: str) -> str:
     """Normalize display text for prompts and outlines."""
 
     value = str(text)
+    value = value.replace("閳?", " - ")
+    value = value.replace("閳ワ拷", " - ")
     value = value.replace("鈥?", " - ")
-    value = value.replace("鈥�", " - ")
-    value = value.replace("—", " - ")
-    value = value.replace("–", " - ")
-    value = value.replace("бк", " - ")
+    value = value.replace("斜泻", " - ")
     return " ".join(value.split())
+
+
+def _resolve_body_target_words(spec: TaskSpec) -> int:
+    """Resolve the body-only target word count used by generation and scoring."""
+
+    resolved = spec.body_target_words if spec.body_target_words is not None else spec.target_words
+    body_target_words = int(resolved)
+    if body_target_words <= 0:
+        raise ValueError("body_target_words must be positive")
+    return body_target_words
 
 
 def build_must_include(spec: TaskSpec) -> list[str]:
@@ -64,10 +74,11 @@ def build_must_include(spec: TaskSpec) -> list[str]:
 def generate_prompt(spec: TaskSpec) -> str:
     """Generate the user-facing writing prompt for a benchmark task."""
 
+    body_target_words = _resolve_body_target_words(spec)
     focus_text = _join_human(spec.focus_points) or "evidence integration"
     closing_text = _join_human(spec.closing_requirements) or "limitations and future work"
     return _clean_text(
-        f"Write an approximately {spec.target_words}-word {spec.paper_type.replace('_', ' ')} "
+        f"Write an approximately {body_target_words}-word {spec.paper_type.replace('_', ' ')} "
         f"article in {spec.language} on {spec.topic} within {spec.domain}. "
         "Keep the piece as a long-form scholarly review rather than a case report, "
         "a popular-science summary, or an outline. "
@@ -211,28 +222,75 @@ def _proxy_question_to_dict(question: ProxyQuestionSpec) -> dict[str, Any]:
     }
 
 
-def generate_constraints(spec: TaskSpec) -> dict[str, Any]:
+def generate_constraints(
+    spec: TaskSpec,
+    *,
+    outline: dict[str, str] | None = None,
+) -> dict[str, Any]:
     """Generate scoring constraints for the task reference."""
 
     must_include = build_must_include(spec)
     expected_sections = max(3, int(spec.expected_sections))
-    return {
-        "required_length_words": int(spec.target_words),
+    resolved_outline = outline or generate_outline(spec)
+    body_target_words = _resolve_body_target_words(spec)
+    section_budget = build_section_budget(
+        task_id=spec.task_id,
+        body_target_words=body_target_words,
+        outline=resolved_outline,
+    )
+
+    constraints = {
+        "required_length_words": body_target_words,
+        "body_target_words": body_target_words,
+        "total_target_words": int(spec.target_words),
         "expected_sections": expected_sections,
         "must_include": must_include,
+        "section_word_targets": dict(section_budget.section_word_targets),
+        "section_roles": dict(section_budget.section_roles),
+        "required_sections": _build_required_completion_slots(
+            dict(section_budget.section_roles)
+        ),
         "periodic_requirements": [
             "The main body should include explicit comparison or synthesis at regular intervals.",
             "The second half should address limitations, evidence gaps, or future work.",
         ],
     }
+    constraints.update(section_budget.to_reference_payload())
+    return constraints
 
 
-def generate_review_task(spec: TaskSpec) -> GeneratedTask:
+def _build_required_completion_slots(section_roles: dict[str, str]) -> list[str]:
+    """Build completion slots from the task's section-role layout."""
+
+    closing_role_aliases = {"conclusion", "limitations_gaps"}
+    required_slots = ["introduction", "main_body"]
+
+    roles_in_use = {
+        str(role).strip()
+        for role in section_roles.values()
+        if str(role).strip()
+    }
+    if roles_in_use & closing_role_aliases:
+        if "limitations_gaps" in roles_in_use:
+            required_slots.append("limitations_gaps")
+        else:
+            required_slots.append("conclusion")
+    else:
+        required_slots.append("conclusion")
+
+    return required_slots
+
+
+def generate_review_task(
+    spec: TaskSpec,
+    *,
+    outline_override: dict[str, str] | None = None,
+) -> GeneratedTask:
     """Generate a complete review-style benchmark task."""
 
     prompt = generate_prompt(spec)
-    constraints = generate_constraints(spec)
-    outline = generate_outline(spec)
+    outline = dict(outline_override) if outline_override is not None else generate_outline(spec)
+    constraints = generate_constraints(spec, outline=outline)
     proxy_questions = generate_proxy_questions(spec)
     reference = {
         "task_id": spec.task_id,
@@ -256,11 +314,12 @@ def generate_review_task(spec: TaskSpec) -> GeneratedTask:
 def build_generation_constraints(spec: TaskSpec) -> list[str]:
     """Build runtime constraints for the main generation loop."""
 
+    body_target_words = _resolve_body_target_words(spec)
     focus_text = _join_human(spec.focus_points) or "the main evidence base"
     closing_text = _join_human(spec.closing_requirements) or "limitations and future work"
     return [
         f"Write the article in {spec.language}.",
-        f"Target length is about {spec.target_words} words overall.",
+        f"Target body length is about {body_target_words} words overall, excluding the final references list.",
         f"Develop approximately {max(3, int(spec.expected_sections))} major sections following the outline.",
         f"Keep the discussion centered on {spec.topic} within {spec.domain}.",
         f"Use {spec.organizer} as a visible organizing logic in the main body.",
@@ -275,10 +334,11 @@ def build_main_task_config(
     *,
     session_name: str | None = None,
     corpus_dir: str | None = None,
+    outline_override: dict[str, str] | None = None,
 ) -> dict[str, object]:
     """Adapt a clean MetaBench task into the main runtime config shape."""
 
-    generated = generate_review_task(spec)
+    generated = generate_review_task(spec, outline_override=outline_override)
     resolved_session_name = session_name or f"meta_bench_{spec.task_id}"
     config = {
         "task": generated.prompt,

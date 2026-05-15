@@ -129,6 +129,7 @@ class SelfCorrectingOrchestrator:
         task: str,
         constraints: List[str],
         outline: Dict[str, str],
+        reference: Optional[Dict[str, Any]] = None,
     ) -> Tuple[str, List[Decision], CorrectionLog]:
         """
         自我修正生成（主方法）
@@ -160,8 +161,12 @@ class SelfCorrectingOrchestrator:
             if self.run_logger is not None:
                 self.run_logger.log_global_index(global_index)
 
-            section_word_target = self._parse_section_word_target(task, outline)
-            self.logger.info("每节目标词数：%s", section_word_target)
+            section_word_targets = self._resolve_section_word_targets(
+                task=task,
+                outline=outline,
+                reference=reference,
+            )
+            self.logger.info("分节目标词数：%s", section_word_targets)
 
             rollback_count = 0
             current_idx = 0
@@ -188,6 +193,7 @@ class SelfCorrectingOrchestrator:
                     )
 
                 # 第一阶段：规划当前节（SectionPlanner）
+                section_word_target = section_word_targets.get(section_id)
                 section_intent = self._plan_section(
                     section_id=section_id,
                     section_title=section_title,
@@ -1040,6 +1046,39 @@ class SelfCorrectingOrchestrator:
             total = int(m.group(1).replace(',', ''))
             return max(100, total // num_sections)
         return None
+
+    @staticmethod
+    def _resolve_section_word_targets(
+        task: str,
+        outline: Dict[str, str],
+        reference: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Optional[int]]:
+        """Resolve per-section word targets, preferring explicit task reference data."""
+
+        if isinstance(reference, dict):
+            constraints = reference.get("constraints")
+            if isinstance(constraints, dict):
+                raw_targets = constraints.get("section_word_targets")
+                if isinstance(raw_targets, dict):
+                    resolved_targets: Dict[str, Optional[int]] = {}
+                    for section_id in outline:
+                        raw_value = raw_targets.get(section_id)
+                        if isinstance(raw_value, (int, float, str)):
+                            try:
+                                parsed = int(raw_value)
+                            except (TypeError, ValueError):
+                                parsed = None
+                            resolved_targets[section_id] = parsed if parsed and parsed > 0 else None
+                        else:
+                            resolved_targets[section_id] = None
+                    if any(value is not None for value in resolved_targets.values()):
+                        return resolved_targets
+
+        uniform_target = SelfCorrectingOrchestrator._parse_section_word_target(task, outline)
+        return {
+            section_id: uniform_target
+            for section_id in outline
+        }
 
     def _compute_low_trust_ratio(self, section_id: str) -> float:
         """

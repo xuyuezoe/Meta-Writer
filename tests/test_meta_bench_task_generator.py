@@ -57,6 +57,13 @@ class TaskGeneratorTests(unittest.TestCase):
         self.assertEqual(task.task_id, "med_s001")
         self.assertIn("4200-word", task.prompt)
         self.assertEqual(task.constraints["required_length_words"], 4200)
+        self.assertEqual(task.constraints["body_target_words"], 4200)
+        self.assertEqual(task.constraints["total_target_words"], 4200)
+        self.assertIn("section_word_targets", task.constraints)
+        self.assertIn("section_roles", task.constraints)
+        self.assertIn("required_sections", task.constraints)
+        self.assertEqual(set(task.constraints["section_word_targets"]), set(task.outline))
+        self.assertEqual(sum(task.constraints["section_word_targets"].values()), 4200)
         self.assertEqual(len(task.outline), 7)
         self.assertEqual(len(task.reference["proxy_questions"]), 5)
 
@@ -65,7 +72,7 @@ class TaskGeneratorTests(unittest.TestCase):
 
         self.assertIsInstance(constraints, list)
         self.assertTrue(all(isinstance(item, str) for item in constraints))
-        self.assertTrue(any("4200 words" in item for item in constraints))
+        self.assertTrue(any("4200 words overall, excluding the final references list" in item for item in constraints))
 
     def test_build_main_task_config_matches_main_runtime_shape(self):
         config = build_main_task_config(self.spec)
@@ -80,11 +87,83 @@ class TaskGeneratorTests(unittest.TestCase):
         self.assertIsInstance(config["outline"], dict)
         self.assertIsInstance(config["session_name"], str)
         self.assertIsInstance(config["reference"], dict)
+        reference_constraints = config["reference"]["constraints"]
+        self.assertEqual(reference_constraints["body_target_words"], 4200)
+        self.assertEqual(set(reference_constraints["section_word_targets"]), set(config["outline"]))
+        self.assertEqual(sum(reference_constraints["section_word_targets"].values()), 4200)
 
     def test_build_main_task_config_accepts_optional_corpus_dir(self):
         config = build_main_task_config(self.spec, corpus_dir="./data_sample/med_papers")
 
         self.assertEqual(config["corpus_dir"], "./data_sample/med_papers")
+
+    def test_body_target_words_override_changes_prompt_and_section_budgets(self):
+        spec = TaskSpec(
+            task_id="med_override",
+            topic="chemokines in alopecia areata",
+            domain="immunodermatology",
+            target_words=6083,
+            body_target_words=2916,
+            expected_sections=6,
+            practice_context="clinical dermatology decision-making",
+            organizer="chemokine pathway framework",
+            focus_points=[
+                "Th1-associated chemokines",
+                "Th2-associated chemokines",
+                "blood and skin biomarker patterns",
+                "therapeutic implications",
+            ],
+        )
+
+        task = generate_review_task(spec)
+
+        self.assertIn("2916-word", task.prompt)
+        self.assertEqual(task.constraints["required_length_words"], 2916)
+        self.assertEqual(task.constraints["body_target_words"], 2916)
+        self.assertEqual(task.constraints["total_target_words"], 6083)
+        self.assertEqual(sum(task.constraints["section_word_targets"].values()), 2916)
+        self.assertEqual(
+            task.constraints["required_sections"],
+            ["introduction", "main_body", "limitations_gaps"],
+        )
+
+    def test_outline_override_recomputes_section_budgets_from_override(self):
+        outline_override = {
+            "sec1": "Scope, disease context, and chemokine terminology in alopecia areata",
+            "sec2": "Chemokine-pathway framework and hair-follicle immune privilege collapse",
+            "sec3": "Evidence base and measurement strategies across blood and skin studies",
+            "sec4": "Chemokine signatures in alopecia areata across Th1, Th2, and related pathways",
+            "sec5": "Biomarker value and therapeutic implications for clinical dermatology",
+            "sec6": "Limitations, heterogeneity, and future research priorities",
+        }
+        spec = TaskSpec(
+            task_id="med_override_outline",
+            topic="chemokines in alopecia areata",
+            domain="immunodermatology",
+            target_words=6083,
+            body_target_words=2916,
+            expected_sections=6,
+            practice_context="clinical dermatology decision-making",
+            organizer="chemokine pathway framework",
+            focus_points=[
+                "Th1-associated chemokines",
+                "Th2-associated chemokines",
+                "blood and skin biomarker patterns",
+                "therapeutic implications",
+            ],
+        )
+
+        config = build_main_task_config(spec, outline_override=outline_override)
+
+        reference_constraints = config["reference"]["constraints"]
+        self.assertEqual(config["outline"], outline_override)
+        self.assertEqual(config["reference"]["outline"], outline_override)
+        self.assertEqual(reference_constraints["section_roles"]["sec5"], "discussion")
+        self.assertEqual(
+            reference_constraints["required_sections"],
+            ["introduction", "main_body", "limitations_gaps"],
+        )
+        self.assertEqual(sum(reference_constraints["section_word_targets"].values()), 2916)
 
     def test_outline_titles_are_clean_ascii_punctuation(self):
         outline = generate_outline(self.spec)

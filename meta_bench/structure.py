@@ -39,6 +39,17 @@ CONCLUSION_HEADINGS = {
     "perspective",
     "perspectives",
 }
+LIMITATIONS_HEADINGS = {
+    "limitations",
+    "limitation",
+    "limitations and evidence gaps",
+    "limitations and future work",
+    "limitations and future directions",
+    "limitations and future research priorities",
+    "limitations, heterogeneity, and future research priorities",
+    "evidence gaps",
+    "limitations and research agenda",
+}
 NON_BODY_HEADINGS = {
     *REFERENCE_HEADINGS,
     *ABSTRACT_HEADINGS,
@@ -106,6 +117,22 @@ FALLBACK_SIGNAL_TERMS = {
         "implications",
         "further studies",
         "research agenda",
+    },
+    "limitations_gaps": {
+        "limitations",
+        "limitation",
+        "future work",
+        "future studies",
+        "future research",
+        "future directions",
+        "research agenda",
+        "research priorities",
+        "evidence gaps",
+        "gap",
+        "gaps",
+        "heterogeneity",
+        "uncertainty",
+        "open questions",
     },
 }
 
@@ -333,10 +360,23 @@ def _slot_for_heading(normalized_heading: str) -> str:
         return "keywords"
     if normalized_heading in INTRODUCTION_HEADINGS:
         return "introduction"
+    if normalized_heading in LIMITATIONS_HEADINGS:
+        return "limitations_gaps"
     if normalized_heading in CONCLUSION_HEADINGS:
         return "conclusion"
     if any(token in normalized_heading for token in ("introduction", "background", "scope", "terminology", "context")):
         return "introduction"
+    if any(
+        token in normalized_heading
+        for token in (
+            "limitations",
+            "evidence gap",
+            "evidence gaps",
+            "future research priorities",
+            "heterogeneity",
+        )
+    ):
+        return "limitations_gaps"
     if any(token in normalized_heading for token in ("conclusion", "summary", "future work", "future direction", "research agenda", "concluding")):
         return "conclusion"
     if normalized_heading in REFERENCE_HEADINGS:
@@ -430,6 +470,7 @@ def classify_functional_sections(final_text: str) -> dict[str, FunctionalSlot]:
         "introduction": "",
         "main_body": "",
         "conclusion": "",
+        "limitations_gaps": "",
         "references": "",
     }
     slot_sources: dict[str, str] = {}
@@ -471,7 +512,7 @@ def classify_functional_sections(final_text: str) -> dict[str, FunctionalSlot]:
     if not slot_texts["main_body"].strip():
         candidate_parts: list[str] = []
         for section in content_sections:
-            if _slot_for_heading(section.normalized_heading) in {"introduction", "conclusion"}:
+            if _slot_for_heading(section.normalized_heading) in {"introduction", "conclusion", "limitations_gaps"}:
                 paragraphs = _paragraphs(section.body)
                 if len(paragraphs) > 2:
                     candidate_parts.extend(paragraphs[1:-1])
@@ -505,6 +546,30 @@ def classify_functional_sections(final_text: str) -> dict[str, FunctionalSlot]:
             slot_texts["conclusion"] = candidate_text
             slot_sources["conclusion"] = candidate.source
             slot_headings["conclusion"] = candidate.heading
+
+    if not slot_texts["limitations_gaps"].strip():
+        for section in reversed(content_sections):
+            if _slot_for_heading(section.normalized_heading) == "limitations_gaps":
+                slot_texts["limitations_gaps"] = section.body
+                slot_sources["limitations_gaps"] = "explicit_heading"
+                slot_headings["limitations_gaps"] = section.heading
+                break
+
+    if not slot_texts["limitations_gaps"].strip() and content_sections:
+        tail_section = content_sections[-1]
+        tail_paragraphs = _paragraphs(tail_section.body)
+        candidate_text = tail_paragraphs[-1] if tail_paragraphs else tail_section.body
+        candidate = _candidate_slot(
+            "limitations_gaps",
+            candidate_text,
+            source="fallback_tail_paragraph",
+            heading=tail_section.heading,
+            min_words=20,
+        )
+        if candidate is not None:
+            slot_texts["limitations_gaps"] = candidate_text
+            slot_sources["limitations_gaps"] = candidate.source
+            slot_headings["limitations_gaps"] = candidate.heading
 
     slots: dict[str, FunctionalSlot] = {}
     for slot, text in slot_texts.items():

@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Callable
 
 from .argumentative_essay import get_task_config as _argumentative_essay
+from .metabench_pmc12440783 import get_task_config as _metabench_pmc12440783
 from .metabench_sample import get_task_config as _metabench_sample
 from .scifi_story import get_task_config as _scifi_story
 
@@ -14,6 +15,7 @@ TASK_REGISTRY: dict[str, TaskFactory] = {
     "scifi_story": _scifi_story,
     "argumentative_essay": _argumentative_essay,
     "metabench_sample": _metabench_sample,
+    "metabench_pmc12440783": _metabench_pmc12440783,
 }
 
 

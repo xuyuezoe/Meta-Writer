@@ -15,6 +15,7 @@ class TaskSpec:
     domain: str
     paper_type: str = "medical_review"
     target_words: int = 4200
+    body_target_words: int | None = None
     expected_sections: int = 7
     language: str = "English"
     practice_context: str = "clinical practice"
