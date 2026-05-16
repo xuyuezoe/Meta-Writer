@@ -31,6 +31,12 @@ from .citation import (
 )
 from .evaluator import META_BENCH_METRIC_ORDER, evaluate_meta_bench
 from .schemas import GeneratedTask, TaskSpec
+from .section_budget import (
+    RELATIVE_JITTER,
+    SECTION_SHARE_PRIORS,
+    SectionBudget,
+    build_section_budget,
+)
 from .structure import (
     evaluate_structure_dimension,
     score_completion_rate,
@@ -81,5 +87,9 @@ __all__ = [
     "score_section_distribution",
     "score_source_balance",
     "score_source_fidelity",
+    "SECTION_SHARE_PRIORS",
+    "RELATIVE_JITTER",
+    "SectionBudget",
+    "build_section_budget",
     "split_into_seven_sections",
 ]

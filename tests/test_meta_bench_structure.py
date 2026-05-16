@@ -151,6 +151,22 @@ Future work should address limitations, open questions, and research priorities.
         self.assertEqual(slots["conclusion"].source, "explicit_heading")
         self.assertTrue(slots["conclusion"].filled)
 
+    def test_classify_functional_sections_recognizes_limitations_gaps_heading(self):
+        text = """## Scope, terminology, and practice context
+
+This section defines the scope and background context for the review.
+
+## Limitations, heterogeneity, and future research priorities
+
+Current evidence is limited by heterogeneity, uncertainty, and open questions.
+Future work should address these gaps with better study design.
+"""
+
+        slots = classify_functional_sections(text)
+
+        self.assertEqual(slots["limitations_gaps"].source, "explicit_heading")
+        self.assertTrue(slots["limitations_gaps"].filled)
+
     def test_evaluate_structure_dimension_extracts_expected_sections(self):
         text = """## Introduction
 
@@ -174,6 +190,41 @@ Evidence from studies is compared and synthesized across groups.
         self.assertEqual(
             result["diagnostics"]["completion"]["expected_section_count"],
             3,
+        )
+
+    def test_evaluate_structure_dimension_uses_required_sections_from_reference(self):
+        text = """## Scope, disease context, and terminology
+
+This introduction defines the scope and background context.
+
+## Evidence synthesis
+
+Evidence from studies is compared and synthesized across groups.
+
+## Limitations, heterogeneity, and future research priorities
+
+Current evidence is limited by heterogeneity and future work should address the main gaps.
+"""
+        result = evaluate_structure_dimension(
+            text,
+            {
+                "constraints": {
+                    "required_length_words": 10,
+                    "expected_sections": 6,
+                    "required_sections": [
+                        "introduction",
+                        "main_body",
+                        "limitations_gaps",
+                    ],
+                }
+            },
+        )
+
+        self.assertAlmostEqual(result["scores"]["completion_rate"], 1.0)
+        slots = result["diagnostics"]["completion"]["slots"]
+        self.assertEqual(
+            [slot["slot"] for slot in slots],
+            ["introduction", "main_body", "limitations_gaps"],
         )
 
 
