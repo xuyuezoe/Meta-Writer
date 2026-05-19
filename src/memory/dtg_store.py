@@ -503,3 +503,98 @@ class DTGStore:
             "avg_confidence": round(avg_confidence, 3),
             "avg_references_per_decision": round(avg_refs, 2),
         }
+
+    # ------------------------------------------------------------------
+    # 第七阶段：Phase 3 DSL 溯源辅助接口
+    # ------------------------------------------------------------------
+
+    def get_subgraph(self, node_id: str, max_depth: int = 3) -> Dict[str, List[str]]:
+        """
+        提取以 node_id 为根的子图（BFS）。
+
+        功能：
+            从 node_id 出发，沿 GENERATES / DERIVED_FROM / GUIDES / REFERENCES /
+            DSL_INJECTED 五类边向外 BFS 展开，返回 {节点: [邻居节点]} 的子图字典。
+            用于 MRCA 判断错误传播范围（Phase 3 D_j(r) 计算基础）。
+
+        参数：
+            node_id:   起始节点 ID
+            max_depth: BFS 最大深度（默认 3 层，防止过深展开）
+
+        返回：
+            Dict[str, List[str]]：{src_node: [dst_node, ...]} 邻接表
+        """
+        subgraph: Dict[str, List[str]] = {}
+        visited: set = {node_id}
+        queue: List[tuple] = [(node_id, 0)]
+
+        while queue:
+            cur, depth = queue.pop(0)
+            if depth >= max_depth:
+                continue
+
+            neighbors: List[str] = []
+
+            # GENERATES 边：decision → content（通过 section_to_decision 反查）
+            for sid, did in self.section_to_decision.items():
+                if did == cur:
+                    target = f"section:{sid}"
+                    neighbors.append(target)
+
+            # DERIVED_FROM 边：intent_node → dsl_entry
+            for dst in self.derived_from_edges.get(cur, []):
+                neighbors.append(dst)
+
+            # GUIDES 边：intent_node → decision
+            for dst in self.guides_edges.get(cur, []):
+                neighbors.append(dst)
+
+            subgraph[cur] = neighbors
+            for nb in neighbors:
+                if nb not in visited:
+                    visited.add(nb)
+                    queue.append((nb, depth + 1))
+
+        return subgraph
+
+    def get_edge_type(self, src_node: str, dst_node: str) -> Optional[str]:
+        """
+        查询两个节点之间的边类型。
+
+        参数：
+            src_node: 源节点 ID
+            dst_node: 目标节点 ID
+
+        返回：
+            str 或 None：边类型（"GENERATES" | "DERIVED_FROM" | "GUIDES" | None）
+        """
+        # GUIDES 边：intent_node → decision_node
+        if dst_node in self.guides_edges.get(src_node, []):
+            return "GUIDES"
+
+        # DERIVED_FROM 边：intent_node → dsl_entry_id
+        if dst_node in self.derived_from_edges.get(src_node, []):
+            return "DERIVED_FROM"
+
+        # GENERATES 边：decision_id → section（decision 产生该节内容）
+        for sid, did in self.section_to_decision.items():
+            if did == src_node and f"section:{sid}" == dst_node:
+                return "GENERATES"
+
+        return None
+
+    def get_section_index(self, section_id: str, section_queue: List[str]) -> int:
+        """
+        返回 section_id 在 section_queue 中的位置（0-based）。
+
+        参数：
+            section_id:    节 ID
+            section_queue: 全局节列表
+
+        返回：
+            int：0-based 索引；未找到时返回 -1
+        """
+        try:
+            return section_queue.index(section_id)
+        except ValueError:
+            return -1

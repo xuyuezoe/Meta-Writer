@@ -2,35 +2,49 @@
 在线验证器：OnlineValidator
 
 功能：
-    对每次生成结果执行四层验证（格式/约束/对齐度/一致性），
-    汇总问题列表，通过 MetaState 门控决定是否信任 MAJOR 级别问题，
-    返回 ValidationReport 供 Orchestrator 决策。
+    对每次生成结果执行四层验证（格式/约束/DSL合规/覆盖率），
+    全部基于规则和本地 embedding+NLI 模型，零 LLM-as-judge 调用。
+    通过 MetaState 门控决定是否信任 blocking failures，
+    返回新版 ValidationReport（含 PresenceViolation/AbsenceViolation）供 Orchestrator 和 MRCA 消费。
 
-依赖：LLMClient、DTGStore、AlignmentScorer、MetaState
+依赖：EmbeddingModel、NLIModel、DTGStore、TopicCoverageScorer、MetaState
 被依赖：Orchestrator（调用 validate_and_diagnose()）
 
 关键设计：
-    四层验证均支持降级（任一层异常不影响其他层）。
-    MetaState.gate_action("trust_validator_major") 返回 False 时，
-    MAJOR 级别问题降级为 MINOR（验证器不稳定时减少误报影响）。
+    Layer 1（格式检查）→ warnings
+    Layer 2（约束规则检查）→ PresenceViolation(τ="SCOPE") 或 warnings
+    Layer 3（DSL 合规，NLI+embedding）→ PresenceViolation
+    Layer 4（覆盖率，embedding）→ AbsenceViolation
+    TCAS（TopicCoverageScorer）→ score 字段
 """
 from __future__ import annotations
 
-import json
 import logging
 import re
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
+
+import numpy as np
 
 from ..core.decision import Decision
 from ..core.meta_state import MetaState
 from ..core.state import GenerationState
-from ..core.validation import Issue, IssueSeverity, ValidationReport
-from ..metrics.alignment import AlignmentScorer
+from ..core.validation import (
+    AbsenceViolation,
+    Issue,
+    IssueSeverity,
+    PresenceViolation,
+    ValidationReport,
+    failure_description,
+)
+from ..metrics.coverage_scorer import TopicCoverageScorer
 from ..references.types import GlobalPaperIndex
 from .reference_validator import ReferenceValidator
 
 if TYPE_CHECKING:
+    from ..core.ledger import LedgerEntry
     from ..logging.run_logger import RunLogger
+    from ..utils.embedding_model import EmbeddingModel
+    from ..utils.nli_model import NLIModel
 
 
 DOCUMENT_LEVEL_CONSTRAINT_PREFIX = "Document-level requirement: "
@@ -38,72 +52,115 @@ DOCUMENT_LEVEL_CONSTRAINT_PREFIX = "Document-level requirement: "
 
 def is_document_level_constraint(requirement: str) -> bool:
     """Return whether the constraint is explicitly tagged as document-level."""
-
     return requirement.startswith(DOCUMENT_LEVEL_CONSTRAINT_PREFIX)
 
 
+# ── 常量 ──────────────────────────────────────────────────────────────────────
+
+THETA_TOPIC: float = 0.40       # embedding 粗筛阈值（DSL 合规检查入口）
+
+DSL_TYPE_TO_TAU: Dict[str, str] = {
+    "forward_commitment":  "CONSISTENCY",
+    "established_claim":   "CONSISTENCY",
+    "tentative_claim":     "CONSISTENCY",
+    "unresolved_issue":    "CONTENT_GAP",    # 错误关闭方式 → PresenceViolation
+    "discourse_policy":    "SCOPE",
+}
+
+
+def sliding_windows(text: str, size: int = 256, stride: int = 128) -> List[str]:
+    """
+    按词数滑动窗口切分文本
+
+    参数：
+        text:   原始文本
+        size:   窗口词数（默认 256）
+        stride: 步长词数（默认 128）
+
+    返回：
+        List[str]: 窗口文本列表
+    """
+    words = text.split()
+    if not words:
+        return []
+    windows: List[str] = []
+    for start in range(0, len(words), stride):
+        window = words[start: start + size]
+        if window:
+            windows.append(" ".join(window))
+        if start + size >= len(words):
+            break
+    return windows
+
+
+def is_blocking(f: Union[PresenceViolation, AbsenceViolation]) -> bool:
+    """所有 PresenceViolation 和 AbsenceViolation 均为 blocking"""
+    return True   # 格式/词数问题已在 validate_and_diagnose() 中分流到 warnings
+
+
+# ── OnlineValidator ────────────────────────────────────────────────────────────
+
 class OnlineValidator:
     """
-    在线验证器
+    在线验证器（零 LLM-as-judge）
 
     功能：
-        执行四层验证流水线，集成 MetaState 门控（MAJOR 级别误报抑制）。
+        执行四层验证流水线，集成 MetaState 门控（blocking failures 抑制）。
         不直接调用 MRSD；MRSD 诊断由 Orchestrator 在获取 ValidationReport 后调用。
 
     参数：
-        llm_client: LLM 客户端（用于约束 LLM 兜底和一致性检查）
-        dtg_store: DTGStore（用于获取历史决策信息）
-        alignment_scorer: AlignmentScorer（计算 DCAS）
-        meta_state: MetaState（行为门控）
+        embedding_model: EmbeddingModel 实例（全局单例）
+        nli_model:       NLIModel 实例（DSL 合规检查）
+        dtg_store:       DTGStore（历史决策信息，当前层未直接使用，预留给 MRCA）
+        meta_state:      MetaState（行为门控）
+        llm_client:      可选，仅用于 ReferenceValidator（约束规则层已无 LLM 调用）
+        run_logger:      可选的运行日志器
 
     关键实现细节：
-        DCAS 阈值 0.6（MAJOR）/ 0.5（CRITICAL）。
-        约束检查使用四阶段规则：字数→情节→实体→LLM兜底。
-        一致性检查使用最近 3 节片段，MINOR 级别（减少误报阻断）。
+        TCAS 阈值 0.55（对标原 DCAS 0.6，保守下调 0.05）。
+        约束检查使用三阶段规则（无 LLM 兜底）。
+        DSL 合规检查：embedding 粗筛 → 批量 NLI → CONTRADICTION → PresenceViolation。
+        覆盖率检查：max-cosine pooling < THETA_COVERAGE → AbsenceViolation。
     """
 
     # 格式检查阈值（词数，不再用字符数）
     _MIN_WORDS = 200
 
     # 长度惩罚比例阈值（相对于 word_target）
-    _LENGTH_SEVERE_FLOOR = 0.35   # 极度过短：低于此比例视为严重欠生成
-    _LENGTH_FLOOR = 0.72          # 过短下限
-    _LENGTH_CEIL = 1.3            # 过长上限
-
-    # DCAS 阈值
-    THRESHOLD_DCAS = 0.6
-    THRESHOLD_DCAS_CRITICAL = 0.5
+    _LENGTH_SEVERE_FLOOR = 0.35
+    _LENGTH_FLOOR = 0.72
+    _LENGTH_CEIL = 1.3
 
     def __init__(
         self,
-        llm_client,
+        embedding_model: "EmbeddingModel",
+        nli_model: "NLIModel",
         dtg_store,
-        alignment_scorer: AlignmentScorer,
         meta_state: MetaState,
+        llm_client=None,
         run_logger: Optional["RunLogger"] = None,
     ):
         """
         初始化在线验证器
 
         参数：
-            llm_client: LLM 客户端（约束 LLM 兜底和一致性检查）
-            dtg_store: DTGStore（历史决策信息）
-            alignment_scorer: AlignmentScorer（计算 DCAS）
-            meta_state: MetaState（行为门控）
-            run_logger: 可选的运行日志器，用于记录四层验证逐层结果
+            embedding_model: EmbeddingModel 全局单例
+            nli_model:       NLIModel 全局单例
+            dtg_store:       DTGStore 实例
+            meta_state:      MetaState 实例
+            llm_client:      可选，仅用于 ReferenceValidator
+            run_logger:      可选的运行日志器
         """
-        self.llm = llm_client
+        self.embedding_model = embedding_model
+        self.nli_model = nli_model
         self.dtg = dtg_store
-        self.alignment_scorer = alignment_scorer
         self.meta_state = meta_state
         self.run_logger = run_logger
         self.logger = logging.getLogger(__name__)
-        # Fix 1：min_citations=1（原值2）。
-        # 设计动机：7节大纲下语料库仅有~4篇相关论文，7×2=14次引用需求
-        # 远超语料库自然容量（约6次）。sec5/sec6/sec7（Limitations/Evidence gaps/Future work）
-        # 本质上是对文献的反思，并非一手引用节；强制2引用导致系统性cascade失败。
-        # 1次引用仍足以保证每节有文献锚定，不退化为零引用写作。
-        self.reference_validator = ReferenceValidator(llm_client=llm_client, min_citations=1)
+
+        self.coverage_scorer = TopicCoverageScorer(embedding_model)
+        # ReferenceValidator 仍需 llm_client（用于复杂引用格式判断）
+        self.reference_validator = ReferenceValidator(llm_client=llm_client, min_citations=4)
 
     # ------------------------------------------------------------------
     # 主入口
@@ -117,7 +174,6 @@ class OnlineValidator:
         attempt: int = 1,
         global_index: Optional[GlobalPaperIndex] = None,
         word_target: Optional[int] = None,
-        # 以下参数保留向后兼容签名，新架构中不使用
         citations=None,
         bundle=None,
     ) -> ValidationReport:
@@ -125,43 +181,37 @@ class OnlineValidator:
         在线验证（核心方法）
 
         流程：
-            1. 格式检查（规则，极快）
-            2. 约束检查（规则 + LLM 兜底）
-            3. 对齐度检查（DCAS，LLM 评分）
-            4. 一致性检查（LLM）
-            5. 引用标记范围验证（纯代码，零 LLM，仅当 global_index 非空时运行）
-            6. MetaState 门控：gate_action("trust_validator_major") 为 False 时
-               将 MAJOR 问题降级为 MINOR
-            7. 汇总 blocking issues，确定 passed 状态
+            Layer 1 → 格式检查（规则，极快）→ warnings
+            Layer 2 → 约束规则检查（无 LLM）→ PresenceViolation(SCOPE) 或 warnings
+            Layer 3 → DSL 合规检查（embedding 粗筛 + 批量 NLI）→ PresenceViolation
+            Layer 4 → 覆盖率检查（embedding）→ AbsenceViolation
+            TCAS    → TopicCoverageScorer 三维评分
+            引用检查 → 可选，仅当 global_index 非空
+            MetaState 门控 → blocking failures 清空时 passed=True
 
         参数：
-            decision:      当前节对应的决策对象
-            content: 当前节生成内容
-            state: 当前生成状态
-            attempt: 协调器层的尝试序号（1-based），传给 run_logger
-            citations: 生成器返回的结构化引用列表
-            bundle: 当前节固定的参考文献 bundle
+            decision:      当前节对应的决策对象（含 required_topics）
+            content:       当前节生成内容
+            state:         当前生成状态（含 global_constraints、discourse_ledger）
+            attempt:       协调器层的尝试序号（1-based）
+            global_index:  全局参考索引（可选）
+            word_target:   本节目标词数（可选）
 
-        返回值：
-            ValidationReport：包含问题列表、DCAS 分数、约束违反列表和引用报告
-
-        关键实现细节：
-            任一层验证异常不影响其他层执行（各层独立 try-except）。
+        返回：
+            ValidationReport（新版，含 section_id / score / failures / warnings）
         """
-        issues: List[Issue] = []
-        constraint_violations: List[str] = []
-        dcas_score = 1.0
+        failures: List[Union[PresenceViolation, AbsenceViolation]] = []
+        warnings: List[str] = []
         section_id = state.current_section
 
-        # 记录验证开始
         if self.run_logger is not None:
             self.run_logger.log_validation_start(section_id, attempt)
 
-        # 第一层：格式检查
+        # ── Layer 1：格式检查 ─────────────────────────────────────────────
+        # 长度越界（过短/过长）→ blocking AbsenceViolation；其余 Issue → warning
         format_passed = True
         try:
             format_issues = self._check_format(content, word_target=word_target)
-            issues.extend(format_issues)
             format_passed = not bool(format_issues)
             word_count = len(content.split())
             format_details = f"词数={word_count}"
@@ -169,7 +219,18 @@ class OnlineValidator:
                 format_details += f"（目标={word_target}）"
             if format_issues:
                 format_details += "  " + " | ".join(i.description for i in format_issues)
-            self.logger.debug("格式检查完成，发现 %d 个问题", len(format_issues))
+            for issue in format_issues:
+                if issue.type == "format" and issue.severity in (
+                    IssueSeverity.MAJOR.value, IssueSeverity.CRITICAL.value
+                ):
+                    # 长度/严重格式问题转为 blocking failure，驱动 local_rewrite
+                    failures.append(AbsenceViolation(
+                        τ="CONTENT_GAP",
+                        obligation=issue.description,
+                        source_check="format_length",
+                    ))
+                else:
+                    warnings.append(str(issue))
         except Exception as e:
             self.logger.warning("格式检查异常（跳过）：%s", e)
             format_details = f"异常跳过：{e}"
@@ -178,107 +239,90 @@ class OnlineValidator:
                 section_id, attempt, "格式检查", format_passed, format_details
             )
 
-        # 第二层：约束检查
+        # ── Layer 2：约束规则检查 ─────────────────────────────────────────
         constraint_passed = True
-        constraint_unknowns: List[str] = []
+        constraint_violations: List[str] = []
         try:
-            constraint_violations, constraint_unknowns = self._check_constraints(
-                content,
-                state.global_constraints,
-                section_id,
+            constraint_violations, _ = self._check_constraints(
+                content, state.global_constraints, section_id
             )
             for v in constraint_violations:
-                issues.append(Issue(
-                    type="constraint",
-                    severity=IssueSeverity.MAJOR.value,
-                    description=f"Constraint violated: {v}",
-                    location=section_id,
+                failures.append(PresenceViolation(
+                    τ="SCOPE",
+                    violating_chunks=[v],
+                    violated_dsl_entry=v,
+                    source_check="constraint_check",
                 ))
             constraint_passed = not bool(constraint_violations)
             total_c = len(state.global_constraints)
             passed_c = total_c - len(constraint_violations)
-            detail_parts = [f"{passed_c}/{total_c} 条通过"]
-            if constraint_unknowns:
-                detail_parts.append(f"未知 {len(constraint_unknowns)} 条")
-            constraint_details = "，".join(detail_parts)
-            self.logger.debug("约束检查完成，违反 %d 条，未知 %d 条", len(constraint_violations), len(constraint_unknowns))
+            constraint_details = f"{passed_c}/{total_c} 条通过"
         except Exception as e:
             constraint_details = f"validator_exception: {e}"
             self.logger.warning("约束检查异常（跳过）：%s", e)
-            constraint_unknowns = list(state.global_constraints)
         if self.run_logger is not None:
             self.run_logger.log_validation_result(
                 section_id, attempt, "约束检查", constraint_passed, constraint_details
             )
-            if constraint_unknowns:
-                self.run_logger.log_validation_note(
-                    section_id,
-                    attempt,
-                    f"constraint_unknown={len(constraint_unknowns)}"
-                )
-        if constraint_unknowns:
-            self.logger.warning(
-                "constraint_unknown: %d 条（section=%s）",
-                len(constraint_unknowns),
-                section_id,
+
+        # ── Layer 3：DSL 合规检查（NLI+embedding） ──────────────────────
+        dsl_passed = True
+        try:
+            dsl_entries: List["LedgerEntry"] = []
+            if hasattr(state, "discourse_ledger") and state.discourse_ledger is not None:
+                active = getattr(state.discourse_ledger, "_entries", {})
+                dsl_entries = [e for e in active.values() if e.is_active()]
+
+            dsl_failures = self._check_dsl_compliance(content, dsl_entries)
+            failures.extend(dsl_failures)
+            dsl_passed = not bool(dsl_failures)
+            dsl_details = f"检查 {len(dsl_entries)} 条 DSL 条目，发现 {len(dsl_failures)} 个违规"
+        except Exception as e:
+            dsl_details = f"异常跳过：{e}"
+            self.logger.warning("DSL 合规检查异常（跳过）：%s", e)
+        if self.run_logger is not None:
+            self.run_logger.log_validation_result(
+                section_id, attempt, "DSL合规(NLI)", dsl_passed, dsl_details
             )
 
-        # 第三层：对齐度检查（DCAS）
-        dcas_passed = True
-        dcas_details = ""
+        # ── TCAS 评分 ─────────────────────────────────────────────────────
+        score = 1.0
         try:
-            alignment_result = self.alignment_scorer.compute_dcas(decision, content)
-            dcas_score = alignment_result.get("dcas", 1.0)
-            dcas_passed = dcas_score >= self.THRESHOLD_DCAS
-            dcas_details = f"score={dcas_score:.3f}  (阈值={self.THRESHOLD_DCAS})"
-            if dcas_score < self.THRESHOLD_DCAS:
-                severity = (
-                    IssueSeverity.CRITICAL.value
-                    if dcas_score < self.THRESHOLD_DCAS_CRITICAL
-                    else IssueSeverity.MAJOR.value
-                )
-                issues.append(Issue(
-                    type="alignment",
-                    severity=severity,
-                    description=(
-                        f"Decision-content alignment is too low (DCAS={dcas_score:.3f} < {self.THRESHOLD_DCAS})"
+            constraint_pass_ratio = (
+                1.0 - len(constraint_violations) / max(len(state.global_constraints), 1)
+            )
+            tcas_result = self.coverage_scorer.compute_tcas(
+                decision=decision,
+                content=content,
+                constraint_pass_ratio=constraint_pass_ratio,
+                word_target=word_target,
+            )
+            score = tcas_result["tcas"]
+            tcas_details = (
+                f"TCAS={score:.3f}  TC={tcas_result['topic_coverage']:.2f}  "
+                f"CS={tcas_result['constraint_satisfaction']:.2f}  "
+                f"LA={tcas_result['length_adherence']:.2f}"
+            )
+            if score < TopicCoverageScorer.THRESHOLD_TCAS_MAJOR:
+                failures.append(AbsenceViolation(
+                    τ="CONTENT_GAP",
+                    obligation=(
+                        f"TCAS score {score:.3f} below threshold "
+                        f"{TopicCoverageScorer.THRESHOLD_TCAS_MAJOR}"
                     ),
-                    location=section_id,
+                    source_check="tcas",
                 ))
-            self.logger.debug("对齐度检查完成，DCAS=%.3f", dcas_score)
         except Exception as e:
-            self.logger.warning("对齐度检查异常（跳过）：%s", e)
-            dcas_score = 0.5
-            dcas_passed = False
-            dcas_details = f"异常跳过：{e}"
+            score = 0.5
+            tcas_details = f"TCAS 计算异常：{e}"
+            self.logger.warning("TCAS 计算异常（跳过）：%s", e)
         if self.run_logger is not None:
             self.run_logger.log_validation_result(
-                section_id, attempt, "对齐度(DCAS)", dcas_passed, dcas_details
+                section_id, attempt, "TCAS评分", score >= TopicCoverageScorer.THRESHOLD_TCAS_MAJOR,
+                tcas_details
             )
 
-        # 第四层：一致性检查
-        consistency_passed = True
-        try:
-            consistency_issues = self._check_consistency(decision, content, state)
-            issues.extend(consistency_issues)
-            # 一致性问题全为 MINOR，不阻断，但记录到日志
-            blocking_consistency = [
-                i for i in consistency_issues if i.severity != IssueSeverity.MINOR.value
-            ]
-            consistency_passed = not bool(blocking_consistency)
-            dim_count = 4
-            fail_count = len(consistency_issues)
-            consistency_details = f"{dim_count - fail_count}/{dim_count} 维度通过"
-            self.logger.debug("一致性检查完成，发现 %d 个问题", len(consistency_issues))
-        except Exception as e:
-            self.logger.warning("一致性检查异常（跳过）：%s", e)
-            consistency_details = f"异常跳过：{e}"
-        if self.run_logger is not None:
-            self.run_logger.log_validation_result(
-                section_id, attempt, "一致性检查", consistency_passed, consistency_details
-            )
-
-        # 第五层：[Rx] 标记范围验证（纯代码，仅当 global_index 非空时）
+        # ── 引用检查（可选，保留，产出 reference_report） ─────────────────
         reference_report = None
         if global_index is not None and not global_index.is_empty():
             ref_passed = True
@@ -289,16 +333,24 @@ class OnlineValidator:
                     valid_r_set=global_index.valid_r_set,
                     section_id=section_id,
                 )
-                # 越界标记为 MINOR，不会阻断；但仍记录到 issues
-                issues.extend(reference_report.issues)
                 ref_passed = reference_report.passed
                 ref_details = (
                     f"valid_markers={reference_report.valid_marker_count}, "
                     f"invalid_markers={reference_report.invalid_marker_count}, "
                     f"invalid_r={sorted(reference_report.invalid_r_indices)}"
                 )
+                if not reference_report.passed:
+                    # 引用密度/越界失败 → blocking AbsenceViolation，驱动 local_rewrite
+                    major_issues = [i for i in reference_report.issues
+                                    if getattr(i, "severity", "") == IssueSeverity.MAJOR.value]
+                    obligation = (major_issues[0].description
+                                  if major_issues else ref_details)
+                    failures.append(AbsenceViolation(
+                        τ="CONTENT_GAP",
+                        obligation=obligation,
+                        source_check="citation_density",
+                    ))
             except Exception as e:
-                ref_passed = True  # 验证失败不阻断生成
                 ref_details = f"异常跳过：{e}"
                 self.logger.warning("引用范围检查异常（跳过）：%s", e)
             if self.run_logger is not None:
@@ -308,44 +360,42 @@ class OnlineValidator:
                 if reference_report is not None:
                     self.run_logger.log_reference_validation(section_id, attempt, reference_report)
 
-        # MetaState 门控：验证器不稳定时，将 MAJOR 降级为 MINOR
+        # ── MetaState 门控 ────────────────────────────────────────────────
         if not self.meta_state.gate_action("trust_validator_major"):
-            issues = self._downgrade_major_to_minor(issues)
+            failures = []
             self.logger.info(
-                "MetaState 门控：验证器不稳定（stability=%.2f），MAJOR 降级为 MINOR",
+                "MetaState 门控：验证器不稳定（stability=%.2f），清空 blocking failures",
                 self.meta_state.validator_stability_estimate,
             )
 
-        # 汇总：MINOR 不阻断
-        blocking_issues = [i for i in issues if i.severity != IssueSeverity.MINOR.value]
-        passed = len(blocking_issues) == 0
+        passed = not any(is_blocking(f) for f in failures)
 
         if not passed:
             self.logger.info(
-                "验证失败 [%d blocking issues] DCAS=%.3f section=%s",
-                len(blocking_issues),
-                dcas_score,
+                "验证失败 [%d blocking failures] TCAS=%.3f section=%s",
+                len(failures),
+                score,
                 section_id,
             )
         else:
-            self.logger.info("验证通过 DCAS=%.3f section=%s", dcas_score, section_id)
+            self.logger.info("验证通过 TCAS=%.3f section=%s", score, section_id)
 
         report = ValidationReport(
+            section_id=section_id,
             passed=passed,
-            issues=blocking_issues,
-            violated_constraints=constraint_violations,
-            dcas_score=dcas_score,
+            score=score,
+            failures=failures,
+            warnings=warnings,
             reference_report=reference_report,
         )
 
-        # 记录验证汇总
         if self.run_logger is not None:
             self.run_logger.log_validation_summary(section_id, attempt, report)
 
         return report
 
     # ------------------------------------------------------------------
-    # 第一层：格式检查
+    # Layer 1：格式检查
     # ------------------------------------------------------------------
 
     def _check_format(
@@ -355,27 +405,17 @@ class OnlineValidator:
         格式检查（规则，极快）
 
         检查：
-            - 内容词数是否达到最低要求（绝对下限 _MIN_WORDS）
-            - 内容词数是否达到本节目标词数的 50%（有 word_target 时）
+            - 词数是否达到最低要求（绝对下限 _MIN_WORDS）
+            - 词数是否达到本节目标词数比例（有 word_target 时）
             - 是否有残留 XML 标签
 
-        设计说明：
-            移除旧版 _MAX_CHARS=8000 上限——该上限对长篇综述毫无意义，只会误报正常长节。
-            改用词数下限：既防止碎片输出，又允许 LLM 写足够长的内容。
-
-        参数：
-            content:     生成内容
-            word_target: 本节目标词数（由 orchestrator 从任务描述解析并传入）
-
-        返回值：
-            List[Issue]：格式问题列表
+        返回：
+            List[Issue]：格式问题列表（全部为 warnings）
         """
         issues: List[Issue] = []
-
         word_count = len(content.split())
 
         if word_target is not None:
-            # 有目标词数时，使用比例阈值进行双侧惩罚
             severe_floor = int(word_target * self._LENGTH_SEVERE_FLOOR)
             floor = int(word_target * self._LENGTH_FLOOR)
             ceil = int(word_target * self._LENGTH_CEIL)
@@ -411,7 +451,6 @@ class OnlineValidator:
                     ),
                 ))
         elif word_count < self._MIN_WORDS:
-            # 无目标词数时，退回绝对下限
             issues.append(Issue(
                 type="format",
                 severity=IssueSeverity.MAJOR.value,
@@ -433,7 +472,7 @@ class OnlineValidator:
         return issues
 
     # ------------------------------------------------------------------
-    # 第二层：约束检查
+    # Layer 2：约束规则检查
     # ------------------------------------------------------------------
 
     def _check_constraints(
@@ -443,40 +482,25 @@ class OnlineValidator:
         section_id: Optional[str],
     ) -> Tuple[List[str], List[str]]:
         """
-        约束检查（四阶段规则 + LLM 兜底）
+        约束检查（三阶段规则，无 LLM 调用）
 
-        参数：
-            content: 生成内容
-            constraints: 全局约束列表
-
-        返回值：
-            List[str]：违反的约束列表
+        返回：(violations, unknown_constraints)
         """
         violations: List[str] = []
         unknown: List[str] = []
         for constraint in constraints:
             try:
                 result, reason = self._check_constraint_satisfaction(
-                    constraint,
-                    content,
-                    section_id,
+                    constraint, content, section_id
                 )
                 if result is False:
                     violations.append(constraint)
                 elif result is None:
                     unknown.append(constraint)
-                    if reason:
-                        self.logger.warning(
-                            "constraint_unknown[%s]: %s",
-                            reason,
-                            constraint[:80],
-                        )
             except Exception as e:
                 unknown.append(constraint)
                 self.logger.warning(
-                    "validator_exception: constraint=%s error=%s",
-                    constraint[:80],
-                    e,
+                    "validator_exception: constraint=%s error=%s", constraint[:80], e
                 )
         return violations, unknown
 
@@ -487,313 +511,110 @@ class OnlineValidator:
         section_id: Optional[str],
     ) -> Tuple[Optional[bool], Optional[str]]:
         """
-        检查单个约束是否满足
+        检查单个约束（三阶段规则，无 LLM 兜底）
 
-        四阶段（规则优先，LLM 兜底）：
-            规则1 — 字数/篇幅类约束：整篇目标，单节直接通过
-            规则2 — 情节/事件类约束：全文要求，单节直接通过
-            规则3 — 实体/属性类约束：在内容中找到关键实体即通过
-            规则4 — LLM 兜底：无法判断时返回 UNKNOWN（不再视为通过）
-
-        参数：
-            constraint: 约束文本
-            content: 生成内容
-
-        返回值：
-            Tuple[Optional[bool], Optional[str]]：
-                - True/False 表示明确满足/违反
-                - None 表示 UNKNOWN，并返回原因关键词
+        规则1 — 字数/篇幅类约束：整篇目标，单节直接通过
+        规则2 — 实体/属性类约束：在内容中找到关键实体即通过
+        规则3 — 无法判断时返回 UNKNOWN（不视为违反）
         """
         c_lower = constraint.lower()
         content_lower = content.lower()
 
-        # 规则0：benchmark 适配器显式标记为“整篇要求”的约束不在 section 级拦截
-        # 目的：
-        #   这些约束本来就是给整篇输出用的，如果在单节即时校验里逐条拦截，
-        #   会把“研究范围”“局限性”这类全文锚点错误地压到 sec2/sec3 上。
+        # 整篇要求的约束不在 section 级拦截
         if is_document_level_constraint(constraint):
             return True, None
 
         # 规则1：字数/篇幅类 → 整篇目标，单节直接通过
-        if re.search(r'\d+\s*(?:[字词]|words?)|字数|篇幅|字以内|字左右|字以上|length|paragraph', constraint, re.IGNORECASE):
+        if re.search(
+            r'\d+\s*(?:[字词]|words?)|字数|篇幅|字以内|字左右|字以上|length|paragraph',
+            constraint, re.IGNORECASE
+        ):
             return True, None
 
-        # 规则2：情节/事件类 → 故事整体要求，单节不强制
-        if re.search(r'包含|必须包含|需要包含|出现|发生|有一个|存在|结局|结尾|必须有|要有|include|appear|mention|ending|conclusion', c_lower):
-            return True, None
-
-        # 规则3：实体/属性类 → 提取关键实体，在内容中命中即通过
+        # 规则2：实体/属性类 → 提取关键实体，在内容中命中即通过
         entities = self._extract_key_entities(constraint)
         if entities and any(e in content_lower for e in entities):
             return True, None
 
-        # 规则4：LLM 兜底（无法判断也需显式返回 UNKNOWN）
-        prompt = (
-            "Decide whether the section content directly violates the constraint below. "
-            "Reply with only true or false. true means satisfied; false means violated. "
-            "Do not add explanations or extra text.\n\n"
-            f"Constraint: {constraint}\n"
-            f"Content: {content[:400]}\n"
-        )
-        try:
-            response = self.llm.generate(
-                prompt,
-                temperature=0.1,
-                max_tokens=32768,
-                strip_think=False,
-                allow_think_only_fallback=False,
-                log_meta={
-                    "component": "Validator.constraint",
-                    "section_id": section_id,
-                    "constraint": constraint[:80],
-                },
-            )
-            stripped = response.strip()
-            if not stripped:
-                return None, "llm_empty_visible_output"
-
-            visible = re.sub(r"<think>.*?</think>", "", stripped, flags=re.DOTALL).strip()
-            candidates = [text for text in (visible, stripped) if text]
-
-            for text in candidates:
-                lowered = text.strip().lower()
-                if lowered in {"true", "false"}:
-                    return (lowered == "true"), None
-
-                payload = self._extract_json_object(text)
-                if payload:
-                    data = self._safe_load_json(payload)
-                    if isinstance(data, bool):
-                        return data, None
-                    if isinstance(data, dict):
-                        satisfied = data.get("satisfied")
-                        if isinstance(satisfied, bool):
-                            return satisfied, None
-
-            if "<think>" in stripped.lower() and not visible:
-                return None, "llm_think_only"
-            return None, "protocol_parse_failure"
-        except Exception as e:
-            self.logger.warning("validator_exception: constraint=%s error=%s", constraint[:80], e)
-            return None, "validator_exception"
+        # 规则3：无法判断 → UNKNOWN（不视为违反，不 blocking）
+        return None, "no_rule_matched"
 
     def _extract_key_entities(self, constraint: str) -> List[str]:
-        """
-        从约束中提取关键实体（用于规则3命中检查）
-
-        参数：
-            constraint: 约束文本
-
-        返回值：
-            List[str]：关键实体列表（小写）
-        """
+        """从约束中提取关键实体（用于规则2命中检查）"""
         cleaned = re.sub(
             r'主角|背景|场景|设定|故事|人物|名叫|叫做|叫|名为|是|在|位于|属于',
-            '',
-            constraint,
+            '', constraint,
         )
         tokens = re.split(r'[\s，。！？,.!?、\-/]+', cleaned.strip())
         entities = [t.lower() for t in tokens if len(t) >= 2]
         extra = [e[:2] for e in entities if len(e) >= 4]
         return entities + extra
 
-    def _extract_json_object(self, text: str) -> Optional[str]:
-        """提取首个 JSON 对象文本，失败返回 None"""
-        if not text:
-            return None
-        stripped = text.strip()
-        try:
-            json.loads(stripped)
-            return stripped
-        except Exception:
-            pass
-
-        start = stripped.find("{")
-        if start == -1:
-            return None
-        depth = 0
-        for idx in range(start, len(stripped)):
-            ch = stripped[idx]
-            if ch == "{":
-                depth += 1
-            elif ch == "}":
-                depth -= 1
-                if depth == 0:
-                    return stripped[start:idx + 1]
-        return None
-
-    def _safe_load_json(self, payload: str):
-        """安全加载 JSON，失败返回 None"""
-        try:
-            return json.loads(payload)
-        except json.JSONDecodeError:
-            return None
-
-    def _parse_consistency_flags(self, response: str, keys: List[str]) -> Dict[str, Optional[bool]]:
-        """解析一致性判断，返回每个维度的布尔值或 None"""
-        result: Dict[str, Optional[bool]] = {k: None for k in keys}
-        if not response:
-            return result
-
-        payload = self._extract_json_object(response)
-        if payload:
-            data = self._safe_load_json(payload)
-            if isinstance(data, dict):
-                for key in keys:
-                    result[key] = self._interpret_bool(data.get(key))
-                return result
-
-        lowered = response.lower()
-        for key in keys:
-            idx = lowered.find(key.lower())
-            if idx == -1:
-                continue
-            window = lowered[idx: idx + 80]
-            result[key] = self._keyword_to_bool(window)
-        return result
-
-    def _interpret_bool(self, value: Optional[object]) -> Optional[bool]:
-        """宽松解析多种布尔表达"""
-        if isinstance(value, bool):
-            return value
-        if isinstance(value, str):
-            lowered = value.strip().lower()
-            if lowered in {"true", "是", "通过", "一致", "有"}:
-                return True
-            if lowered in {"false", "否", "矛盾", "冲突", "重复"}:
-                return False
-        return None
-
-    def _keyword_to_bool(self, text: str) -> Optional[bool]:
-        """根据局部关键词推断布尔值"""
-        lowered = text.lower()
-        if "false" in lowered or "矛盾" in lowered or "冲突" in lowered or "重复" in lowered:
-            return False
-        if "true" in lowered or "一致" in lowered or "连贯" in lowered or "通过" in lowered:
-            return True
-        return None
-
     # ------------------------------------------------------------------
-    # 第四层：一致性检查
+    # Layer 3：DSL 合规检查（embedding 粗筛 + 批量 NLI）
     # ------------------------------------------------------------------
 
-    def _check_consistency(
+    def _check_dsl_compliance(
         self,
-        decision: Decision,
-        content: str,
-        state: GenerationState,
-    ) -> List[Issue]:
+        section_content: str,
+        dsl_entries: List["LedgerEntry"],
+    ) -> List[PresenceViolation]:
         """
-        一致性检查（LLM，检查最近 3 节）
+        零 LLM DSL 合规检查
 
-        检查维度：
-            1. 实体属性一致性（人物、地点、数字前后是否矛盾）
-            2. 时间线连贯性（事件顺序是否合理）
-            3. 设定一致性（与已生成章节是否冲突）
-            4. 叙事推进性（新内容是否在重复已有章节的核心情节动作）
+        算法：
+            1. 将内容切分为滑动窗口
+            2. 批量编码所有窗口（一次性，避免重复）
+            3. 对每个 DSL 条目，计算与所有窗口的 cosine 相似度
+            4. 相似度 ≥ THETA_TOPIC 的窗口进入 NLI 候选队列
+            5. 一次性 predict_batch() 所有候选对
+            6. CONTRADICTION → PresenceViolation
 
         参数：
-            decision: 当前决策对象
-            content: 当前节内容
-            state: 生成状态
+            section_content: 生成内容
+            dsl_entries:     活跃 DSL 条目列表
 
-        返回值：
-            List[Issue]：一致性问题列表（全部为 MINOR 级别）
-
-        关键实现细节：
-            所有四个维度均为 MINOR 级别，不阻断主流程，只记录供统计分析。
-            narrative_progress 的 LLM 误判率较高（相邻章节共享主题属正常现象），
-            降为 MINOR 可避免频繁触发不必要的重试循环。
-            无法判断时视为通过（宁可放行，不误杀）。
+        返回：
+            List[PresenceViolation]: 检测到的违规列表
         """
-        if not state.generated_sections:
+        if not dsl_entries:
             return []
 
-        prev_snippets: List[str] = []
-        for sid in state.generated_sections[-3:]:
-            snippet = state.section_snippets.get(sid, "")
-            if snippet:
-                prev_snippets.append(f"[{sid}] {snippet[:200]}")
-        if not prev_snippets:
+        windows = list(sliding_windows(section_content))
+        if not windows:
             return []
 
-        context_hint = "\n".join(prev_snippets)
-        prompt = (
-            "Check whether the new content contains clear contradictions or narrative repetition "
-            "relative to the existing sections. Reply with JSON such as "
-            "{\"entity_consistency\": true, ...}. The required fields are "
-            "entity_consistency, timeline_consistency, setting_consistency, and narrative_progress. "
-            "Use true for pass and false for an issue. Do not output markdown code fences or extra text.\n\n"
-            f"Existing section snippets:\n{context_hint}\n\n"
-            f"New content:\n{content[:500]}"
-        )
+        # 批量编码所有窗口（共享计算）
+        window_embeds = self.embedding_model.embed(windows)  # (W, D)
 
-        issues: List[Issue] = []
-        try:
-            response = self.llm.generate(
-                prompt,
-                temperature=0.1,
-                max_tokens=32768,
-                strip_think=True,
-                allow_think_only_fallback=False,
-                log_meta={
-                    "component": "Validator.consistency",
-                    "section_id": state.current_section,
-                },
-            )
-            checks = {
-                "entity_consistency":   ("Entity attributes are inconsistent",   IssueSeverity.MINOR.value),
-                "timeline_consistency": ("Timeline is not coherent",   IssueSeverity.MINOR.value),
-                "setting_consistency":  ("Setting conflicts with earlier sections",   IssueSeverity.MINOR.value),
-                "narrative_progress":   ("Narrative progress repeats earlier sections", IssueSeverity.MINOR.value),
-            }
-            flags = self._parse_consistency_flags(response, list(checks.keys()))
-            for tag, (label, severity) in checks.items():
-                value = flags.get(tag)
-                if value is False:
-                    issues.append(Issue(
-                        type="consistency",
-                        severity=severity,
-                        description=label,
-                        location=state.current_section,
-                    ))
-        except Exception as e:
-            self.logger.warning("一致性检查 LLM 调用失败（跳过）：%s", e)
+        candidates: List[Tuple["LedgerEntry", str]] = []
+        for entry in dsl_entries:
+            entry_embed = self.embedding_model.embed([entry.content])[0]  # (D,)
+            sims = window_embeds @ entry_embed                             # (W,)
+            for win_idx, sim in enumerate(sims):
+                if float(sim) >= THETA_TOPIC:
+                    candidates.append((entry, windows[win_idx]))
 
-        return issues
+        if not candidates:
+            return []
 
-    # ------------------------------------------------------------------
-    # MetaState 门控
-    # ------------------------------------------------------------------
+        pairs = [(c[0].content, c[1]) for c in candidates]
+        labels = self.nli_model.predict_batch(pairs)
 
-    def _downgrade_major_to_minor(self, issues: List[Issue]) -> List[Issue]:
-        """
-        将所有 MAJOR 级别问题降级为 MINOR（MetaState 门控后调用）
-
-        功能：
-            当验证器不稳定时（validator_stability_estimate < 0.5），
-            MAJOR 问题可能是误报，降级为 MINOR 避免触发不必要的修复。
-            CRITICAL 级别问题不受影响。
-
-        参数：
-            issues: 原始问题列表
-
-        返回值：
-            List[Issue]：降级后的问题列表
-        """
-        result: List[Issue] = []
-        for issue in issues:
-            if issue.severity == IssueSeverity.MAJOR.value:
-                result.append(Issue(
-                    type=issue.type,
-                    severity=IssueSeverity.MINOR.value,
-                    description=issue.description,
-                    location=issue.location,
+        violations: List[PresenceViolation] = []
+        for (entry, window), label in zip(candidates, labels):
+            if label == "CONTRADICTION":
+                tau = DSL_TYPE_TO_TAU.get(entry.commitment_type.value, "CONSISTENCY")
+                violations.append(PresenceViolation(
+                    τ=tau,
+                    violating_chunks=[window],
+                    violated_dsl_entry=entry.content,
+                    source_check=f"dsl_compliance:{entry.entry_id}",
                 ))
-            else:
-                result.append(issue)
-        return result
+
+        return violations
 
     # ------------------------------------------------------------------
-    # 工具方法
+    # Layer 4：覆盖率检查（embedding）
     # ------------------------------------------------------------------
+

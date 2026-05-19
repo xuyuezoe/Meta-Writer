@@ -218,7 +218,7 @@ class RunLogger:
         self._write("[PLAN] SectionIntent")
         self._write(f"  局部目标：{intent.local_goal}")
         self._write(
-            f"  开放线索推进：{intent.open_loops_to_advance if intent.open_loops_to_advance else '[]'}"
+            f"  覆盖要求：{intent.coverage_requirements if intent.coverage_requirements else '[]'}"
         )
         self._write(
             f"  待维护承诺：{intent.commitments_to_maintain if intent.commitments_to_maintain else '[]'}"
@@ -311,7 +311,7 @@ class RunLogger:
         self,
         section_id: str,
         total_attempts: int,
-        dcas: float,
+        tcas: float,
         new_entries: List[Any],
         total_active_entries: int,
         memory_trust: float,
@@ -322,12 +322,12 @@ class RunLogger:
         参数：
             section_id: 节 ID
             total_attempts: 本节实际总尝试次数（1-based）
-            dcas: 最终 DCAS 分数
+            tcas: 最终 TCAS 分数
             new_entries: 本节新提取的 LedgerEntry 列表
             total_active_entries: 提取后 DSL 总活跃条目数
             memory_trust: 当前记忆信任度
         """
-        self._write(f"[SUCCESS] ✓  DCAS={dcas:.3f}  尝试次数={total_attempts}")
+        self._write(f"[SUCCESS] ✓  TCAS={tcas:.3f}  尝试次数={total_attempts}")
         self._write(f"  新增 DSL 条目：{len(new_entries)} 条")
         for e in new_entries:
             ct  = e.commitment_type.value  if hasattr(e, "commitment_type")  else "?"
@@ -582,7 +582,7 @@ class RunLogger:
         参数：
             section_id: 节 ID
             attempt: 尝试次数（1-based）
-            layer: 验证层名称（格式检查/约束检查/对齐度(DCAS)/一致性检查）
+            layer: 验证层名称（格式检查/约束检查/对齐度(TCAS)/一致性检查）
             passed: 是否通过
             details: 验证细节描述
         """
@@ -616,10 +616,16 @@ class RunLogger:
         if report.passed:
             self._write("  总计: PASS  阻断问题 0 个")
         else:
-            blocking = report.issues
+            blocking = report.failures
             self._write(f"  总计: FAIL  阻断问题 {len(blocking)} 个")
-            for issue in blocking:
-                self._write(f"    ! [{issue.severity.upper()}] {issue.description}")
+            for v in blocking:
+                from src.core.validation import PresenceViolation, AbsenceViolation
+                if isinstance(v, PresenceViolation):
+                    self._write(f"    ! [PRESENCE][{v.τ}] {v.violated_dsl_entry[:80]} | check={v.source_check}")
+                elif isinstance(v, AbsenceViolation):
+                    self._write(f"    ! [ABSENCE][{v.τ}] {v.obligation[:80]} | check={v.source_check}")
+                else:
+                    self._write(f"    ! {v}")
         self._write("")
 
     def log_reference_validation(self, section_id: str, attempt: int, ref_report: Any) -> None:

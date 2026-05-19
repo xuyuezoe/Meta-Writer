@@ -119,6 +119,14 @@ class SectionPlanner:
 
         return intent
 
+    def extract_required_topics(
+        self,
+        section_title: str,
+        task_description: str,
+    ) -> List[str]:
+        """对外暴露的 required_topics 提取接口（供 Orchestrator 调用后注入 Decision）"""
+        return self._extract_required_topics(section_title, task_description)
+
     def _build_prompt(
         self,
         section_title: str,
@@ -171,7 +179,7 @@ class SectionPlanner:
             "{\n"
             "  \"local_goal\": \"...\",\n"
             "  \"scope_boundary\": \"...\",\n"
-            "  \"open_loops_to_advance\": [\"...\"],\n"
+            "  \"coverage_requirements\": [\"...\"],\n"
             "  \"commitments_to_maintain\": [\"...\"],\n"
             "  \"risks_to_avoid\": [\"...\"],\n"
             "  \"success_criteria\": [\"...\"]\n"
@@ -224,7 +232,7 @@ class SectionPlanner:
 
         local_goal = str(_first_value("local_goal", "goal") or "").strip() or f"Complete the content for section {section_id}"
         scope_boundary = str(_first_value("scope_boundary", "scope") or "").strip()
-        open_loops = _norm_list(_first_value("open_loops_to_advance", "open_loops"))
+        coverage_requirements = _norm_list(_first_value("coverage_requirements", "coverage_requirements"))
         commitments = _norm_list(_first_value("commitments_to_maintain", "commitments_to_preserve"))
         risks = _norm_list(_first_value("risks_to_avoid", "risks"))
         success_criteria = _norm_list(_first_value("success_criteria", "criteria")) or ["The content matches the section goal and does not violate major constraints."]
@@ -233,7 +241,7 @@ class SectionPlanner:
             section_id=section_id,
             local_goal=local_goal,
             scope_boundary=scope_boundary,
-            open_loops_to_advance=open_loops,
+            coverage_requirements=coverage_requirements,
             commitments_to_maintain=commitments,
             risks_to_avoid=risks,
             success_criteria=success_criteria,
@@ -302,7 +310,7 @@ class SectionPlanner:
             section_id=section_id,
             local_goal=f"Complete the content for section {section_id}",
             scope_boundary="",
-            open_loops_to_advance=[],
+            coverage_requirements=[],
             commitments_to_maintain=[],
             risks_to_avoid=[],
             success_criteria=["The content matches the section goal and does not violate major constraints."],
@@ -310,3 +318,88 @@ class SectionPlanner:
             dsl_trust_at_generation=dsl_trust_at_generation,
             word_target=word_target,
         )
+
+    def _extract_required_topics(
+        self,
+        section_title: str,
+        task_description: str,  # 保留参数签名，但不参与 n-gram 生成
+    ) -> List[str]:
+        """
+        从节标题提取必须覆盖的核心主题短语（RAKE 变体，无 LLM，无外部依赖）
+
+        算法：RAKE（Rapid Automatic Keyword Extraction）简化版
+            节标题已是高度压缩的语言，停用词天然形成短语边界。
+            按停用词/标点切分标题 → 候选短语列表；
+            对超过 3 词的长短语，额外拆出 bigram/trigram 子短语；
+            返回 top-5（优先保留较长短语，子短语补位）。
+
+        设计原则：
+            task_description 不参与 n-gram 生成，彻底消除跨边界伪词。
+            不使用任何统计评分（TF-IDF / BM25），因为：
+              - 标题词数 < 15，统计无意义
+              - 停用词边界已充分表达短语结构
+
+        参数：
+            section_title:    节大纲标题（关键短语来源）
+            task_description: 全局任务描述（此方法不使用）
+
+        返回：
+            List[str]: 最多 top-5 核心主题短语（小写，去重）
+        """
+        _STOPWORDS = frozenset(
+            "a an the and or but in on at to for of with from by is are was were be been "
+            "being have has had do does did will would could should may might shall can "
+            "this that these those it its we our they their he she his her i my you your "
+            "not no nor so yet also just each many any all some such only both either "
+            "than then when where which who whom what how as if provide ensure discuss "
+            "describe explain present analyze consider include examine overview introduction "
+            "conclusion summary review related work method approach system framework model "
+            "across within between among about above below beyond related write writing".split()
+        )
+
+        # 第一步：按标点（逗号/分号/冒号/括号）切分为子段
+        # 标题中的逗号通常分隔并列概念，必须作为短语边界，否则产生跨概念伪词
+        raw_parts = re.split(r"[,;:()\[\]/\\]+", section_title.lower())
+
+        # 第二步：在每个子段内按停用词切分，得到候选短语（RAKE 核心）
+        base_phrases: List[str] = []
+        for part in raw_parts:
+            clean = re.sub(r"[^a-z0-9\s\-]", " ", part)
+            tokens = [t.strip("-") for t in clean.split() if t.strip("-")]
+            current: List[str] = []
+            for tok in tokens:
+                if tok in _STOPWORDS or not tok:
+                    if current:
+                        base_phrases.append(" ".join(current))
+                        current = []
+                else:
+                    current.append(tok)
+            if current:
+                base_phrases.append(" ".join(current))
+
+        # 去掉单字符噪声
+        base_phrases = [p for p in base_phrases if len(p) >= 2]
+
+        if not base_phrases:
+            return []
+
+        # 构建结果：先放完整短语，再补充长短语的 bigram/trigram 子短语
+        seen: set = set()
+        result: List[str] = []
+
+        def _add(phrase: str) -> None:
+            if phrase not in seen and len(phrase) >= 2:
+                seen.add(phrase)
+                result.append(phrase)
+
+        for phrase in base_phrases:
+            _add(phrase)
+
+        for phrase in base_phrases:
+            words = phrase.split()
+            if len(words) >= 3:
+                for n in (2, 3):
+                    for i in range(len(words) - n + 1):
+                        _add(" ".join(words[i: i + n]))
+
+        return result[:5]

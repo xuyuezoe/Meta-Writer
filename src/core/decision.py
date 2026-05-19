@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import List, Tuple, Dict, Optional
+from typing import List, Tuple, Dict, Optional, TYPE_CHECKING
 import time
 import uuid
 """
@@ -40,7 +40,7 @@ class Decision:
     # 决策内容
     decision: str              # 决策描述
     reasoning: str             # 推理过程
-    expected_effect: str       # 预期效果
+    expected_effect: str       # 本节生成完成后应满足的可验证结果（如覆盖的主题、引用密度）
     confidence: float          # 置信度 [0, 1]
 
     # 依赖关系（DTG的关键）
@@ -49,6 +49,8 @@ class Decision:
 
     # 元数据
     phase: str = "expanding"
+    required_topics: List[str] = field(default_factory=list)
+    # 本节必须覆盖的核心主题词，由 SectionPlanner._extract_required_topics() 填充
 
     def __post_init__(self):
         """验证数据有效性"""
@@ -71,6 +73,7 @@ class Decision:
             "referenced_sections": [list(ref) for ref in self.referenced_sections],
             "target_section": self.target_section,
             "phase": self.phase,
+            "required_topics": self.required_topics,
         }
 
     @classmethod
@@ -86,6 +89,7 @@ class Decision:
             referenced_sections=[tuple(ref) for ref in data["referenced_sections"]],
             target_section=data["target_section"],
             phase=data.get("phase", "expanding"),
+            required_topics=data.get("required_topics", []),
         )
 
     def get_dependency_edges(self) -> List[Tuple[str, str]]:
@@ -135,7 +139,10 @@ try:
             )
         )
         expected_effect: str = Field(
-            description="The effect this section should achieve once it is complete"
+            description=(
+                "The verifiable outcome this section must satisfy, expressed as concrete coverage "
+                "requirements (topics, claims, citation density)."
+            )
         )
         confidence: float = Field(
             ge=0.0, le=1.0,
@@ -143,8 +150,9 @@ try:
         )
         content: str = Field(
             description=(
-                "The clean body text. Where a sentence is supported by an available reference, "
-                "append the marker [Rx] (e.g. [R1], [R3]) immediately after that sentence. "
+                "The section body text for the academic survey. Each factual claim that is "
+                "supported by an available reference should be followed by [Rx] marker "
+                "(e.g. [R1], [R3]) immediately after that sentence. "
                 "Do not include section IDs, word counts, XML tags, or metadata."
             )
         )

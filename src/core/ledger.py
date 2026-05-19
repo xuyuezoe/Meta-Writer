@@ -6,22 +6,21 @@
     LedgerEntry 是带完整生命周期管理的账本条目，不是简单的约束字符串。
 
 说明：
-    ommitmentType 问的是"这个承诺是什么性质的东西"                                                                                                                                                                                                                     
-                                                            
-    fact         → 已发生、已确立的事实，判断"这个设定在叙事上是否应该被视为不可变"（"主角在火星"）
-    commitment   → 对后文的明确预告（"他决定明天去找Sarah"）
-    open_loop    → 悬而未决的线索（"神秘信号的来源"）
-    hypothesis   → 角色的主观猜测（"他怀疑是蓄意破坏"）
-    style_policy → 全局风格约定（"第三人称限知视角"）
+    CommitmentType 问的是"这个话语承诺是什么性质的东西"
+
+    ESTABLISHED_CLAIM  → 已确立的学术事实或命题，后续不可矛盾
+    FORWARD_COMMITMENT → 对后续节的明确预告（"下节将讨论..."）
+    UNRESOLVED_ISSUE   → 尚未解决的研究问题或争议点
+    TENTATIVE_CLAIM    → 推测性主张，应保持暂定态度
+    DISCOURSE_POLICY   → 全局话语规约（写作风格、引用格式等）
 
     ConstraintType 问的是"这个承诺对后续生成有多强的约束力"
 
-    immutable → 用户明确给定，不可被后续生成覆盖
-    stateful  → 可以随情节推进合法更新（状态会变化）
-    soft      → 尽量满足，但可以酌情调整
+    IMMUTABLE → 任务规范给定的硬约束，生成过程不可覆盖
+    STATEFUL  → 可随生成推进合法更新的动态状态
+    SOFT      → 风格偏好或非核心约束，不作为强回退依据
 
-    两个维度是正交的，可以任意组合。例如"主角名叫Alex"是 fact + immutable；"主角目前在基地"是 fact + stateful（位置会变）；"故事节奏尽量紧凑"是 style_policy + soft。
-    这两个维度的标签怎么打，完全依赖 LLM 的判断，而这个判断没有任何校验机制。LLM 决定一个事实是 immutable 还是 stateful，直接决定了它的初始 trust_level，进而影响它被注入的优先级、被撤销时造成的级联损失大小、MetaState 的 CRS 计算。
+    两个维度正交可任意组合。
 
 依赖：无
 被依赖：DiscourseLedger、CommitmentExtractor、OnlineValidator
@@ -37,20 +36,20 @@ from typing import Dict, List, Optional
 
 class CommitmentType(Enum):
     """
-    承诺对象类型（五类，对后续节的约束力不同）
+    话语承诺类型（五类，对后续节的约束力不同）
 
     关键实现细节：
-        FACT         → 对后续不可矛盾，按 salience显著性筛选注入
-        COMMITMENT   → 后文必须履行，全部注入
-        OPEN_LOOP    → 越久未闭合越显著，全部注入
-        HYPOTHESIS   → 不注入 prompt（角色猜测，不刚性约束）
-        STYLE_POLICY → 全局有效，全部注入
+        ESTABLISHED_CLAIM  → 已确立命题，按 salience 显著性筛选注入
+        FORWARD_COMMITMENT → 后文必须履行的预告，全部注入
+        UNRESOLVED_ISSUE   → 越久未解决越显著，全部注入
+        TENTATIVE_CLAIM    → 推测性主张，不注入刚性约束
+        DISCOURSE_POLICY   → 全局话语规约，全部注入
     """
-    FACT         = "fact"
-    COMMITMENT   = "commitment"
-    OPEN_LOOP    = "open_loop"
-    HYPOTHESIS   = "hypothesis"
-    STYLE_POLICY = "style_policy"
+    ESTABLISHED_CLAIM  = "established_claim"
+    FORWARD_COMMITMENT = "forward_commitment"
+    UNRESOLVED_ISSUE   = "unresolved_issue"
+    TENTATIVE_CLAIM    = "tentative_claim"
+    DISCOURSE_POLICY   = "discourse_policy"
 
 
 class ConstraintType(Enum):
@@ -58,9 +57,9 @@ class ConstraintType(Enum):
     约束强度类型（三级分类）
 
     关键实现细节：
-        IMMUTABLE → 叙事上不可逆的设定，任何生成决策不可与之矛盾
-        STATEFUL  → 可随情节推进合法演变的状态，更新须前后连贯
-        SOFT      → 风格偏好或非核心细节，不作为强回退依据
+        IMMUTABLE → 任务规范给定的硬约束，生成过程不可覆盖
+        STATEFUL  → 可随生成推进合法更新的动态状态
+        SOFT      → 风格偏好或非核心约束，不作为强回退依据
     """
     IMMUTABLE = "immutable"
     STATEFUL  = "stateful"
@@ -113,6 +112,12 @@ class LedgerEntry:
     revoked_by: Optional[str] = None
     revision_history: List[Dict] = field(default_factory=list)
 
+    # Phase 3：DSL 溯源字段
+    # source_node: 在 DTG 中生成此条目的节点 ID（decision_id 或 intent_node_id）
+    # used_by_sections: 记录哪些节在生成时注入了此条目（溯源 D_j(r) 传播强度）
+    source_node: str = ""
+    used_by_sections: List[str] = field(default_factory=list)
+
     @classmethod
     def create(
         cls,
@@ -154,7 +159,7 @@ class LedgerEntry:
     def is_active(self) -> bool:
         """是否仍为活跃状态（未被撤销且未过期解决）"""
         return self.revoked_by is None and not (
-            self.commitment_type == CommitmentType.OPEN_LOOP and self.is_resolved
+            self.commitment_type == CommitmentType.UNRESOLVED_ISSUE and self.is_resolved
         )
 
     def to_dict(self) -> Dict:
@@ -173,6 +178,8 @@ class LedgerEntry:
             "is_resolved":       self.is_resolved,
             "resolved_in":       self.resolved_in,
             "revoked_by":        self.revoked_by,
+            "source_node":       self.source_node,
+            "used_by_sections":  self.used_by_sections,
         }
 
 

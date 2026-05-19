@@ -57,7 +57,7 @@ class FakeDSL:
         return list(self.added_entries)
 
     def get_open_loops(self):
-        return [e for e in self.added_entries if e.commitment_type == CommitmentType.OPEN_LOOP]
+        return [e for e in self.added_entries if e.commitment_type == CommitmentType.UNRESOLVED_ISSUE]
 
 
 class OrchestratorDslRelationTests(unittest.TestCase):
@@ -79,8 +79,8 @@ class OrchestratorDslRelationTests(unittest.TestCase):
         orchestrator.correction_log = SimpleNamespace(add_success=lambda section_id, attempts: None)
         orchestrator.commitment_extractor = SimpleNamespace(
             extract=lambda **_: [
-                self._entry("entry1", CommitmentType.COMMITMENT),
-                self._entry("entry2", CommitmentType.OPEN_LOOP),
+                self._entry("entry1", CommitmentType.FORWARD_COMMITMENT),
+                self._entry("entry2", CommitmentType.UNRESOLVED_ISSUE),
             ]
         )
         orchestrator.dsl = FakeDSL()
@@ -92,7 +92,7 @@ class OrchestratorDslRelationTests(unittest.TestCase):
         orchestrator.run_logger = None
         orchestrator._compute_low_trust_ratio = lambda section_id: 0.0
         orchestrator._log_postprocess_skipped = lambda section_id: None
-        orchestrator._print_success = lambda section_id, attempts, dcas: None
+        orchestrator._print_success = lambda section_id, attempts, tcas: None
 
         state = GenerationState(current_section="sec1", progress=0.0, outline={"sec1": "Intro"})
         generated_content: dict[str, str] = {}
@@ -117,7 +117,7 @@ class OrchestratorDslRelationTests(unittest.TestCase):
             section_queue=["sec1"],
             plan_state=plan_state,
             attempt=0,
-            dcas=0.93,
+            tcas=0.93,
         )
 
         self.assertEqual([entry.entry_id for entry in orchestrator.dsl.added_entries], ["entry1", "entry2"])

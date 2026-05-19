@@ -60,14 +60,14 @@ class DiscourseLedgerTests(unittest.TestCase):
         ledger = DiscourseLedger(candidate_score_threshold=1.5)
         new = self._entry(
             "new",
-            CommitmentType.COMMITMENT,
+            CommitmentType.FORWARD_COMMITMENT,
             "Run real-world studies in low-resource settings to strengthen the evidence base",
             "s2",
             110,
         )
         old = self._entry(
             "old",
-            CommitmentType.OPEN_LOOP,
+            CommitmentType.UNRESOLVED_ISSUE,
             "Evidence from real-world studies in low-resource settings remains insufficient",
             "s1",
             100,
@@ -84,14 +84,14 @@ class DiscourseLedgerTests(unittest.TestCase):
         ledger = DiscourseLedger(candidate_score_threshold=1.0)
         new = self._entry(
             "new",
-            CommitmentType.COMMITMENT,
+            CommitmentType.FORWARD_COMMITMENT,
             "Clarify indication boundaries with explicit evidence grades and use conditions",
             "s2",
             110,
         )
         old = self._entry(
             "old",
-            CommitmentType.OPEN_LOOP,
+            CommitmentType.UNRESOLVED_ISSUE,
             "The valid scope under sparse evidence and indication boundaries remains unclear",
             "s1",
             100,
@@ -109,14 +109,14 @@ class DiscourseLedgerTests(unittest.TestCase):
         ledger = DiscourseLedger(candidate_score_threshold=1.0)
         new = self._entry(
             "new",
-            CommitmentType.COMMITMENT,
+            CommitmentType.FORWARD_COMMITMENT,
             "Clarify dosing guidance with explicit evidence grades",
             "s2",
             110,
         )
         old = self._entry(
             "old",
-            CommitmentType.COMMITMENT,
+            CommitmentType.FORWARD_COMMITMENT,
             "The monitoring schedule should define the valid scope under sparse evidence",
             "s1",
             100,
@@ -130,8 +130,8 @@ class DiscourseLedgerTests(unittest.TestCase):
 
     def test_gate_relation_pair_drops_double_short_noise(self) -> None:
         ledger = DiscourseLedger()
-        new = self._entry("new", CommitmentType.COMMITMENT, "tbd", "s2", 110)
-        old = self._entry("old", CommitmentType.OPEN_LOOP, "see above", "s1", 100)
+        new = self._entry("new", CommitmentType.FORWARD_COMMITMENT, "tbd", "s2", 110)
+        old = self._entry("old", CommitmentType.UNRESOLVED_ISSUE, "see above", "s1", 100)
 
         keep, gate_score, signals = ledger._gate_relation_pair(new, old)
 
@@ -144,14 +144,14 @@ class DiscourseLedgerTests(unittest.TestCase):
         ledger = DiscourseLedger(llm_client=llm, candidate_score_threshold=1.5)
         old = self._entry(
             "old",
-            CommitmentType.OPEN_LOOP,
+            CommitmentType.UNRESOLVED_ISSUE,
             "Evidence from real-world studies in low-resource settings remains insufficient",
             "s1",
             100,
         )
         new = self._entry(
             "new",
-            CommitmentType.COMMITMENT,
+            CommitmentType.FORWARD_COMMITMENT,
             "Run real-world studies in low-resource settings to strengthen the evidence base",
             "s2",
             110,
@@ -167,8 +167,8 @@ class DiscourseLedgerTests(unittest.TestCase):
 
     def test_add_entry_drop_writes_none_prefilter_cache(self) -> None:
         ledger = DiscourseLedger(candidate_score_threshold=2.0)
-        old = self._entry("old", CommitmentType.COMMITMENT, "MRI", "s1", 100)
-        new = self._entry("new", CommitmentType.COMMITMENT, "RCT", "s2", 110)
+        old = self._entry("old", CommitmentType.FORWARD_COMMITMENT, "MRI", "s1", 100)
+        new = self._entry("new", CommitmentType.FORWARD_COMMITMENT, "RCT", "s2", 110)
 
         ledger.add_entry(old)
         ledger.add_entry(new)
@@ -195,14 +195,14 @@ class DiscourseLedgerTests(unittest.TestCase):
         ledger = DiscourseLedger(llm_client=llm, candidate_score_threshold=1.5)
         commitment = self._entry(
             "commitment",
-            CommitmentType.COMMITMENT,
+            CommitmentType.FORWARD_COMMITMENT,
             "Captain Alice finally reveals the signal source in the control room",
             "s2",
             120,
         )
         loop = self._entry(
             "loop",
-            CommitmentType.OPEN_LOOP,
+            CommitmentType.UNRESOLVED_ISSUE,
             "What is the source of the strange signal in the control room?",
             "s1",
             100,
@@ -234,8 +234,8 @@ class DiscourseLedgerTests(unittest.TestCase):
             ]
         )
         ledger = DiscourseLedger(llm_client=llm, candidate_score_threshold=1.5)
-        a = self._entry("a", CommitmentType.COMMITMENT, "The low-resource real-world evidence pathway needs reinforcement", "s1", 100)
-        b = self._entry("b", CommitmentType.COMMITMENT, "Run real-world studies in low-resource settings to reinforce the pathway", "s2", 110)
+        a = self._entry("a", CommitmentType.FORWARD_COMMITMENT, "The low-resource real-world evidence pathway needs reinforcement", "s1", 100)
+        b = self._entry("b", CommitmentType.FORWARD_COMMITMENT, "Run real-world studies in low-resource settings to reinforce the pathway", "s2", 110)
 
         ledger.add_entry(a)
         ledger.add_entry(b)
@@ -249,14 +249,14 @@ class DiscourseLedgerTests(unittest.TestCase):
         ledger = DiscourseLedger(llm_client=None, candidate_score_threshold=1.5)
         old = self._entry(
             "old",
-            CommitmentType.COMMITMENT,
+            CommitmentType.FORWARD_COMMITMENT,
             "Captain Alice hides the map in the observatory chamber",
             "s1",
             100,
         )
         new = self._entry(
             "new",
-            CommitmentType.OPEN_LOOP,
+            CommitmentType.UNRESOLVED_ISSUE,
             "Why did Captain Alice hide the map in the observatory chamber?",
             "s2",
             110,
@@ -286,9 +286,9 @@ class DiscourseLedgerTests(unittest.TestCase):
             ]
         )
         ledger = DiscourseLedger(llm_client=llm, candidate_score_threshold=1.5)
-        a = self._entry("a", CommitmentType.COMMITMENT, "Alice guards the west gate tonight", "s1", 100)
-        b = self._entry("b", CommitmentType.COMMITMENT, "Alice guards the west gate to protect the archive", "s2", 110)
-        c = self._entry("c", CommitmentType.OPEN_LOOP, "Will Alice keep guarding the west gate tomorrow?", "s3", 120)
+        a = self._entry("a", CommitmentType.FORWARD_COMMITMENT, "Alice guards the west gate tonight", "s1", 100)
+        b = self._entry("b", CommitmentType.FORWARD_COMMITMENT, "Alice guards the west gate to protect the archive", "s2", 110)
+        c = self._entry("c", CommitmentType.UNRESOLVED_ISSUE, "Will Alice keep guarding the west gate tomorrow?", "s3", 120)
 
         ledger.add_entry(a)
         ledger.add_entry(b)
@@ -311,14 +311,14 @@ class DiscourseLedgerTests(unittest.TestCase):
         ledger = DiscourseLedger(llm_client=llm, candidate_score_threshold=1.5)
         old = self._entry(
             "old",
-            CommitmentType.COMMITMENT,
+            CommitmentType.FORWARD_COMMITMENT,
             "Captain Alice tracks the signal inside the northern tunnel",
             "s1",
             100,
         )
         new = self._entry(
             "new",
-            CommitmentType.OPEN_LOOP,
+            CommitmentType.UNRESOLVED_ISSUE,
             "Will Captain Alice solve the signal mystery inside the northern tunnel?",
             "s2",
             110,
@@ -335,21 +335,21 @@ class DiscourseLedgerTests(unittest.TestCase):
         ledger = DiscourseLedger(candidate_score_threshold=1.0)
         generic = self._entry(
             "generic",
-            CommitmentType.COMMITMENT,
+            CommitmentType.FORWARD_COMMITMENT,
             "Future sections will provide a framework and offer a detailed comparison of these issues",
             "s1",
             100,
         )
         specific = self._entry(
             "specific",
-            CommitmentType.COMMITMENT,
+            CommitmentType.FORWARD_COMMITMENT,
             "Indication boundaries should define the valid scope under sparse evidence",
             "s1",
             101,
         )
         loop = self._entry(
             "loop",
-            CommitmentType.OPEN_LOOP,
+            CommitmentType.UNRESOLVED_ISSUE,
             "The valid scope under sparse evidence and indication boundaries remains unclear",
             "s2",
             110,

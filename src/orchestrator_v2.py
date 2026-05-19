@@ -7,7 +7,7 @@
     MetaState 提供元认知门控，MetricCollector 收集内部机制指标。
 
 依赖：Generator、SectionPlanner、DiscourseLedger、CommitmentExtractor、DTGStore、
-      OnlineValidator、MRSD、AlignmentScorer、MetaState、PlanState、MetricCollector、
+      OnlineValidator、MRSD、EmbeddingModel、NLIModel、MetaState、PlanState、MetricCollector、
       CorrectionLog
 被依赖：main.py
 """
@@ -27,16 +27,19 @@ from .core.decision import Decision
 from .core.meta_state import MetaState
 from .core.plan import PlanState, SectionIntent
 from .core.state import GenerationState
+from .core.validation import failure_description
 from .evaluation.metric_collector import MetricCollector
 from .logging.correction_log import CorrectionLog
 from .logging.run_logger import RunLogger
 from .memory.commitment_extractor import CommitmentExtractor
 from .memory.discourse_ledger import DiscourseLedger
 from .memory.dtg_store import DTGStore
-from .metrics.alignment import AlignmentScorer
 from .references.corpus import CorpusLoader
 from .references.retriever import HyDERetriever
 from .references.types import GlobalPaperEntry, GlobalPaperIndex
+from .metrics.coverage_scorer import TopicCoverageScorer
+from .utils.embedding_model import EmbeddingModel
+from .utils.nli_model import NLIModel
 from .validators.online_validator import OnlineValidator
 
 
@@ -58,12 +61,12 @@ class SelfCorrectingOrchestrator:
     关键常数：
         MAX_RETRIES_PER_SECTION = 3
         MAX_ROLLBACKS = 5
-        DCAS_THRESHOLD = 0.6
+        TCAS_THRESHOLD = 0.6
     """
 
     MAX_RETRIES_PER_SECTION = 3
     MAX_ROLLBACKS = 5
-    DCAS_THRESHOLD = 0.6
+    TCAS_THRESHOLD = 0.6
     DSL_RELATION_MAX_PAIRS_PER_SECTION = 8
     DSL_RELATION_BATCH_SIZE = 4
     DSL_RELATION_MIN_CONFIDENCE = 0.5
@@ -100,22 +103,26 @@ class SelfCorrectingOrchestrator:
 
         llm_client.attach_run_logger(self.run_logger)
 
+        # EmbeddingModel / NLIModel 作为全局单例，所有组件共享同一实例
+        self._embed_model = EmbeddingModel()
+        self._nli_model   = NLIModel()
+
         self.generator        = Generator(llm_client, run_logger=self.run_logger)
         self.section_planner  = SectionPlanner(llm_client, self.dtg)
         self.commitment_extractor = CommitmentExtractor(llm_client)
-        self.alignment_scorer = AlignmentScorer(llm_client)
         self.online_validator = OnlineValidator(
-            llm_client=llm_client,
+            embedding_model=self._embed_model,
+            nli_model=self._nli_model,
             dtg_store=self.dtg,
-            alignment_scorer=self.alignment_scorer,
             meta_state=self.meta_state,
+            llm_client=llm_client,
             run_logger=self.run_logger,
         )
-        self.mrsd = MRSD(dtg_store=self.dtg, llm_client=llm_client)
+        self.mrsd = MRSD(dtg_store=self.dtg, embedding_model=self._embed_model)
         self.correction_log   = CorrectionLog()
         self.metric_collector = MetricCollector()
-        self._corpus = CorpusLoader(corpus_dir)
-        self.retriever = HyDERetriever(self._corpus, llm_client=llm_client)
+        self._corpus = CorpusLoader(corpus_dir, self._embed_model)
+        self.retriever = HyDERetriever(self._corpus)
         self.retriever.attach_run_logger(self.run_logger)
         self.last_chunk_map: List[Dict[str, Any]] = []
         self.last_citation_manifest: List[Dict[str, Any]] = []
@@ -175,6 +182,7 @@ class SelfCorrectingOrchestrator:
             consecutive_failures_this_section = 0
             last_purge_succeeded = False
             last_diagnosis_event_id: Optional[str] = None
+            last_diagnosis_tier: Optional[str] = None  # 上一次诊断的 error_tier，供 MetaState 更新准确率
 
             while current_idx < len(section_queue):
                 section_id = section_queue[current_idx]
@@ -205,6 +213,13 @@ class SelfCorrectingOrchestrator:
                 if self.run_logger is not None:
                     self.run_logger.log_planning(section_id, section_intent)
 
+                # 提前提取 required_topics：用任务描述 + 节标题提取核心主题词，
+                # 生成后注入 Decision，供 OnlineValidator 覆盖率检查使用
+                required_topics = self.section_planner.extract_required_topics(
+                    section_title=section_title,
+                    task_description=task,
+                )
+
                 # 准备 DSL 注入
                 self._update_dsl_injection(state, section_id, section_queue, current_idx)
                 section_papers = self.retriever.rank_for_section(
@@ -221,6 +236,7 @@ class SelfCorrectingOrchestrator:
                 last_failure_reason: Optional[str] = None
                 citation_retry_hint: Optional[str] = None  # 每节重置；引用失败后由验证路径填充
                 length_retry_hint: Optional[str] = None    # 每节重置；长度验证失败后由验证路径填充
+                _section_tier_failures: Dict[str, int] = {}  # 当前节内各 error_tier 的失败次数
 
                 for attempt in range(self.MAX_RETRIES_PER_SECTION):
                     # 第二阶段：生成
@@ -245,6 +261,9 @@ class SelfCorrectingOrchestrator:
                         self.correction_log.add_retry(section_id, attempt + 1, "RETRY_SIMPLE", [str(e)])
                         continue
 
+                    # 将 required_topics 注入 Decision，供 OnlineValidator 覆盖率检查消费
+                    decision.required_topics = required_topics
+
                     # 第二点五阶段：引用注入
                     # 在验证前，若 content 中无 [Rx] 标记，执行专项引用注入调用。
                     # 分离"内容写作"和"引用标注"两个任务，使 LLM 聚焦于各自目标。
@@ -265,7 +284,7 @@ class SelfCorrectingOrchestrator:
                             global_index=global_index,
                             word_target=section_word_target,
                         )
-                        self.meta_state.update_validator_stability(report.dcas_score)
+                        self.meta_state.update_validator_stability(report.score)
                     except Exception as e:
                         self.logger.error("验证异常（section=%s）: %s", section_id, e)
                         report = None
@@ -293,14 +312,19 @@ class SelfCorrectingOrchestrator:
                             section_queue=section_queue,
                             plan_state=plan_state,
                             attempt=attempt,
-                            dcas=report.dcas_score,
+                            tcas=report.score,
                         )
                         # 记录诊断结果（若上一次有诊断）
                         if last_diagnosis_event_id:
                             self.metric_collector.record_diagnosis_outcome(
                                 last_diagnosis_event_id, succeeded=True
                             )
+                            if last_diagnosis_tier:
+                                self.meta_state.record_diagnosis_outcome(
+                                    last_diagnosis_tier, was_correct=True
+                                )
                             last_diagnosis_event_id = None
+                            last_diagnosis_tier = None
                         self.metric_collector.record_section_first_pass(
                             section_id, passed_on_first_try=(attempt == 0)
                         )
@@ -334,28 +358,51 @@ class SelfCorrectingOrchestrator:
                         confidence=diagnosis.confidence,
                         repair_scope=diagnosis.repair_scope,
                         causal_subgraph_size=len(diagnosis.causal_subgraph),
-                        llm_calls_used=min(self.mrsd._max_llm_budget, len(diagnosis.causal_subgraph) + 1),
+                        llm_calls_used=0,
                     )
                     if last_diagnosis_event_id:
                         self.metric_collector.record_diagnosis_outcome(
                             last_diagnosis_event_id, succeeded=False
                         )
+                        if last_diagnosis_tier:
+                            self.meta_state.record_diagnosis_outcome(
+                                last_diagnosis_tier, was_correct=False
+                            )
                     last_diagnosis_event_id = diag_event_id
+                    last_diagnosis_tier = diagnosis.error_tier.value
 
                     # 更新 MetaState
-                    self.meta_state.record_failure(
-                        diagnosis.error_tier.value, diagnosis.error_source.value
+                    _current_tier = diagnosis.error_tier.value
+                    self.meta_state.record_failure(_current_tier, diagnosis.error_source.value)
+
+                    # Fix 3：用当前节内同层级失败次数计算真实 recent_same_tier_failure_rate
+                    _section_tier_failures[_current_tier] = (
+                        _section_tier_failures.get(_current_tier, 0) + 1
+                    )
+                    _recent_tier_rate = (
+                        _section_tier_failures[_current_tier]
+                        / consecutive_failures_this_section
                     )
                     self.meta_state.update_contamination_risk(
                         low_trust_ref_ratio=self._compute_low_trust_ratio(section_id),
-                        recent_same_tier_failure_rate=0.0,
+                        recent_same_tier_failure_rate=_recent_tier_rate,
+                    )
+
+                    # Fix 2：接入 EIV 计算（依赖已更新的 diagnosis_uncertainty_profile）
+                    self.meta_state.update_eiv(
+                        current_tier=_current_tier,
+                        current_tcas=report.score,
+                        tcas_threshold=TopicCoverageScorer.THRESHOLD_TCAS_MAJOR,
+                        estimated_extra_calls=1,
+                        avg_tokens_per_call=2000,
+                        token_budget=max(self.meta_state.remaining_retry_budget, 1),
                     )
 
                     self._print_failure(section_id, attempt + 1, diagnosis, report)
                     self.correction_log.add_retry(
                         section_id, attempt + 1,
                         f"{diagnosis.repair_scope}({diagnosis.error_tier.value})",
-                        report.issues,
+                        report.failures,
                     )
 
                     # 引用失败检测：当 ReferenceValidator 报告合法引用不足时，
@@ -364,46 +411,123 @@ class SelfCorrectingOrchestrator:
                     ref_rpt = report.reference_report if report else None
                     _citation_only_failure = False
                     if ref_rpt is not None and not ref_rpt.passed:
+                        min_cit = self.online_validator.reference_validator._min_citations
                         available_labels = (
                             " ".join(f"[R{e.r_index}]" for e in section_papers)
                             if section_papers else "none"
                         )
                         citation_retry_hint = (
-                            f"The previous attempt produced {ref_rpt.valid_marker_count} valid [Rx] "
-                            f"marker(s) in the content field, but at least 1 is required. "
+                            f"CRITICAL: The previous attempt produced only {ref_rpt.valid_marker_count} "
+                            f"valid [Rx] marker(s), but at least {min_cit} are required. "
                             f"References available for this section: {available_labels}. "
-                            "You MUST append [Rx] immediately after each sentence that a reference supports. "
+                            f"You MUST cite at least {min_cit} different references by appending "
+                            "[Rx] immediately after each supporting sentence. "
+                            "Integrate citations naturally throughout the section — "
+                            "do not cluster them all in one place. "
                             "[Rx] markers must appear ONLY in the content field — "
                             "never in reasoning, decision, or expected_effect."
                         )
                         self.logger.info(
-                            "citation_retry_hint set for next attempt: section=%s valid_markers=%d",
-                            section_id, ref_rpt.valid_marker_count,
+                            "citation_retry_hint set for next attempt: section=%s valid_markers=%d min_required=%d",
+                            section_id, ref_rpt.valid_marker_count, min_cit,
                         )
-                        # Fix 2：引用密度失败不得触发 partial_rollback。
-                        # 根因：citation 失败是局部的标记缺失（内容正确但未加 [Rx]），
-                        # 不是上游章节决策传播的错误，rollback 到更早节只会引发级联振荡。
-                        # 当其他维度均通过（非引用类 major issue 为零）时，强制 local_rewrite。
-                        non_ref_major = [
-                            i for i in report.issues
-                            if i.type != "reference" and i.severity in ("critical", "major")
-                        ] if report else []
-                        _citation_only_failure = len(non_ref_major) == 0
+                        # 引用密度失败不得触发 partial_rollback：
+                        # 根因是标记缺失（内容正确但未加 [Rx]），不是上游决策传播错误。
+                        # 新版：引用失败以 AbsenceViolation(source_check="citation_density") 进入
+                        # report.failures，需按 source_check 识别，而非依赖 failures==[]。
+                        from .core.validation import AbsenceViolation as _AV
+                        citation_abs = [
+                            f for f in report.failures
+                            if isinstance(f, _AV) and f.source_check == "citation_density"
+                        ]
+                        _citation_only_failure = bool(citation_abs) and all(
+                            isinstance(f, _AV) and f.source_check == "citation_density"
+                            for f in report.failures
+                        )
                         if _citation_only_failure:
                             self.logger.info(
                                 "citation-only failure detected, overriding diagnosis to local_rewrite: section=%s",
                                 section_id,
                             )
+                            # ── 免费引用插入矫正（不消耗重试次数）──────────────────
+                            # 引用数量不足属于标注问题，内容质量本身没有问题。
+                            # 对已生成原文做纯标记插入（不重写内容），保留写作质量。
+                            # 若矫正通过，直接接受；若未通过，保留 citation_retry_hint
+                            # 供下轮正式重试使用，本轮不额外消耗重试次数。
+                            if content and section_papers:
+                                self.logger.info(
+                                    "免费引用插入矫正启动：section=%s actual=%d min=%d",
+                                    section_id, ref_rpt.valid_marker_count, min_cit,
+                                )
+                                _rc, _rd = self._reinforce_citations(
+                                    content=content,
+                                    decision=decision,
+                                    section_papers=section_papers,
+                                    section_id=section_id,
+                                    actual_count=ref_rpt.valid_marker_count,
+                                    min_required=min_cit,
+                                )
+                                _reinforce_report = self.online_validator.validate_and_diagnose(
+                                    _rd, _rc, state,
+                                    global_index=global_index,
+                                    word_target=section_word_target,
+                                )
+                                self.meta_state.update_validator_stability(_reinforce_report.score)
 
-                    # 长度失败检测：从 format issue 中提取 actual/target 词数，构建 length_retry_hint。
-                    # 目的：让下轮生成明确知道上次的实际词数与目标的差距。
-                    length_format_issues = [
-                        i for i in (report.issues if report else [])
-                        if i.type == "format" and "actual=" in i.description
+                                if _reinforce_report.passed:
+                                    self.logger.info(
+                                        "免费引用插入矫正通过：section=%s", section_id
+                                    )
+                                    self._on_section_success(
+                                        section_id=section_id,
+                                        content=_rc,
+                                        decision=_rd,
+                                        state=state,
+                                        generated_content=generated_content,
+                                        section_queue=section_queue,
+                                        plan_state=plan_state,
+                                        attempt=attempt,
+                                        tcas=_reinforce_report.score,
+                                    )
+                                    if last_diagnosis_event_id:
+                                        self.metric_collector.record_diagnosis_outcome(
+                                            last_diagnosis_event_id, succeeded=True
+                                        )
+                                        if last_diagnosis_tier:
+                                            self.meta_state.record_diagnosis_outcome(
+                                                last_diagnosis_tier, was_correct=True
+                                            )
+                                        last_diagnosis_event_id = None
+                                        last_diagnosis_tier = None
+                                    self.metric_collector.record_section_first_pass(
+                                        section_id, passed_on_first_try=(attempt == 0)
+                                    )
+                                    consecutive_failures_this_section = 0
+                                    last_purge_succeeded = False
+                                    current_idx += 1
+                                    break
+
+                                # 矫正未通过：更新 content/decision，
+                                # citation_retry_hint 已就位，下轮正式重试会携带
+                                self.logger.info(
+                                    "免费引用插入矫正未通过，进入下轮正式重试：section=%s",
+                                    section_id,
+                                )
+                                content = _rc
+                                decision = _rd
+
+                    # 长度失败检测：从 report.failures 中找 format_length 类型的
+                    # AbsenceViolation，从其 obligation 字段提取 actual/target 词数。
+                    # 原因：MAJOR 格式问题进入 failures（非 warnings），旧代码查 warnings 永远为空。
+                    from .core.validation import AbsenceViolation as _AV2
+                    _length_failures = [
+                        f for f in (report.failures if report else [])
+                        if isinstance(f, _AV2) and getattr(f, "source_check", "") == "format_length"
                     ]
-                    if length_format_issues:
-                        _m_actual = re.search(r'actual=(\d+)', length_format_issues[0].description)
-                        _m_target = re.search(r'target=(\d+)', length_format_issues[0].description)
+                    if _length_failures:
+                        _obligation_text = _length_failures[0].obligation
+                        _m_actual = re.search(r'actual=(\d+)', _obligation_text)
+                        _m_target = re.search(r'target=(\d+)', _obligation_text)
                         if _m_actual and _m_target:
                             _actual = int(_m_actual.group(1))
                             _target = int(_m_target.group(1))
@@ -436,6 +560,8 @@ class SelfCorrectingOrchestrator:
                                 "length_retry_hint set for next attempt: section=%s actual=%d target=%d",
                                 section_id, _actual, _target,
                             )
+                        else:
+                            length_retry_hint = None
                     else:
                         length_retry_hint = None
 
@@ -455,7 +581,7 @@ class SelfCorrectingOrchestrator:
                         if target and self._execute_rollback(
                             target_section=target,
                             current_section=section_id,
-                            reason="; ".join(i.description for i in report.issues),
+                            reason="; ".join(failure_description(f) for f in report.failures),
                             state=state,
                             generated_content=generated_content,
                             section_queue=section_queue,
@@ -476,7 +602,7 @@ class SelfCorrectingOrchestrator:
                                 triggered_by_tier=diagnosis.error_tier.value,
                                 triggered_by_confidence=diagnosis.confidence,
                                 succeeded=True,
-                                extra_llm_calls=self.mrsd._max_llm_budget,
+                                extra_llm_calls=0,
                                 rollback_distance=abs(
                                     section_queue.index(section_id)
                                     - (section_queue.index(target) if target in section_queue else 0)
@@ -495,7 +621,7 @@ class SelfCorrectingOrchestrator:
                         purged = self.dsl.purge_contaminated_entries(
                             contaminated_section=section_id,
                             conflict_description="; ".join(
-                                i.description for i in report.issues[:2]
+                                failure_description(f) for f in report.failures[:2]
                             ),
                         )
                         last_purge_succeeded = len(purged) > 0
@@ -524,7 +650,7 @@ class SelfCorrectingOrchestrator:
                                 task=task,
                                 plan_state=plan_state,
                                 is_revision=True,
-                                revision_reason="; ".join(i.description for i in report.issues),
+                                revision_reason="; ".join(failure_description(f) for f in report.failures),
                                 word_target=section_word_target,
                             )
                             plan_state.revise_intent(
@@ -569,7 +695,7 @@ class SelfCorrectingOrchestrator:
                         if fallback_decision:
                             self.dtg.add_decision(fallback_decision)
 
-                        last_issues = report.issues if report else []
+                        last_issues = report.failures if report else []
                         self.correction_log.add_failure(section_id, last_issues)
                         state.flagged_issues.append(
                             f"{section_id}: degraded content accepted after validation failure"
@@ -670,7 +796,7 @@ class SelfCorrectingOrchestrator:
                 section_id=section_id,
                 local_goal=f"Complete the content for {section_title}",
                 scope_boundary=f"This section must stay within {section_title} and must not cover later sections",
-                open_loops_to_advance=[],
+                coverage_requirements=[],
                 commitments_to_maintain=[],
                 risks_to_avoid=[],
                 success_criteria=["The content matches the section goal and does not violate major constraints."],
@@ -748,7 +874,7 @@ class SelfCorrectingOrchestrator:
         section_queue: List[str],
         plan_state: PlanState,
         attempt: int,
-        dcas: float,
+        tcas: float,
     ) -> None:
         """
         验证通过后的统一处理逻辑
@@ -771,7 +897,7 @@ class SelfCorrectingOrchestrator:
             section_queue: 全局节列表
             plan_state: 规划状态
             attempt: 本次为第几次尝试（0-based）
-            dcas: DCAS 评分
+            tcas: TCAS 评分
         """
         generated_content[section_id] = content
         state.generated_sections.append(section_id)
@@ -791,6 +917,8 @@ class SelfCorrectingOrchestrator:
                 existing_summary="; ".join(state.section_summaries.get(sid, "")[:100] for sid in state.generated_sections[-3:-1]),
             )
             for entry in new_entries:
+                # Phase 3 DSL 溯源：记录产生此条目的 DTG 决策节点
+                entry.source_node = decision.decision_id
                 self.dsl.add_entry(entry)
         except Exception as e:
             self.logger.warning("承诺提取失败（跳过）：%s", e)
@@ -829,14 +957,14 @@ class SelfCorrectingOrchestrator:
             self.run_logger.log_section_success(
                 section_id=section_id,
                 total_attempts=attempt + 1,
-                dcas=dcas,
+                tcas=tcas,
                 new_entries=new_entries,
                 total_active_entries=len(active),
                 memory_trust=self.meta_state.memory_trust_level,
             )
 
         self._log_postprocess_skipped(section_id)
-        self._print_success(section_id, attempt + 1, dcas)
+        self._print_success(section_id, attempt + 1, tcas)
 
     def _log_dsl_relation_stats(
         self,
@@ -987,13 +1115,32 @@ class SelfCorrectingOrchestrator:
             GenerationState：初始化后的生成状态
         """
         first_section = next(iter(outline))
-        return GenerationState(
+        state = GenerationState(
             current_section=first_section,
             progress=0.0,
             global_constraints=constraints,
             outline=outline,
             generated_sections=[],
         )
+
+        # Phase 3：将任务规范级约束写入 DSL 作为 IMMUTABLE DISCOURSE_POLICY 条目，
+        # 使 MRCA 的 D_j(r) 计算能追踪这些约束的传播影响
+        from .core.ledger import CommitmentType, ConstraintType, LedgerEntry
+        for constraint in constraints:
+            if not constraint.strip():
+                continue
+            entry = LedgerEntry.create(
+                commitment_type=CommitmentType.DISCOURSE_POLICY,
+                content=constraint,
+                constraint_type=ConstraintType.IMMUTABLE,
+                source_section="__task_spec__",
+                source_decision_id="__task_spec__",
+                trust_level=1.0,
+            )
+            entry.source_node = "__task_spec__"
+            self.dsl.add_entry(entry)
+
+        return state
 
     def _get_recent_content(self) -> str:
         """
@@ -1118,6 +1265,34 @@ Text to annotate:
 
 Annotated text:"""
 
+    # 引用强化插入 prompt：用于已有标记但数量不足时的专项矫正。
+    # 与 _CITATION_INJECTION_PROMPT 的区别：明确告知上次实际数量和最低要求，
+    # 同时重复完整论文列表和原文，引导 LLM 做补充插入而非重写。
+    _CITATION_REINFORCE_PROMPT = """\
+You are an academic editor performing citation reinforcement. Do NOT rewrite, add, or remove any prose.
+
+The previous version of this section contained only {actual_count} citation marker(s) — \
+below the minimum requirement of {min_required}.
+
+Your task: insert additional [Rx] markers into the text wherever the supporting reference applies.
+
+Available references for this section:
+{paper_list}
+
+Requirements:
+1. Insert [Rx] immediately after the sentence or clause it supports.
+   Example: "Dropout reduces overfitting [R3]."
+2. You MUST achieve at least {min_required} distinct [Rx] markers in the output.
+3. Each reference may appear multiple times if multiple sentences support it.
+4. Do NOT add, remove, or rephrase any words — only insert [Rx] markers.
+5. [Rx] markers go ONLY in the body text — never in headings.
+6. Output ONLY the annotated text, nothing else.
+
+Original text (from previous attempt):
+{content}
+
+Annotated text:"""
+
     def _inject_citations_if_needed(
         self,
         content: str,
@@ -1216,6 +1391,108 @@ Annotated text:"""
         except Exception as exc:
             self.logger.warning(
                 "引用注入：section=%s LLM 调用失败 %s，使用原始内容",
+                section_id, exc,
+            )
+            return content, decision
+
+    def _reinforce_citations(
+        self,
+        content: str,
+        decision: "Decision",
+        section_papers: List[GlobalPaperEntry],
+        section_id: str,
+        actual_count: int,
+        min_required: int,
+    ) -> Tuple[str, "Decision"]:
+        """
+        引用强化插入：对已生成内容做纯标记插入，不重写任何正文。
+
+        设计原理：
+            引用数量不足通常是写作注意力分配问题（写作质量与引用标注竞争），
+            而非内容本身存在缺陷。纯插入策略保留已有写作质量，
+            仅在恰当位置补充缺失的 [Rx] 标记。
+
+        与 _inject_citations_if_needed 的区别：
+            - 触发条件：已有标记但数量低于 min_required（而非零标记）
+            - prompt 中明确传递 actual_count 和 min_required，
+              以及上次生成的完整原文，要求 LLM 补充插入而非从零开始
+
+        参数：
+            content:        当前节已生成文本（含现有 [Rx] 标记）
+            decision:       对应 Decision（插入成功后同步 decision.content）
+            section_papers: 该节可用论文列表
+            section_id:     节 ID（日志用）
+            actual_count:   上一次验证的实际引用标记数
+            min_required:   最低要求引用标记数
+
+        返回：
+            Tuple[str, Decision]：(插入后内容, 更新后 decision)；
+            插入失败时返回原始 (content, decision)。
+        """
+        if not section_papers:
+            self.logger.info(
+                "引用强化插入：section=%s 无可用论文，跳过",
+                section_id,
+            )
+            return content, decision
+
+        # 第一阶段：构建论文列表（含摘要片段，控制 prompt 长度）
+        paper_lines = []
+        for entry in section_papers:
+            abstract_snippet = (entry.abstract or entry.top_chunk_text or "")[:150].replace("\n", " ")
+            paper_lines.append(
+                f"[R{entry.r_index}] {entry.title[:80]} | {abstract_snippet}"
+            )
+        paper_list_str = "\n".join(paper_lines)
+
+        prompt = self._CITATION_REINFORCE_PROMPT.format(
+            actual_count=actual_count,
+            min_required=min_required,
+            paper_list=paper_list_str,
+            content=content,
+        )
+
+        # 第二阶段：调用 LLM 做纯插入（低温度保证确定性，token 上限按原文词数放宽）
+        try:
+            reinforced = self.llm_client.generate(
+                prompt=prompt,
+                temperature=0.1,
+                max_tokens=min(4096, max(512, len(content.split()) * 3)),
+                log_meta={"caller": f"CitationReinforcer.{section_id}"},
+            )
+            reinforced = reinforced.strip()
+
+            reinforced_markers = re.findall(r"\[R\d+\]", reinforced)
+            marker_count = len(reinforced_markers)
+
+            # 第三阶段：校验插入结果
+            if marker_count < min_required:
+                self.logger.warning(
+                    "引用强化插入：section=%s 插入后仅 %d 个标记（需 %d），返回原始内容",
+                    section_id, marker_count, min_required,
+                )
+                return content, decision
+
+            # 防止 LLM 在插入时截断正文
+            original_words = len(content.split())
+            reinforced_words = len(reinforced.split())
+            if reinforced_words < original_words * 0.8:
+                self.logger.warning(
+                    "引用强化插入：section=%s 词数骤降（%d→%d），使用原始内容",
+                    section_id, original_words, reinforced_words,
+                )
+                return content, decision
+
+            self.logger.info(
+                "引用强化插入：section=%s 成功，标记数 %d→%d %s",
+                section_id, actual_count, marker_count, reinforced_markers[:6],
+            )
+            decision.content = reinforced
+            return reinforced, decision
+
+        except Exception as exc:
+            self.logger.warning(
+                "引用强化插入：section=%s LLM 调用失败 %s，使用原始内容",
                 section_id, exc,
             )
             return content, decision
@@ -1490,14 +1767,14 @@ Annotated text:"""
             f"\n[bold blue][{idx+1}/{total}] {section_id}[/bold blue] - {title}"
         )
 
-    def _print_success(self, section_id: str, attempt: int, dcas: float) -> None:
+    def _print_success(self, section_id: str, attempt: int, tcas: float) -> None:
         attempt_str = f"(attempt {attempt})" if attempt > 1 else "(first pass)"
         self.console.print(
-            f"  [green][OK] {section_id} passed {attempt_str} DCAS={dcas:.3f}[/green]"
+            f"  [green][OK] {section_id} passed {attempt_str} TCAS={tcas:.3f}[/green]"
         )
 
     def _print_failure(self, section_id: str, attempt: int, diagnosis, report) -> None:
-        issues_str = " | ".join(i.description[:40] for i in report.issues[:3])
+        issues_str = " | ".join(failure_description(f)[:40] for f in (report.failures or [])[:3])
         self.console.print(
             f"  [yellow][FAIL] {section_id} failed on attempt {attempt} -> "
             f"{diagnosis.repair_scope}({diagnosis.error_tier.value}/"

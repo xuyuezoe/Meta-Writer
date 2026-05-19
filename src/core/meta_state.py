@@ -119,7 +119,7 @@ class MetaState:
         更新验证器稳定性估计
 
         参数：
-            new_dcas_score: 最新一次 DCAS 总分
+            new_dcas_score: 最新一次 TCAS 总分
 
         关键实现细节：
             保留最近 5 次评分，计算方差，稳定性 = 1 / (1 + variance)
@@ -138,8 +138,8 @@ class MetaState:
     def update_eiv(
         self,
         current_tier: str,
-        current_dcas: float,
-        dcas_threshold: float,
+        current_tcas: float,
+        tcas_threshold: float,
         estimated_extra_calls: int,
         avg_tokens_per_call: int,
         token_budget: int,
@@ -148,20 +148,20 @@ class MetaState:
         更新预期干预价值（EIV）
 
         参数：
-            current_tier: 当前错误层级字符串
-            current_dcas: 当前 DCAS 总分
-            dcas_threshold: DCAS 通过阈值
+            current_tier:          当前错误层级字符串
+            current_tcas:          当前 TCAS 总分
+            tcas_threshold:        TCAS 通过阈值
             estimated_extra_calls: 预计需要的额外 LLM 调用次数
-            avg_tokens_per_call: 每次调用平均 token 数
-            token_budget: 当前剩余 token 预算
+            avg_tokens_per_call:   每次调用平均 token 数
+            token_budget:          当前剩余重试预算（用作代价归一化基数）
 
         关键实现细节：
-            P(成功) ≈ 当前错误层级的历史诊断准确率
-            ΔQ ≈ 当前 DCAS 到阈值的差距
-            C ≈ 额外调用 token 数 / 总 token 预算
+            P(成功) ≈ 当前错误层级的历史诊断准确率（由 record_diagnosis_outcome 维护）
+            ΔQ     ≈ 当前 TCAS 到阈值的差距（差距越大，修复价值越高）
+            C      ≈ 额外调用 token 数 / 总 token 预算
         """
         p_success = self.diagnosis_uncertainty_profile.get(current_tier, 0.5)
-        delta_q = max(0.0, dcas_threshold - current_dcas)
+        delta_q = max(0.0, tcas_threshold - current_tcas)
         c_cost = (estimated_extra_calls * avg_tokens_per_call) / max(token_budget, 1)
         self.expected_intervention_value = p_success * delta_q - c_cost
 

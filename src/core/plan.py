@@ -31,8 +31,8 @@ class SectionIntent:
         intent_id: 唯一标识（UUID）
         section_id: 对应节 ID
         local_goal: 本节需要实现的具体目标（≤50字）
-        scope_boundary: 本节明确不应涉及的内容，防止 LLM 越界解决后续冲突
-        open_loops_to_advance: 本节应推进的未闭合线索列表
+        scope_boundary: 本节明确不应涉及的内容范围（防止越界覆盖后续节责任）
+        coverage_requirements: 本节应覆盖的核心主题或研究问题列表
         commitments_to_maintain: 本节必须维护的承诺列表
         risks_to_avoid: 本节需避免的高风险冲突列表
         success_criteria: 本节通过验证的最低标准（1-2条）
@@ -42,7 +42,7 @@ class SectionIntent:
         revision_count: 已被修订的次数
 
     关键实现细节：
-        scope_boundary 是解决叙事不推进问题的关键约束字段，明确禁止本节提前解决后续冲突。
+        scope_boundary 是防止跨节越界的关键约束字段，明确禁止本节抢占后续节的覆盖责任。
         source_dsl_entry_ids 用于 plan_level 诊断时判断是否被低 trust DSL 污染。
         trust_level_at_generation 用于排除"state_level 污染伪装成 plan_level"的情况。
     """
@@ -50,7 +50,7 @@ class SectionIntent:
     section_id: str
     local_goal: str
     scope_boundary: str
-    open_loops_to_advance: List[str]
+    coverage_requirements: List[str]
     commitments_to_maintain: List[str]
     risks_to_avoid: List[str]
     success_criteria: List[str]
@@ -66,7 +66,7 @@ class SectionIntent:
         section_id: str,
         local_goal: str,
         scope_boundary: str,
-        open_loops_to_advance: List[str],
+        coverage_requirements: List[str],
         commitments_to_maintain: List[str],
         risks_to_avoid: List[str],
         success_criteria: List[str],
@@ -80,7 +80,7 @@ class SectionIntent:
             section_id=section_id,
             local_goal=local_goal,
             scope_boundary=scope_boundary,
-            open_loops_to_advance=open_loops_to_advance,
+            coverage_requirements=coverage_requirements,
             commitments_to_maintain=commitments_to_maintain,
             risks_to_avoid=risks_to_avoid,
             success_criteria=success_criteria,
@@ -98,9 +98,9 @@ class SectionIntent:
         if self.scope_boundary:
             lines.append(f"\n**Do not cross this boundary**: {self.scope_boundary}")
 
-        if self.open_loops_to_advance:
-            lines.append("\n**Open loops to advance**:")
-            for item in self.open_loops_to_advance:
+        if self.coverage_requirements:
+            lines.append("\n**Coverage requirements**:")
+            for item in self.coverage_requirements:
                 lines.append(f"- {item}")
 
         if self.commitments_to_maintain:
@@ -130,7 +130,7 @@ class SectionIntent:
             "section_id":               self.section_id,
             "local_goal":               self.local_goal,
             "scope_boundary":           self.scope_boundary,
-            "open_loops_to_advance":    self.open_loops_to_advance,
+            "coverage_requirements":    self.coverage_requirements,
             "commitments_to_maintain":  self.commitments_to_maintain,
             "risks_to_avoid":           self.risks_to_avoid,
             "success_criteria":         self.success_criteria,

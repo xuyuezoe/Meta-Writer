@@ -1,11 +1,13 @@
 """
-Tests for src/references 模块：HyDEGenerator、reciprocal_rank_fusion、HyDERetriever。
+Tests for src/references 模块：reciprocal_rank_fusion、DenseRetriever。
 
 验证范围：
-    - RRF 分数计算与排名逻辑
-    - HyDEGenerator 缓存、降级（llm_client=None → None）
+    - RRF 分数计算与排名逻辑（fusion.py 仍保留，供其他场景复用）
     - 模块公开接口导出（__init__.py）
-    - HyDERetriever 在空语料库上不崩溃
+    - DenseRetriever（HyDERetriever 别名）在空语料库上不崩溃
+    - Closing 辅助路去重与补充逻辑
+
+注意：HyDEGenerator 已在 Phase 2 删除，其对应测试已移除。
 """
 from __future__ import annotations
 
@@ -72,92 +74,17 @@ class ReciprocaRankFusionTests(unittest.TestCase):
         self.assertEqual(ids, {"a", "b", "c", "d"})
 
 
-class HyDEGeneratorTests(unittest.TestCase):
-    """验证 HyDEGenerator 的缓存、降级和 LLM 调用逻辑。"""
-
-    def _make_generator(self):
-        from src.references.hyde import HyDEGenerator
-        return HyDEGenerator()
-
-    def test_returns_none_when_client_is_none_for_task(self) -> None:
-        gen = self._make_generator()
-        self.assertIsNone(gen.generate_for_task("test task", llm_client=None))
-
-    def test_returns_none_when_client_is_none_for_section(self) -> None:
-        gen = self._make_generator()
-        self.assertIsNone(
-            gen.generate_for_section("Introduction", "overview", llm_client=None)
-        )
-
-    def test_returns_none_when_client_is_none_for_memory(self) -> None:
-        gen = self._make_generator()
-        self.assertIsNone(gen.generate_for_memory("some intent", llm_client=None))
-
-    def test_cache_key_is_deterministic(self) -> None:
-        gen = self._make_generator()
-        k1 = gen._cache_key("same text", "task")
-        k2 = gen._cache_key("same text", "task")
-        self.assertEqual(k1, k2)
-
-    def test_cache_key_is_16_chars(self) -> None:
-        gen = self._make_generator()
-        self.assertEqual(len(gen._cache_key("any", "any")), 16)
-
-    def test_cache_key_differs_for_different_style(self) -> None:
-        gen = self._make_generator()
-        k1 = gen._cache_key("text", "task")
-        k2 = gen._cache_key("text", "section")
-        self.assertNotEqual(k1, k2)
-
-    def test_llm_result_is_cached_on_second_call(self) -> None:
-        gen = self._make_generator()
-        mock_client = MagicMock()
-        mock_client.generate.return_value = "Hypothetical abstract text."
-
-        r1 = gen.generate_for_task("task A", llm_client=mock_client)
-        r2 = gen.generate_for_task("task A", llm_client=mock_client)
-
-        self.assertEqual(r1, r2)
-        # LLM は 1 回だけ呼ばれるべき（2 回目はキャッシュヒット）
-        mock_client.generate.assert_called_once()
-
-    def test_empty_llm_response_returns_none(self) -> None:
-        gen = self._make_generator()
-        mock_client = MagicMock()
-        mock_client.generate.return_value = "   "
-
-        result = gen.generate_for_task("task B", llm_client=mock_client)
-        self.assertIsNone(result)
-
-    def test_allow_think_only_fallback_is_passed_to_client(self) -> None:
-        gen = self._make_generator()
-        mock_client = MagicMock()
-        mock_client.generate.return_value = "Some text."
-
-        gen.generate_for_task("task C", llm_client=mock_client)
-
-        call_kwargs = mock_client.generate.call_args[1]
-        self.assertTrue(
-            call_kwargs.get("allow_think_only_fallback"),
-            "allow_think_only_fallback must be True to handle extended-thinking models",
-        )
-
-    def test_llm_exception_returns_none(self) -> None:
-        gen = self._make_generator()
-        mock_client = MagicMock()
-        mock_client.generate.side_effect = RuntimeError("LLM unavailable")
-
-        result = gen.generate_for_task("task D", llm_client=mock_client)
-        self.assertIsNone(result)
-
-
 class ReferencesInitExportTests(unittest.TestCase):
-    """验证 src/references/__init__.py 的公开导出。"""
+    """验证 src/references/__init__.py 的公开导出。
 
-    def test_hyde_generator_exported(self) -> None:
-        from src.references import HyDEGenerator
-        from src.references.hyde import HyDEGenerator as Direct
-        self.assertIs(HyDEGenerator, Direct)
+    HyDEGenerator 和 reciprocal_rank_fusion 已从 __init__.py 移除（Phase 2）。
+    DenseRetriever 为新主类，HyDERetriever/ReferenceRetriever 为向后兼容别名。
+    """
+
+    def test_dense_retriever_exported(self) -> None:
+        from src.references import DenseRetriever
+        from src.references.retriever import DenseRetriever as Direct
+        self.assertIs(DenseRetriever, Direct)
 
     def test_hyde_retriever_exported(self) -> None:
         from src.references import HyDERetriever
@@ -168,11 +95,6 @@ class ReferencesInitExportTests(unittest.TestCase):
         from src.references import ReferenceRetriever
         from src.references import HyDERetriever
         self.assertIs(ReferenceRetriever, HyDERetriever)
-
-    def test_rrf_exported(self) -> None:
-        from src.references import reciprocal_rank_fusion
-        from src.references.fusion import reciprocal_rank_fusion as Direct
-        self.assertIs(reciprocal_rank_fusion, Direct)
 
 
 class HyDERetrieverSmokeTests(unittest.TestCase):

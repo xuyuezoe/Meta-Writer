@@ -1,75 +1,139 @@
 """
 最小责任子图诊断算法：MRSD（Minimal Responsibility Subgraph Diagnosis）
+内核实现：MRCA（Minimal Repair-oriented Causal Attribution）
 
 功能：
     给定验证失败事件，寻找能解释失败的最小决策责任子图。
-    替代原启发式 DTGDebugger，提供形式化目标函数下的可计算诊断。
+    全零 LLM 调用，基于本地 embedding + 图论归因。
 
-    核心流程（五步 BCP）：
-        步骤0：约束类型前置过滤（SOFT/STATEFUL 合法更新过滤）
-        步骤1：Realization 软短路（CRS 门控）
-        步骤2：结构因果路径检测（DTG 路径分析，无 LLM 调用）
-        步骤3：反向语义扫描（K=3 次 LLM 预算）
-        步骤4：来源判定（无 LLM 调用）
-        步骤5：构建 DiagnosisResult + DecodingConfig
+    路径 A（PresenceViolation）：五层 MRCA
+        Layer 1 — 语义存在概率 p_h(v)：sigmoid 校准 cosine 相似度
+        Layer 2 — 语义新引入量 α_h(v)：去除父节点已知贡献
+        Layer 3 — 拓扑传播可达性 ρ(v→sf)：反向 DP
+        Layer 4 — 节点类型先验 λ(v, τ)：按失败类型加权
+        Layer 5 — 责任聚合 + 归一化 → 三分类决策
 
-依赖：DTGStore、LLMClient、core/diagnosis.py、core/decision.py、core/validation.py
-被依赖：OnlineValidator（集成后替换 DTGDebugger 调用）、Orchestrator
+    路径 B（AbsenceViolation）：规划层审计（三种子情况）
+
+依赖：DTGStore、EmbeddingModel、core/diagnosis.py、core/decision.py、core/validation.py
+被依赖：Orchestrator
 """
 from __future__ import annotations
 
 import logging
-from typing import Dict, List, Optional, Set, Tuple
+import math
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple, Union
+
+import numpy as np
 
 from ..core.decision import Decision
 from ..core.diagnosis import DecodingConfig, DiagnosisResult, ErrorSource, ErrorTier
-from ..core.validation import ValidationReport
+from ..core.validation import AbsenceViolation, PresenceViolation, ValidationReport
 from ..memory.dtg_store import DTGStore
-from ..utils.llm_client import LLMClient
 
+if TYPE_CHECKING:
+    from ..utils.embedding_model import EmbeddingModel
+
+
+# ── 内部数据类 ──────────────────────────────────────────────────────────────
+
+@dataclass
+class RepairDecision:
+    """
+    MRCA 内部输出，由 diagnose() 桥接为 DiagnosisResult 对外暴露
+
+    字段：
+        error_class:      "CURRENT_LOCAL" | "HISTORICAL_ISOLATED" | "HISTORICAL_CONTAGIOUS"
+        responsible_node: decision_id 或 intent_node_id
+        repair_scope:     需要重生成的 section_id 集合
+        instruction:      可选的针对性修复指令
+        debug:            调试信息字典
+    """
+    error_class: str                          # 三分类决策
+    responsible_node: Optional[str]           # 最大责任节点 ID
+    repair_scope: Set[str]                    # 需要重生成的节集合
+    instruction: Optional[str] = None
+    debug: Dict = field(default_factory=dict)
+
+
+# ── 常量 ──────────────────────────────────────────────────────────────────────
+
+EDGE_WEIGHTS: Dict[str, float] = {
+    "GENERATES":    0.90,
+    "DERIVED_FROM": 0.85,
+    "GUIDES":       0.60,
+    "REFERENCES":   0.70,   # 默认值，REFERENCES 类型会按 cosine 运行时覆盖
+    "DSL_INJECTED": 0.50,   # 默认值，会按 salience 覆盖
+}
+
+# 节点类型先验：{τ: weight}
+# 行 = 节点类型，列 = 失败类型 (CONSISTENCY, SCOPE, CONTENT_GAP)
+NODE_TYPE_PRIOR: Dict[str, Dict[str, float]] = {
+    "intent":   {"CONSISTENCY": 0.8, "SCOPE": 1.5, "CONTENT_GAP": 1.3},
+    "decision": {"CONSISTENCY": 1.5, "SCOPE": 0.8, "CONTENT_GAP": 1.0},
+    "dsl":      {"CONSISTENCY": 1.3, "SCOPE": 1.0, "CONTENT_GAP": 1.2},
+    "repair":   {"CONSISTENCY": 1.4, "SCOPE": 0.9, "CONTENT_GAP": 0.8},
+}
+
+ETA: float = 0.8       # 历史节责任超出当前节的阈值才回退
+THETA_U: float = 0.25  # 传染判断：引用强度阈值
+THETA_Q: float = 0.35  # 传染判断：质量压力阈值
+THETA_C: float = 0.30  # 传染判断：传染分阈值
+M: int = 2             # 传染判断：最小受染节数
+
+# RepairDecision → DiagnosisResult 映射表
+_ERROR_CLASS_TO_TIER: Dict[str, ErrorTier] = {
+    "CURRENT_LOCAL":         ErrorTier.DECISION,
+    "HISTORICAL_ISOLATED":   ErrorTier.DECISION,
+    "HISTORICAL_CONTAGIOUS": ErrorTier.STATE,
+}
+_TAU_TO_TIER: Dict[str, ErrorTier] = {
+    "CONSISTENCY":  ErrorTier.STATE,
+    "SCOPE":        ErrorTier.STATE,
+    "CONTENT_GAP":  ErrorTier.DECISION,
+    "METHODOLOGY":  ErrorTier.PLAN,
+}
+_ERROR_CLASS_TO_SCOPE: Dict[str, str] = {
+    "CURRENT_LOCAL":         "local_rewrite",
+    "HISTORICAL_ISOLATED":   "partial_rollback",
+    "HISTORICAL_CONTAGIOUS": "partial_rollback",
+}
+_ERROR_CLASS_TO_SOURCE: Dict[str, ErrorSource] = {
+    "CURRENT_LOCAL":         ErrorSource.INTRINSIC,
+    "HISTORICAL_ISOLATED":   ErrorSource.PROPAGATED,
+    "HISTORICAL_CONTAGIOUS": ErrorSource.PROPAGATED,
+}
+
+_EPSILON: float = 1e-8
+
+
+# ── MRSD ────────────────────────────────────────────────────────────────────
 
 class MRSD:
     """
-    最小责任子图诊断器
+    最小责任子图诊断器（MRCA 内核）
 
     功能：
-        实现五步 BCP 流程，输出两轴分类（Tier × Source）的诊断结果。
-        操作性因果定义：哪些决策节点若被修改，当前失败最可能消失。
-        结构因果（路径连通性）优先于纯语义匹配。
+        对验证失败执行零 LLM 的五层归因，输出三分类修复决策。
+        路径 A（PresenceViolation）→ 五层 MRCA。
+        路径 B（AbsenceViolation）→ 规划层审计。
 
     参数：
-        dtg_store: DTGStore 实例，提供决策历史和路径检测
-        llm_client: LLM 客户端，用于反向语义扫描（最多 K=3 次调用）
-        max_llm_budget: 反向语义扫描的 LLM 调用次数上限（默认 3）
-
-    关键实现细节：
-        score(G_r) = α|V_r| + β|E_r| + γ·uncertainty(G_r) - δ·explanation_coverage(G_r)
-        α=0.1, β=0.05, γ=0.3, δ=1.0（最小化子图大小和不确定性，最大化解释覆盖）
-        BCP 是上述目标的有预算贪心近似。
+        dtg_store:       DTGStore 实例
+        embedding_model: EmbeddingModel 实例（五层归因共享）
     """
-
-    # 目标函数权重
-    _ALPHA = 0.1     # 子图节点数惩罚
-    _BETA  = 0.05    # 子图边数惩罚
-    _GAMMA = 0.3     # 不确定性惩罚
-    _DELTA = 1.0     # 解释覆盖奖励
-
-    # LLM 置信度映射
-    _CONF_EXPLICIT_CONFLICT = 0.8
-    _CONF_IMPLICIT_OMISSION = 0.5
-
-    # plan_level 触发需要的连续失败次数阈值
-    _PLAN_TRIGGER_CONSECUTIVE_FAILURES = 2
 
     def __init__(
         self,
         dtg_store: DTGStore,
-        llm_client: LLMClient,
-        max_llm_budget: int = 3,
+        embedding_model: Optional["EmbeddingModel"] = None,
+        # 保留向后兼容参数（忽略 LLM）
+        llm_client=None,
+        max_llm_budget: int = 0,
     ):
         self._dtg = dtg_store
-        self._llm = llm_client
-        self._max_llm_budget = max_llm_budget
+        self._embed = embedding_model
         self.logger = logging.getLogger(__name__)
 
     def diagnose(
@@ -83,785 +147,724 @@ class MRSD:
         last_purge_succeeded: bool,
         intent_from_trusted_dsl: bool,
         recent_section_failure_tiers: List[str],
+        embedding_model: Optional["EmbeddingModel"] = None,
+        validator_history: Optional[Dict[str, ValidationReport]] = None,
     ) -> DiagnosisResult:
         """
-        对单次验证失败执行 MRSD 诊断
-
-        功能：
-            完整执行五步 BCP 流程，返回 DiagnosisResult。
+        对单次验证失败执行 MRCA 诊断
 
         参数：
-            report: OnlineValidator 产出的验证报告
-            current_section_id: 当前失败节 ID
-            section_queue: 全局节顺序列表
-            contamination_risk_score: MetaState.contamination_risk_score（[0,1]）
-            consecutive_failures_this_section: 当前节在同一 SectionIntent 下的连续失败次数
-            low_trust_dsl_ref_ratio: 当前节引用的低信任 DSL 条目比例
-            last_purge_succeeded: 上次 memory_purge 是否有效缓解了失败
-            intent_from_trusted_dsl: 当前 Section Intent 是否从高信任 DSL 生成（trust > 0.6）
-            recent_section_failure_tiers: 最近节的历史失败层级列表（用于 plan_level 判断）
+            report:                           OnlineValidator 产出的验证报告
+            current_section_id:               当前失败节 ID
+            section_queue:                    全局节顺序列表
+            contamination_risk_score:         MetaState.contamination_risk_score
+            consecutive_failures_this_section: 同一 Section Intent 下的连续失败次数
+            low_trust_dsl_ref_ratio:          低信任 DSL 引用比例
+            last_purge_succeeded:             上次 memory_purge 是否有效
+            intent_from_trusted_dsl:          Section Intent 是否从高信任 DSL 生成
+            recent_section_failure_tiers:     最近节的历史失败层级列表
+            embedding_model:                  可选，覆盖构造时传入的 embedding_model
+            validator_history:                历史节验证报告字典 {section_id: report}
 
-        返回值：
+        返回：
             DiagnosisResult：包含两轴分类、修复范围、置信度和解码配置
         """
-        # 第一步：识别失败维度
-        failed_dims = self._identify_failed_dimensions(report)
+        embed = embedding_model or self._embed
+        if validator_history is None:
+            validator_history = {}
 
-        # 步骤0：约束类型前置过滤
-        if self._is_soft_only_failure(report):
+        # 取第一个 blocking failure（最严重）
+        first_failure: Optional[Union[PresenceViolation, AbsenceViolation]] = None
+        for f in report.failures:
+            first_failure = f
+            break
+
+        if first_failure is None:
+            # 无 blocking failures（MetaState 门控后 passed=True）
             return self._make_result(
-                tier=ErrorTier.REALIZATION,
-                source=ErrorSource.INTRINSIC,
-                repair_scope="local_rewrite",
-                target_section=None,
-                causal_subgraph=[],
-                confidence=0.9,
-                evidence=["仅 SOFT 约束违反，不触发 MRSD"],
-                failed_dims=failed_dims,
+                repair_decision=RepairDecision(
+                    error_class="CURRENT_LOCAL",
+                    responsible_node=None,
+                    repair_scope={current_section_id},
+                    debug={"reason": "no_blocking_failure"},
+                ),
+                report=report,
+                current_section_id=current_section_id,
+                section_queue=section_queue,
             )
 
-        # 步骤1：Realization 软短路（低 Coverage 且低污染风险）
-        if self._should_realization_short_circuit(report, contamination_risk_score):
-            return self._make_result(
-                tier=ErrorTier.REALIZATION,
-                source=ErrorSource.INTRINSIC,
-                repair_scope="local_rewrite",
-                target_section=None,
-                causal_subgraph=[],
-                confidence=0.85,
-                evidence=[
-                    f"DCAS Coverage 低（score={report.dcas_score:.2f}）",
-                    f"CRS={contamination_risk_score:.2f} < 0.3，上游污染风险低",
-                ],
-                failed_dims=failed_dims,
+        # 路径分流
+        if isinstance(first_failure, PresenceViolation):
+            repair_decision = self._presence_attribution(
+                failure=first_failure,
+                sf_section=current_section_id,
+                section_queue=section_queue,
+                embed=embed,
+                validator_history=validator_history,
+                contamination_risk_score=contamination_risk_score,
             )
-
-        # 步骤2：结构因果路径检测（无 LLM 调用）
-        structural_candidates = self._detect_structural_responsibility(
-            current_section_id, section_queue
-        )
-
-        # 步骤3：反向语义扫描（K=3 次 LLM 预算）
-        causal_nodes, evidence, node_confidences = self._backward_semantic_scan(
-            report=report,
-            current_section_id=current_section_id,
-            section_queue=section_queue,
-            structural_priority_ids=structural_candidates,
-        )
-
-        # 步骤4：来源判定
-        error_source = self._determine_source(
-            causal_nodes=causal_nodes,
-            current_section_id=current_section_id,
-            section_queue=section_queue,
-            report=report,
-        )
-
-        # 步骤5：层级判定
-        error_tier = self._determine_tier(
-            causal_nodes=causal_nodes,
-            report=report,
-            consecutive_failures=consecutive_failures_this_section,
-            failed_dims=failed_dims,
-            low_trust_dsl_ref_ratio=low_trust_dsl_ref_ratio,
-            last_purge_succeeded=last_purge_succeeded,
-            intent_from_trusted_dsl=intent_from_trusted_dsl,
-            recent_section_failure_tiers=recent_section_failure_tiers,
-            contamination_risk_score=contamination_risk_score,
-        )
-
-        # 确定修复范围
-        repair_scope, target_section = self._determine_repair_scope(
-            tier=error_tier,
-            source=error_source,
-            causal_nodes=causal_nodes,
-            current_section_id=current_section_id,
-            section_queue=section_queue,
-        )
-
-        # 计算子图整体置信度
-        confidence = self._compute_subgraph_confidence(
-            causal_nodes=causal_nodes,
-            node_confidences=node_confidences,
-            failed_dims=failed_dims,
-            structural_ids=structural_candidates,
-        )
+        else:
+            repair_decision = self._absence_attribution(
+                failure=first_failure,
+                sf_section=current_section_id,
+                section_queue=section_queue,
+                embed=embed,
+                validator_history=validator_history,
+            )
 
         return self._make_result(
-            tier=error_tier,
-            source=error_source,
-            repair_scope=repair_scope,
-            target_section=target_section,
-            causal_subgraph=causal_nodes,
-            confidence=confidence,
-            evidence=evidence,
-            failed_dims=failed_dims,
-        )
-
-    # ------------------------------------------------------------------
-    # 第一阶段：失败维度识别
-    # ------------------------------------------------------------------
-
-    def _identify_failed_dimensions(self, report: ValidationReport) -> Set[str]:
-        """
-        从验证报告中识别失败维度
-
-        功能：
-            将验证报告映射到四类固定失败维度，用于 explanation_coverage 计算。
-
-        参数：
-            report: 验证报告
-
-        返回值：
-            Set[str]：失败维度集合（dim_coverage / dim_consistency / dim_constraint / dim_discourse）
-        """
-        dims: Set[str] = set()
-        if report.dcas_score < 0.5:
-            dims.add("dim_coverage")
-
-        for issue in report.issues:
-            if issue.type == "alignment" and "consistency" in issue.description.lower():
-                dims.add("dim_consistency")
-            elif issue.type == "constraint":
-                dims.add("dim_constraint")
-            elif issue.type == "consistency":
-                dims.add("dim_discourse")
-
-        if not dims and not report.passed:
-            dims.add("dim_coverage")  # 兜底
-
-        return dims
-
-    # ------------------------------------------------------------------
-    # 步骤0：约束前置过滤
-    # ------------------------------------------------------------------
-
-    def _is_soft_only_failure(self, report: ValidationReport) -> bool:
-        """
-        判断是否仅为 SOFT 约束违反（不触发 MRSD）
-
-        参数：
-            report: 验证报告
-
-        返回值：
-            bool：True 表示仅有 MINOR 级别问题，无需 MRSD
-        """
-        if report.passed:
-            return False
-        critical_or_major = [
-            i for i in report.issues
-            if i.severity in ("critical", "major")
-        ]
-        return len(critical_or_major) == 0 and len(report.issues) > 0
-
-    # ------------------------------------------------------------------
-    # 步骤1：Realization 软短路
-    # ------------------------------------------------------------------
-
-    def _should_realization_short_circuit(
-        self,
-        report: ValidationReport,
-        contamination_risk_score: float,
-    ) -> bool:
-        """
-        判断是否触发 Realization 软短路
-
-        关键实现细节：
-            软短路条件：DCAS.coverage < 0.5 且 CRS < 0.3。
-            若 CRS >= 0.3，不短路，进入步骤2（上游污染嫌疑）。
-
-        参数：
-            report: 验证报告
-            contamination_risk_score: 上游污染风险分数
-
-        返回值：
-            bool：True 表示确定为 realization 错误，直接退出
-        """
-        low_coverage = report.dcas_score < 0.5
-        no_constraint_violation = "dim_constraint" not in self._identify_failed_dimensions(report)
-        low_crs = contamination_risk_score < 0.3
-        return low_coverage and no_constraint_violation and low_crs
-
-    # ------------------------------------------------------------------
-    # 步骤2：结构因果路径检测
-    # ------------------------------------------------------------------
-
-    def _detect_structural_responsibility(
-        self,
-        current_section_id: str,
-        section_queue: List[str],
-    ) -> Set[str]:
-        """
-        在 DTG 中检测历史决策节点的结构性责任
-
-        功能：
-            检查每个历史决策节点 D 是否在"当前失败节"到"依赖节"的路径上。
-            不需要 LLM 调用，使用 DTG 路径连通性判断。
-
-        参数：
-            current_section_id: 当前失败节 ID
-            section_queue: 全局节顺序列表
-
-        返回值：
-            Set[str]：具有结构性责任的决策 ID 集合（优先进入候选集）
-        """
-        structural_ids: Set[str] = set()
-
-        current_decision_id = self._dtg.section_to_decision.get(current_section_id)
-        if not current_decision_id:
-            return structural_ids
-
-        current_decision = self._dtg.decision_by_id.get(current_decision_id)
-        if not current_decision:
-            return structural_ids
-
-        # 获取当前决策的所有引用节
-        referenced_section_ids = {sid for sid, _ in current_decision.referenced_sections}
-
-        # 对每个历史决策节点检查路径连通性
-        for decision in self._dtg.decision_log:
-            if decision.decision_id == current_decision_id:
-                continue
-            # 若该历史决策生成的内容被当前决策引用，则具有结构性责任
-            if decision.target_section in referenced_section_ids:
-                structural_ids.add(decision.decision_id)
-
-        return structural_ids
-
-    # ------------------------------------------------------------------
-    # 步骤3：反向语义扫描
-    # ------------------------------------------------------------------
-
-    def _backward_semantic_scan(
-        self,
-        report: ValidationReport,
-        current_section_id: str,
-        section_queue: List[str],
-        structural_priority_ids: Set[str],
-    ) -> Tuple[List[str], List[str], Dict[str, float]]:
-        """
-        反向语义扫描候选决策节点，最多使用 K=3 次 LLM 调用
-
-        功能：
-            优先扫描具有结构性责任的节点，再扫描时序上最近的节点。
-            LLM 判断每个候选节点是否存在 explicit_conflict（置信度 0.8）
-            或 implicit_omission（置信度 0.5）。
-
-        参数：
-            report: 验证报告（提供失败描述）
-            current_section_id: 当前失败节 ID
-            section_queue: 全局节顺序列表
-            structural_priority_ids: 具有结构性责任的决策 ID 集合（优先扫描）
-
-        返回值：
-            Tuple[
-                List[str],       # 识别出的责任节点 ID 列表
-                List[str],       # 证据字符串列表
-                Dict[str, float] # 节点ID → 置信度映射
-            ]
-        """
-        failure_description = self._build_failure_description(report)
-        causal_nodes: List[str] = []
-        evidence: List[str] = []
-        node_confidences: Dict[str, float] = {}
-        llm_calls_used = 0
-
-        # 构建候选列表：结构性责任节点优先，然后按时间序倒序
-        candidates = self._build_candidate_order(
+            repair_decision=repair_decision,
+            report=report,
             current_section_id=current_section_id,
             section_queue=section_queue,
-            structural_priority_ids=structural_priority_ids,
         )
 
-        for decision in candidates:
-            if llm_calls_used >= self._max_llm_budget:
+    # ------------------------------------------------------------------
+    # 路径 A：PresenceViolation → 五层 MRCA
+    # ------------------------------------------------------------------
+
+    def _presence_attribution(
+        self,
+        failure: PresenceViolation,
+        sf_section: str,
+        section_queue: List[str],
+        embed: Optional["EmbeddingModel"],
+        validator_history: Dict[str, ValidationReport],
+        contamination_risk_score: float,
+    ) -> RepairDecision:
+        """路径 A：基于五层 MRCA 计算责任分数"""
+        tau = failure.τ
+        H = failure.violating_chunks    # 验证器截取的违规内容窗口
+
+        # 第一步：构建归因子图 GF = Anc(sf) ∪ {sf}
+        subgraph = self._build_attribution_subgraph(sf_section)
+        gf_nodes = subgraph["nodes"]    # List[str]：node_id 列表
+        gf_edges = subgraph["edges"]    # List[Dict]：边列表
+
+        if not gf_nodes or not H or embed is None:
+            return RepairDecision(
+                error_class="CURRENT_LOCAL",
+                responsible_node=None,
+                repair_scope={sf_section},
+                debug={"reason": "empty_subgraph_or_no_embed"},
+            )
+
+        # ── Layer 1：语义存在概率 p_h(v) ─────────────────────────────────
+        # 对每个节点，计算每个 claim h 存在于该节点内容的校准概率
+        node_contents = self._get_node_contents(gf_nodes)
+        # shape: {node_id: np.ndarray(H,)}
+        p_h_v = self._compute_all_p_h(H, gf_nodes, node_contents, embed)
+
+        # ── Layer 2：语义新引入量 α_F(v) ─────────────────────────────────
+        edge_weights = self._compute_edge_weights_map(gf_edges)
+        alpha_v = self._compute_alpha_F(gf_nodes, p_h_v, gf_edges, edge_weights)
+
+        # ── Layer 3：拓扑传播可达性 ρ(v→sf) ──────────────────────────────
+        sf_node_id = f"content:{sf_section}"
+        rho_v = self._compute_reachability(sf_node_id, gf_nodes, gf_edges, edge_weights)
+
+        # ── Layer 4：节点类型先验 λ(v, τ) ────────────────────────────────
+        lambda_v = self._compute_node_type_prior(gf_nodes, tau)
+
+        # ── Layer 5：责任聚合 + 归一化 ────────────────────────────────────
+        resp_raw = {
+            v: alpha_v.get(v, 0.0) * rho_v.get(v, 0.0) * lambda_v.get(v, 1.0)
+            for v in gf_nodes
+        }
+        total = sum(resp_raw.values()) + _EPSILON
+        resp_norm = {v: r / total for v, r in resp_raw.items()}
+
+        # Step 6：本节 vs 历史节责任分流
+        sf_node_ids = {n for n in gf_nodes if sf_section in n}
+        R_cur = sum(resp_norm.get(v, 0.0) for v in sf_node_ids)
+        R_hist = sum(resp_norm.get(v, 0.0) for v in gf_nodes if v not in sf_node_ids)
+
+        if R_cur >= ETA * R_hist:
+            return RepairDecision(
+                error_class="CURRENT_LOCAL",
+                responsible_node=max(sf_node_ids, key=lambda v: resp_norm.get(v, 0), default=None),
+                repair_scope={sf_section},
+                debug={"R_cur": R_cur, "R_hist": R_hist, "resp_norm": resp_norm},
+            )
+
+        # Step 7：定位历史责任节
+        hist_nodes = {v: resp_norm[v] for v in gf_nodes if v not in sf_node_ids}
+        r_node = max(hist_nodes, key=lambda v: hist_nodes[v])
+        r_section = self._node_to_section(r_node)
+
+        # Step 8：传染性判断
+        return self._contagion_decision(
+            r_section=r_section,
+            sf_section=sf_section,
+            H=H,
+            embed=embed,
+            section_queue=section_queue,
+            validator_history=validator_history,
+            r_node=r_node,
+            resp_norm=resp_norm,
+        )
+
+    # ------------------------------------------------------------------
+    # 路径 B：AbsenceViolation → 规划层审计
+    # ------------------------------------------------------------------
+
+    def _absence_attribution(
+        self,
+        failure: AbsenceViolation,
+        sf_section: str,
+        section_queue: List[str],
+        embed: Optional["EmbeddingModel"],
+        validator_history: Dict[str, ValidationReport],
+    ) -> RepairDecision:
+        """
+        路径 B：规划层审计三种子情况
+
+        子情况 A：当前节 intent.coverage_requirements 包含 obligation，但执行未覆盖
+                 → CURRENT_LOCAL
+        子情况 B：历史节 r 的 intent 分配了此 obligation，但未执行
+                 → 传染判断
+        子情况 C：全局计划从未分配此 obligation
+                 → CURRENT_LOCAL（规划层遗漏）
+        """
+        obligation = failure.obligation
+        sf_intent = self._get_intent(sf_section)
+
+        # 子情况 A：当前节规划了但未执行
+        if sf_intent and obligation.lower() in " ".join(
+            sf_intent.get("coverage_requirements", [])
+        ).lower():
+            return RepairDecision(
+                error_class="CURRENT_LOCAL",
+                responsible_node=f"intent:{sf_section}",
+                repair_scope={sf_section},
+                instruction=f"Must cover the topic: {obligation}",
+                debug={"case": "A", "obligation": obligation},
+            )
+
+        # 子情况 B：在历史节中找承担此 obligation 的节
+        r_section = None
+        for sec_id in reversed(section_queue):
+            if sec_id == sf_section:
+                continue
+            intent = self._get_intent(sec_id)
+            if not intent:
+                continue
+            if obligation.lower() in " ".join(
+                intent.get("coverage_requirements", [])
+            ).lower():
+                r_section = sec_id
                 break
 
-            conflict_type, conf = self._llm_judge_conflict(decision, failure_description)
-            llm_calls_used += 1
+        if r_section is not None:
+            # 历史节有义务但执行遗漏 → 传染判断
+            H_obligation = [obligation]
+            return self._contagion_decision(
+                r_section=r_section,
+                sf_section=sf_section,
+                H=H_obligation,
+                embed=embed,
+                section_queue=section_queue,
+                validator_history=validator_history,
+                r_node=f"intent:{r_section}",
+                resp_norm={},
+            )
 
-            if conflict_type == "explicit_conflict":
-                causal_nodes.append(decision.decision_id)
-                node_confidences[decision.decision_id] = conf
-                evidence.append(
-                    f"明确冲突 [{decision.decision_id}] "
-                    f"节 {decision.target_section}：{decision.decision[:60]}"
-                )
-                break  # explicit_conflict 即停止
-            elif conflict_type == "implicit_omission":
-                causal_nodes.append(decision.decision_id)
-                node_confidences[decision.decision_id] = conf
-                evidence.append(
-                    f"隐式遗漏 [{decision.decision_id}] "
-                    f"节 {decision.target_section}：{decision.decision[:60]}"
-                )
-                # 继续扫描（implicit 不停止）
-            # no_conflict 跳过
-
-        return causal_nodes, evidence, node_confidences
-
-    def _build_candidate_order(
-        self,
-        current_section_id: str,
-        section_queue: List[str],
-        structural_priority_ids: Set[str],
-    ) -> List[Decision]:
-        """
-        构建反向扫描候选决策节点列表（结构性优先，然后时序倒序）
-
-        参数：
-            current_section_id: 当前节 ID
-            section_queue: 全局节顺序列表
-            structural_priority_ids: 优先候选集
-
-        返回值：
-            List[Decision]：有序候选决策列表（不含当前节自身决策）
-        """
-        current_decision_id = self._dtg.section_to_decision.get(current_section_id)
-        structural: List[Decision] = []
-        temporal: List[Decision] = []
-
-        for decision in reversed(self._dtg.decision_log):
-            if decision.decision_id == current_decision_id:
-                continue
-            if decision.decision_id in structural_priority_ids:
-                structural.append(decision)
-            else:
-                temporal.append(decision)
-
-        return structural + temporal
-
-    def _llm_judge_conflict(
-        self,
-        decision: Decision,
-        failure_description: str,
-    ) -> Tuple[str, float]:
-        """
-        调用 LLM 判断决策节点与失败描述之间的语义冲突类型
-
-        参数：
-            decision: 待判断的决策节点
-            failure_description: 当前失败的描述文本
-
-        返回值：
-            Tuple[str, float]：(conflict_type, confidence)
-                conflict_type: "explicit_conflict" | "implicit_omission" | "no_conflict"
-                confidence: 置信度 [0.0, 1.0]
-        """
-        prompt = (
-            "判断以下决策是否是当前验证失败的责任来源。只输出 JSON，不要解释。\n\n"
-            f"决策内容：\"{decision.decision}\"\n"
-            f"决策推理：\"{decision.reasoning}\"\n"
-            f"预期效果：\"{decision.expected_effect}\"\n\n"
-            f"当前验证失败描述：\"{failure_description}\"\n\n"
-            "输出格式：\n"
-            '{"conflict_type": "explicit_conflict"|"implicit_omission"|"no_conflict", "confidence": 0.0~1.0}\n\n'
-            "说明：\n"
-            "  explicit_conflict：决策内容与失败描述存在直接矛盾\n"
-            "  implicit_omission：决策遗漏了本应包含的内容，间接导致失败\n"
-            "  no_conflict：与当前失败无关"
+        # 子情况 C：规划层根本遗漏 → CURRENT_LOCAL（不回退，当前节补入）
+        return RepairDecision(
+            error_class="CURRENT_LOCAL",
+            responsible_node=None,
+            repair_scope={sf_section},
+            instruction=f"Global plan never assigned this topic; include it here: {obligation}",
+            debug={"case": "C", "obligation": obligation},
         )
 
-        try:
-            raw = self._llm.generate(
-                prompt,
-                temperature=0.0,
-                max_tokens=32768,
-                log_meta={
-                    "component": "MRSD",
-                    "section_id": decision.target_section,
+    # ------------------------------------------------------------------
+    # Step 8：传染性判断（路径 A/B 共享）
+    # ------------------------------------------------------------------
+
+    def _contagion_decision(
+        self,
+        r_section: str,
+        sf_section: str,
+        H: List[str],
+        embed: Optional["EmbeddingModel"],
+        section_queue: List[str],
+        validator_history: Dict[str, ValidationReport],
+        r_node: str,
+        resp_norm: Dict[str, float],
+    ) -> RepairDecision:
+        """
+        传染性判断：判断历史节 r 的错误是否已沿中间节传播
+
+        三维信号：P_j(r)、D_j(r)、S_j(r) → U_j(r) → C(r)
+        """
+        k_idx = section_queue.index(r_section) if r_section in section_queue else -1
+        t_idx = section_queue.index(sf_section) if sf_section in section_queue else len(section_queue)
+
+        if k_idx < 0 or t_idx - k_idx - 1 <= 0:
+            # 无中间节，直接返回 HISTORICAL_ISOLATED
+            return RepairDecision(
+                error_class="HISTORICAL_ISOLATED",
+                responsible_node=r_node,
+                repair_scope={r_section, sf_section},
+                debug={"r_section": r_section, "middle_sections": 0},
+            )
+
+        middle_sections = section_queue[k_idx + 1: t_idx]
+        infected_count = 0
+        contagion_details: Dict[str, float] = {}
+
+        # 构建子图用于可达性计算
+        subgraph = self._build_attribution_subgraph(sf_section)
+        edge_weights = self._compute_edge_weights_map(subgraph["edges"])
+
+        for j_section in middle_sections:
+            # P_j(r)：DTG 路径依赖强度（用 rho 近似）
+            rho_all = self._compute_reachability(
+                f"content:{j_section}",
+                subgraph["nodes"],
+                subgraph["edges"],
+                edge_weights,
+            )
+            P_j = rho_all.get(f"content:{r_section}", 0.0)
+
+            # D_j(r)：DSL 引用强度（Phase 3 前用 0，Phase 3 后从 used_by_sections 读取）
+            D_j = self._compute_dsl_injection_strength(r_section, j_section)
+
+            # S_j(r)：语义继承强度
+            S_j = 0.0
+            if embed is not None and H:
+                j_content = self._get_section_content(j_section)
+                if j_content:
+                    h_embeds = embed.embed(H)
+                    j_embed = embed.embed([j_content])[0]
+                    sims = h_embeds @ j_embed
+                    S_j = float(sims.max())
+
+            # U_j(r)：综合引用强度（三路 OR 近似）
+            U_j = 1.0 - (1.0 - P_j) * (1.0 - D_j) * (1.0 - S_j)
+
+            # Q_j：质量压力（连续化"勉强过线"信号）
+            Q_j = 0.0
+            j_report = validator_history.get(j_section)
+            if j_report is not None:
+                tau_safe = 0.75
+                tau_pass = TopicCoverageScorer.THRESHOLD_TCAS_MAJOR if hasattr(
+                    self, "_tcas_threshold"
+                ) else 0.55
+                Q_j = max(0.0, min(1.0, (tau_safe - j_report.score) / (tau_safe - tau_pass + _EPSILON)))
+
+            # C_j：传染分
+            C_j = (U_j + Q_j) / 2.0
+            contagion_details[j_section] = C_j
+
+            if C_j >= THETA_C:
+                infected_count += 1
+
+        is_contagious = infected_count >= M
+
+        if is_contagious:
+            return RepairDecision(
+                error_class="HISTORICAL_CONTAGIOUS",
+                responsible_node=r_node,
+                repair_scope=set(section_queue[k_idx:]),
+                debug={
+                    "r_section": r_section,
+                    "infected_count": infected_count,
+                    "contagion": contagion_details,
                 },
             )
-            return self._parse_conflict_json(raw)
-        except Exception:
-            return "no_conflict", 0.0
-
-    def _parse_conflict_json(self, raw: str) -> Tuple[str, float]:
-        """
-        解析 LLM 冲突判断输出
-
-        参数：
-            raw: LLM 原始输出
-
-        返回值：
-            Tuple[str, float]：(conflict_type, confidence)
-        """
-        import json as _json
-        import re
-
-        valid_types = {"explicit_conflict", "implicit_omission", "no_conflict"}
-
-        text = raw.strip()
-        try:
-            obj = _json.loads(text)
-            ct = obj.get("conflict_type", "no_conflict")
-            conf = float(obj.get("confidence", 0.0))
-            if ct in valid_types:
-                return ct, min(1.0, max(0.0, conf))
-        except Exception:
-            pass
-
-        # 正则降级
-        m1 = re.search(r'"conflict_type"\s*:\s*"(\w+)"', text)
-        m2 = re.search(r'"confidence"\s*:\s*([0-9.]+)', text)
-        if m1 and m2:
-            ct = m1.group(1)
-            if ct in valid_types:
-                return ct, min(1.0, float(m2.group(1)))
-
-        return "no_conflict", 0.0
-
-    # ------------------------------------------------------------------
-    # 步骤4：来源判定
-    # ------------------------------------------------------------------
-
-    def _determine_source(
-        self,
-        causal_nodes: List[str],
-        current_section_id: str,
-        section_queue: List[str],
-        report: ValidationReport,
-    ) -> ErrorSource:
-        """
-        判断错误来源（Intrinsic / Propagated / Ambiguous）
-
-        判断逻辑（无 LLM 调用）：
-            causal_nodes 中最远节与当前节的距离 > 1 → propagated
-            causal_nodes 仅含当前节决策 → intrinsic
-            causal_nodes 为空但一致性失败 → propagated（上游污染）
-            causal_nodes 为空 → ambiguous
-
-        参数：
-            causal_nodes: 责任子图节点 ID 列表
-            current_section_id: 当前节 ID
-            section_queue: 全局节顺序列表
-            report: 验证报告
-
-        返回值：
-            ErrorSource 枚举值
-        """
-        if not causal_nodes:
-            has_consistency_failure = any(
-                i.type in ("consistency", "alignment") for i in report.issues
-            )
-            if has_consistency_failure:
-                return ErrorSource.PROPAGATED
-            return ErrorSource.AMBIGUOUS
-
-        current_idx = section_queue.index(current_section_id) if current_section_id in section_queue else -1
-        current_decision_id = self._dtg.section_to_decision.get(current_section_id)
-
-        max_distance = 0
-        for decision_id in causal_nodes:
-            decision = self._dtg.decision_by_id.get(decision_id)
-            if not decision:
-                continue
-            if decision.target_section in section_queue:
-                node_idx = section_queue.index(decision.target_section)
-                distance = abs(current_idx - node_idx)
-                max_distance = max(max_distance, distance)
-
-        if max_distance > 1:
-            return ErrorSource.PROPAGATED
-        elif all(d == current_decision_id for d in causal_nodes):
-            return ErrorSource.INTRINSIC
         else:
-            return ErrorSource.INTRINSIC
+            return RepairDecision(
+                error_class="HISTORICAL_ISOLATED",
+                responsible_node=r_node,
+                repair_scope={r_section, sf_section},
+                debug={
+                    "r_section": r_section,
+                    "infected_count": infected_count,
+                    "contagion": contagion_details,
+                },
+            )
 
     # ------------------------------------------------------------------
-    # 步骤5：层级判定
+    # 五层 MRCA 工具方法
     # ------------------------------------------------------------------
 
-    def _determine_tier(
+    def _compute_all_p_h(
         self,
-        causal_nodes: List[str],
-        report: ValidationReport,
-        consecutive_failures: int,
-        failed_dims: Set[str],
-        low_trust_dsl_ref_ratio: float,
-        last_purge_succeeded: bool,
-        intent_from_trusted_dsl: bool,
-        recent_section_failure_tiers: List[str],
-        contamination_risk_score: float,
-    ) -> ErrorTier:
+        H: List[str],
+        gf_nodes: List[str],
+        node_contents: Dict[str, str],
+        embed: "EmbeddingModel",
+    ) -> Dict[str, np.ndarray]:
         """
-        判断错误层级（Plan / Decision / Realization / State）
+        Layer 1：对所有节点计算每个 claim h 的语义存在概率 p_h(v)
 
-        判断逻辑（按优先级）：
-            plan：满足全部四条操作性条件
-            state：decision 合理但引用低信任 DSL，或一致性失败但 decision 无内在冲突
-            decision：BCP 发现 explicit_conflict 或 implicit_omission
-            realization：兜底（Coverage 低，无上述特征）
+        p_h(v) = σ((max_cos - θ_h) / T_h)
+        θ_h = Pct60{cos(E(h), E(v)) | v ∈ GF}（per-claim 动态基准）
+        T_h = max_v cos - θ_h + ε（温度）
 
-        参数：
-            causal_nodes: 责任子图节点 ID 列表
-            report: 验证报告
-            consecutive_failures: 当前节在同一 Section Intent 下的连续失败次数
-            failed_dims: 失败维度集合
-            low_trust_dsl_ref_ratio: 低信任 DSL 引用比例
-            last_purge_succeeded: 上次 memory_purge 是否有效
-            intent_from_trusted_dsl: Section Intent 是否从高信任 DSL 生成
-            recent_section_failure_tiers: 最近节失败层级列表
-            contamination_risk_score: 上游污染风险分数
-
-        返回值：
-            ErrorTier 枚举值
+        返回：{node_id: ndarray(H,)} 每个节点的 H 维概率向量
         """
-        # plan_level 四条件检查
-        if self._check_plan_level_conditions(
-            consecutive_failures=consecutive_failures,
-            failed_dims=failed_dims,
-            last_purge_succeeded=last_purge_succeeded,
-            intent_from_trusted_dsl=intent_from_trusted_dsl,
-        ):
-            return ErrorTier.PLAN
+        if not H or not gf_nodes:
+            return {v: np.zeros(len(H)) for v in gf_nodes}
 
-        # state_level：decision 合理但 DSL 污染，或一致性失败但 decision 无内在冲突
-        has_consistency_fail = any(i.type in ("consistency",) for i in report.issues)
-        high_dsl_contamination = low_trust_dsl_ref_ratio > 0.4
-
-        if (has_consistency_fail and not causal_nodes) or high_dsl_contamination:
-            return ErrorTier.STATE
-
-        # decision_level：BCP 发现了责任节点
-        if causal_nodes:
-            return ErrorTier.DECISION
-
-        # realization：兜底
-        return ErrorTier.REALIZATION
-
-    def _check_plan_level_conditions(
-        self,
-        consecutive_failures: int,
-        failed_dims: Set[str],
-        last_purge_succeeded: bool,
-        intent_from_trusted_dsl: bool,
-    ) -> bool:
-        """
-        检查 plan_level 错误的四条操作性条件（须全部满足）
-
-        条件：
-            ① 同一 Section Intent 下连续两次低温保守重写仍失败
-            ② 失败维度集中在 dim_coverage 和 dim_constraint（目标冲突）
-            ③ memory_purge 和 local DSL 修复均不能缓解
-            ④ Section Intent 本身从可信 DSL 状态生成（排除 state_level 污染伪装）
-
-        参数：
-            consecutive_failures: 当前节连续失败次数
-            failed_dims: 失败维度集合
-            last_purge_succeeded: 上次 purge 是否有效缓解
-            intent_from_trusted_dsl: Section Intent 是否从高信任 DSL 生成
-
-        返回值：
-            bool：全部四条满足时返回 True
-        """
-        cond1 = consecutive_failures >= self._PLAN_TRIGGER_CONSECUTIVE_FAILURES
-        cond2 = (
-            "dim_coverage" in failed_dims
-            and "dim_constraint" in failed_dims
-            and len(failed_dims) <= 2
-        )
-        cond3 = not last_purge_succeeded
-        cond4 = intent_from_trusted_dsl
-
-        return cond1 and cond2 and cond3 and cond4
-
-    # ------------------------------------------------------------------
-    # 修复范围确定
-    # ------------------------------------------------------------------
-
-    def _determine_repair_scope(
-        self,
-        tier: ErrorTier,
-        source: ErrorSource,
-        causal_nodes: List[str],
-        current_section_id: str,
-        section_queue: List[str],
-    ) -> Tuple[str, Optional[str]]:
-        """
-        根据层级和来源确定修复范围及目标节
-
-        修复范围映射：
-            realization, intrinsic → local_rewrite
-            decision, intrinsic    → local_rewrite
-            decision, propagated   → partial_rollback（回退到责任节）
-            state                  → memory_purge
-            plan                   → local_rewrite（先 revise intent）
-            any, ambiguous         → local_rewrite（保守处理）
-
-        参数：
-            tier: 错误层级
-            source: 错误来源
-            causal_nodes: 责任节点 ID 列表
-            current_section_id: 当前节 ID
-            section_queue: 全局节顺序列表
-
-        返回值：
-            Tuple[str, Optional[str]]：(repair_scope, target_section)
-        """
-        if source == ErrorSource.AMBIGUOUS:
-            return "local_rewrite", None
-
-        if tier == ErrorTier.STATE:
-            return "memory_purge", None
-
-        if tier == ErrorTier.REALIZATION:
-            return "local_rewrite", None
-
-        if tier == ErrorTier.PLAN:
-            return "local_rewrite", None  # plan 层由 trigger_section_intent_revision 处理
-
-        if tier == ErrorTier.DECISION:
-            if source == ErrorSource.PROPAGATED and causal_nodes:
-                target = self._find_rollback_target(causal_nodes, section_queue)
-                if target:
-                    return "partial_rollback", target
-            return "local_rewrite", None
-
-        return "local_rewrite", None
-
-    def _find_rollback_target(
-        self,
-        causal_nodes: List[str],
-        section_queue: List[str],
-    ) -> Optional[str]:
-        """
-        找到最近的责任节作为回退目标
-
-        功能：
-            在责任节点中找到 section_queue 中最早（最前）的节，
-            回退到该节之前的一节（保留其前驱）。
-
-        参数：
-            causal_nodes: 责任节点 ID 列表
-            section_queue: 全局节顺序列表
-
-        返回值：
-            Optional[str]：回退目标节 ID（回退后保留的最后一节），或 None
-        """
-        min_idx = len(section_queue)
-        for decision_id in causal_nodes:
-            decision = self._dtg.decision_by_id.get(decision_id)
-            if not decision:
+        # 批量编码所有节点内容的窗口（共享计算）
+        node_window_embeds: Dict[str, Optional[np.ndarray]] = {}
+        for node_id in gf_nodes:
+            content = node_contents.get(node_id, "")
+            if not content:
+                node_window_embeds[node_id] = None
                 continue
-            if decision.target_section in section_queue:
-                idx = section_queue.index(decision.target_section)
-                min_idx = min(min_idx, idx)
+            windows = self._get_windows(content)
+            if windows:
+                node_window_embeds[node_id] = embed.embed(windows)  # (W, D)
+            else:
+                node_window_embeds[node_id] = None
 
-        if min_idx == 0:
-            return None  # 无法回退到第 0 节之前
-        if min_idx < len(section_queue):
-            return section_queue[min_idx - 1]  # 回退到责任节之前一节
-        return None
+        h_embeds = embed.embed(H)  # (|H|, D)
+        result: Dict[str, np.ndarray] = {}
 
-    # ------------------------------------------------------------------
-    # 置信度计算
-    # ------------------------------------------------------------------
+        for h_idx, h_embed in enumerate(h_embeds):
+            # 计算所有节点的 max_cos
+            max_cos_per_node: Dict[str, float] = {}
+            for node_id in gf_nodes:
+                w_embeds = node_window_embeds.get(node_id)
+                if w_embeds is None:
+                    max_cos_per_node[node_id] = 0.0
+                else:
+                    sims = w_embeds @ h_embed
+                    max_cos_per_node[node_id] = float(sims.max())
 
-    def _compute_subgraph_confidence(
+            max_cos_values = list(max_cos_per_node.values())
+            theta_h = float(np.percentile(max_cos_values, 60)) if max_cos_values else 0.0
+            global_max = max(max_cos_values) if max_cos_values else 0.0
+            T_h = global_max - theta_h + _EPSILON
+
+            for node_id in gf_nodes:
+                mc = max_cos_per_node[node_id]
+                p = 1.0 / (1.0 + math.exp(-(mc - theta_h) / T_h))
+                if node_id not in result:
+                    result[node_id] = np.zeros(len(H))
+                result[node_id][h_idx] = p
+
+        return result
+
+    def _compute_alpha_F(
         self,
-        causal_nodes: List[str],
-        node_confidences: Dict[str, float],
-        failed_dims: Set[str],
-        structural_ids: Set[str],
+        gf_nodes: List[str],
+        p_h_v: Dict[str, np.ndarray],
+        gf_edges: List[Dict],
+        edge_weights: Dict[Tuple[str, str], float],
+    ) -> Dict[str, float]:
+        """
+        Layer 2：语义新引入量 α_F(v) = max_h α_h(v)
+
+        α_h(v) = max(0, p_h(v) - p̂_h(v))
+        p̂_h(v) = 1 - ∏_(u∈Pa(v)) (1 - w_uv * p_h(u))   NB 近似
+
+        返回：{node_id: float} 每个节点的最大跨 claim 新引入量
+        """
+        parent_map: Dict[str, List[str]] = {v: [] for v in gf_nodes}
+        for edge in gf_edges:
+            src = edge.get("source", "")
+            tgt = edge.get("target", "")
+            if src in parent_map and tgt in parent_map:
+                parent_map[tgt].append(src)
+
+        alpha_F: Dict[str, float] = {}
+        H_len = len(next(iter(p_h_v.values()))) if p_h_v else 0
+
+        for node_id in gf_nodes:
+            p_h = p_h_v.get(node_id, np.zeros(H_len))
+            parents = parent_map.get(node_id, [])
+
+            if not parents:
+                # 根节点：无父节点，α = p_h（全部为新引入）
+                alpha_F[node_id] = float(p_h.max()) if len(p_h) > 0 else 0.0
+                continue
+
+            # NB 近似：p̂_h(v) = 1 - ∏ (1 - w * p_h(u))
+            p_hat = np.zeros(H_len)
+            for h_idx in range(H_len):
+                prod = 1.0
+                for parent_id in parents:
+                    w = edge_weights.get((parent_id, node_id), 0.5)
+                    p_parent = p_h_v.get(parent_id, np.zeros(H_len))[h_idx]
+                    prod *= (1.0 - w * p_parent)
+                p_hat[h_idx] = 1.0 - prod
+
+            alpha_h = np.maximum(0.0, p_h - p_hat)
+            alpha_F[node_id] = float(alpha_h.max()) if len(alpha_h) > 0 else 0.0
+
+        return alpha_F
+
+    def _compute_reachability(
+        self,
+        sf_id: str,
+        gf_nodes: List[str],
+        gf_edges: List[Dict],
+        edge_weights: Dict[Tuple[str, str], float],
+    ) -> Dict[str, float]:
+        """
+        Layer 3：反向 DP 计算拓扑传播可达性 ρ(v→sf)
+
+        ρ(sf) = 1
+        ρ(v) = 1 - ∏_(v,u)∈E (1 - w_vu * ρ(u))，逆拓扑顺序
+        O(|V|+|E|)，无需迭代
+
+        返回：{node_id: float}
+        """
+        # 构建出边表
+        out_edges: Dict[str, List[Tuple[str, float]]] = {v: [] for v in gf_nodes}
+        for edge in gf_edges:
+            src = edge.get("source", "")
+            tgt = edge.get("target", "")
+            if src in out_edges and tgt in out_edges:
+                w = edge_weights.get((src, tgt), 0.5)
+                out_edges[src].append((tgt, w))
+
+        # 拓扑排序（Kahn's algorithm）
+        in_degree: Dict[str, int] = {v: 0 for v in gf_nodes}
+        for edge in gf_edges:
+            src = edge.get("source", "")
+            tgt = edge.get("target", "")
+            if tgt in in_degree:
+                in_degree[tgt] += 1
+
+        from collections import deque
+        queue: deque = deque([v for v in gf_nodes if in_degree[v] == 0])
+        topo_order: List[str] = []
+        in_deg_copy = dict(in_degree)
+        while queue:
+            node = queue.popleft()
+            topo_order.append(node)
+            for tgt, _ in out_edges.get(node, []):
+                in_deg_copy[tgt] -= 1
+                if in_deg_copy[tgt] == 0:
+                    queue.append(tgt)
+
+        # 反向 DP（逆拓扑顺序）
+        rho: Dict[str, float] = {v: 0.0 for v in gf_nodes}
+        rho[sf_id] = 1.0 if sf_id in rho else 0.0
+
+        for node_id in reversed(topo_order):
+            if rho.get(node_id, 0.0) == 1.0:
+                continue
+            prod = 1.0
+            for tgt, w in out_edges.get(node_id, []):
+                prod *= (1.0 - w * rho.get(tgt, 0.0))
+            rho[node_id] = 1.0 - prod
+
+        return rho
+
+    def _compute_node_type_prior(
+        self,
+        gf_nodes: List[str],
+        tau: str,
+    ) -> Dict[str, float]:
+        """
+        Layer 4：节点类型先验 λ(v, τ)
+
+        按节点 ID 前缀推断节点类型，再查 NODE_TYPE_PRIOR 表。
+        """
+        result: Dict[str, float] = {}
+        for node_id in gf_nodes:
+            if node_id.startswith("intent:"):
+                ntype = "intent"
+            elif node_id.startswith("repair:"):
+                ntype = "repair"
+            elif node_id.startswith("dsl:"):
+                ntype = "dsl"
+            else:
+                ntype = "decision"
+            prior_table = NODE_TYPE_PRIOR.get(ntype, {})
+            result[node_id] = prior_table.get(tau, 1.0)
+        return result
+
+    def _compute_edge_weights_map(
+        self,
+        gf_edges: List[Dict],
+    ) -> Dict[Tuple[str, str], float]:
+        """按边类型查表填充权重"""
+        weights: Dict[Tuple[str, str], float] = {}
+        for edge in gf_edges:
+            src = edge.get("source", "")
+            tgt = edge.get("target", "")
+            etype = edge.get("type", "GENERATES")
+            w = EDGE_WEIGHTS.get(etype, 0.5)
+            weights[(src, tgt)] = w
+        return weights
+
+    # ------------------------------------------------------------------
+    # DTG 图查询工具
+    # ------------------------------------------------------------------
+
+    def _build_attribution_subgraph(self, sf_section: str) -> Dict:
+        """
+        构建以 sf_section 为汇点的归因子图 GF = Anc(sf) ∪ {sf}
+
+        返回：{"nodes": List[str], "edges": List[Dict]}
+        """
+        try:
+            exported = self._dtg.export_dtg()
+            all_edges = exported.get("edges", [])
+            all_nodes: Set[str] = set()
+
+            # 收集祖先节点（BFS 反向）
+            reachable: Set[str] = {f"content:{sf_section}"}
+            queue = [f"content:{sf_section}"]
+            while queue:
+                current = queue.pop()
+                for edge in all_edges:
+                    if edge.get("target") == current:
+                        src = edge.get("source", "")
+                        if src not in reachable:
+                            reachable.add(src)
+                            queue.append(src)
+
+            all_nodes = reachable
+
+            # 过滤只含子图内节点的边
+            subgraph_edges = [
+                e for e in all_edges
+                if e.get("source") in all_nodes and e.get("target") in all_nodes
+            ]
+            return {"nodes": list(all_nodes), "edges": subgraph_edges}
+        except Exception as e:
+            self.logger.warning("构建归因子图失败：%s", e)
+            return {"nodes": [], "edges": []}
+
+    def _get_node_contents(self, node_ids: List[str]) -> Dict[str, str]:
+        """从 DTGStore 获取各节点对应的文本内容"""
+        contents: Dict[str, str] = {}
+        for node_id in node_ids:
+            content = ""
+            if node_id.startswith("content:"):
+                section_id = node_id[len("content:"):]
+                decision = None
+                dec_id = self._dtg.section_to_decision.get(section_id)
+                if dec_id:
+                    decision = self._dtg.decision_by_id.get(dec_id)
+                if decision:
+                    content = decision.decision + " " + decision.reasoning
+            elif node_id.startswith("intent:"):
+                section_id = node_id[len("intent:"):]
+                intent = self._dtg.intent_by_section.get(section_id, {})
+                content = intent.get("content", "")
+            contents[node_id] = content
+        return contents
+
+    def _get_windows(self, text: str, size: int = 256, stride: int = 128) -> List[str]:
+        """按词数切分文本为滑动窗口"""
+        words = text.split()
+        if not words:
+            return []
+        windows = []
+        for start in range(0, len(words), stride):
+            window = words[start: start + size]
+            if window:
+                windows.append(" ".join(window))
+            if start + size >= len(words):
+                break
+        return windows
+
+    def _node_to_section(self, node_id: str) -> str:
+        """从节点 ID 提取 section_id"""
+        for prefix in ("content:", "intent:", "decision:", "repair:", "dsl:"):
+            if node_id.startswith(prefix):
+                return node_id[len(prefix):]
+        return node_id
+
+    def _get_intent(self, section_id: str) -> Optional[Dict]:
+        """获取某节的 intent_node 字典"""
+        return self._dtg.intent_by_section.get(section_id)
+
+    def _get_section_content(self, section_id: str) -> str:
+        """获取某节的决策文本内容"""
+        dec_id = self._dtg.section_to_decision.get(section_id)
+        if not dec_id:
+            return ""
+        decision = self._dtg.decision_by_id.get(dec_id)
+        if not decision:
+            return ""
+        return decision.decision + " " + decision.reasoning
+
+    def _compute_dsl_injection_strength(
+        self,
+        source_section: str,
+        target_section: str,
     ) -> float:
         """
-        计算责任子图的整体诊断置信度
+        D_j(r)：DSL 引用强度（Phase 3 前用 0 占位）
 
-        公式：
-            base = 节点置信度均值（无节点时 0.5）
-            结构性责任节点加成 +0.1
-            覆盖所有失败维度加成 +0.1（近似）
-
-        参数：
-            causal_nodes: 责任节点 ID 列表
-            node_confidences: 节点ID → 置信度映射
-            failed_dims: 失败维度集合
-            structural_ids: 具有结构性责任的节点 ID 集合
-
-        返回值：
-            float：整体置信度 [0.0, 1.0]
+        Phase 3 后通过 LedgerEntry.used_by_sections 和 source_node 字段精确计算。
         """
-        if not causal_nodes:
-            return 0.5
-
-        confidences = [node_confidences.get(nid, 0.5) for nid in causal_nodes]
-        base = sum(confidences) / len(confidences)
-
-        # 结构性责任加成
-        has_structural = bool(set(causal_nodes) & structural_ids)
-        structural_bonus = 0.1 if has_structural else 0.0
-
-        # 失败维度覆盖加成
-        coverage_bonus = 0.1 if len(failed_dims) <= len(causal_nodes) else 0.0
-
-        return min(1.0, base + structural_bonus + coverage_bonus)
+        return 0.0  # Phase 3 前：D_j 恒为 0，传染判断仍可通过 P_j + S_j 两维运作
 
     # ------------------------------------------------------------------
-    # 工具方法
+    # 桥接 RepairDecision → DiagnosisResult
     # ------------------------------------------------------------------
-
-    def _build_failure_description(self, report: ValidationReport) -> str:
-        """
-        将验证报告转换为用于 LLM 判断的失败描述文本
-
-        参数：
-            report: 验证报告
-
-        返回值：
-            str：失败描述字符串
-        """
-        parts = [f"DCAS 评分：{report.dcas_score:.2f}"]
-        for issue in report.issues:
-            if issue.severity in ("critical", "major"):
-                parts.append(f"[{issue.type}] {issue.description}")
-        for constraint in report.violated_constraints[:3]:
-            parts.append(f"违反约束：{constraint}")
-        return "；".join(parts)
 
     def _make_result(
         self,
-        tier: ErrorTier,
-        source: ErrorSource,
-        repair_scope: str,
-        target_section: Optional[str],
-        causal_subgraph: List[str],
-        confidence: float,
-        evidence: List[str],
-        failed_dims: Set[str],
+        repair_decision: RepairDecision,
+        report: ValidationReport,
+        current_section_id: str,
+        section_queue: List[str],
     ) -> DiagnosisResult:
         """
-        构建 DiagnosisResult，自动生成 DecodingConfig 和备选修复
+        将 RepairDecision 桥接为 DiagnosisResult（Orchestrator 消费格式）
 
-        参数：
-            tier: 错误层级
-            source: 错误来源
-            repair_scope: 修复范围
-            target_section: 回退目标节（可为 None）
-            causal_subgraph: 责任节点 ID 列表
-            confidence: 整体置信度
-            evidence: 证据列表
-            failed_dims: 失败维度集合
-
-        返回值：
-            DiagnosisResult 实例
+        按 error_class → tier/scope/source 静态映射，
+        同时结合 ValidationReport.failures[0].τ 更精确推断 tier。
         """
+        error_class = repair_decision.error_class
+        tier = _ERROR_CLASS_TO_TIER.get(error_class, ErrorTier.DECISION)
+
+        # 使用失败类型细化 tier
+        if report.failures:
+            tau = report.failures[0].τ
+            tier = _TAU_TO_TIER.get(tau, tier)
+
+        scope = _ERROR_CLASS_TO_SCOPE.get(error_class, "local_rewrite")
+        source = _ERROR_CLASS_TO_SOURCE.get(error_class, ErrorSource.INTRINSIC)
+
+        # 确定回退目标节
+        target_section = None
+        if scope == "partial_rollback" and repair_decision.repair_scope:
+            r_sec = self._node_to_section(
+                repair_decision.responsible_node or ""
+            )
+            if r_sec in section_queue:
+                r_idx = section_queue.index(r_sec)
+                target_section = section_queue[r_idx - 1] if r_idx > 0 else None
+
+        # causal_subgraph：责任节点列表
+        causal_subgraph = (
+            [repair_decision.responsible_node]
+            if repair_decision.responsible_node
+            else []
+        )
+
+        confidence = self._compute_confidence(repair_decision, report)
         decoding_config = DecodingConfig.for_tier(tier)
-        alternative_repairs = self._compute_alternatives(tier, source, repair_scope)
+        evidence = [
+            f"error_class={error_class}",
+            f"responsible_node={repair_decision.responsible_node}",
+        ]
+        if repair_decision.instruction:
+            evidence.append(f"instruction={repair_decision.instruction}")
 
         self.logger.info(
-            "MRSD 诊断完成：tier=%s source=%s scope=%s conf=%.2f nodes=%d",
-            tier.value,
-            source.value,
-            repair_scope,
-            confidence,
-            len(causal_subgraph),
+            "MRCA 诊断完成：class=%s tier=%s scope=%s conf=%.2f",
+            error_class, tier.value, scope, confidence,
         )
 
         return DiagnosisResult(
             error_tier=tier,
             error_source=source,
-            repair_scope=repair_scope,
+            repair_scope=scope,
             target_section=target_section,
             causal_subgraph=causal_subgraph,
             confidence=confidence,
@@ -869,27 +872,17 @@ class MRSD:
             evidence=evidence,
         )
 
-    def _compute_alternatives(
+    def _compute_confidence(
         self,
-        tier: ErrorTier,
-        source: ErrorSource,
-        primary_scope: str,
-    ) -> List[Tuple[str, float]]:
-        """
-        计算备选修复方案及其概率
-
-        参数：
-            tier: 错误层级
-            source: 错误来源
-            primary_scope: 主修复范围
-
-        返回值：
-            List[Tuple[str, float]]：[(scope, probability), ...]
-        """
-        alternatives: List[Tuple[str, float]] = []
-        all_scopes = ["local_rewrite", "partial_rollback", "memory_purge"]
-        for scope in all_scopes:
-            if scope != primary_scope:
-                prob = 0.15 if tier == ErrorTier.DECISION else 0.05
-                alternatives.append((scope, prob))
-        return alternatives
+        repair_decision: RepairDecision,
+        report: ValidationReport,
+    ) -> float:
+        """计算诊断置信度"""
+        base = 0.7 if repair_decision.error_class == "CURRENT_LOCAL" else 0.6
+        # 有明确责任节点加成
+        if repair_decision.responsible_node:
+            base += 0.1
+        # 多个 failure 时略降低置信度（可能存在多源问题）
+        if len(report.failures) > 2:
+            base -= 0.05
+        return round(min(1.0, max(0.0, base)), 3)

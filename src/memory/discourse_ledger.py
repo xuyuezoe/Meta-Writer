@@ -31,7 +31,7 @@ class DiscourseLedger:
 
     功能：
         1. 管理 LedgerEntry 对象的生命周期（写入、撤销、解析、更新稳定性）
-        2. 维护 EntryRelation 图，支持级联撤销、冲突传播、OPEN_LOOP 自动闭合
+        2. 维护 EntryRelation 图，支持级联撤销、冲突传播、UNRESOLVED_ISSUE 自动闭合
         3. 在 section 级别批量处理关系判断，避免逐 pair 同步阻塞
         4. 运行时计算每条可注入条目的 salience_score，返回前 K 条用于 prompt 注入
         5. 支持整节回退（rollback）和精确记忆清除（purge）
@@ -73,7 +73,7 @@ class DiscourseLedger:
         功能：
             1. 写入前检测与现有条目的 conflicts 关系
             2. 写入条目
-            3. 若类型为 COMMITMENT 或 OPEN_LOOP，对候选对执行预筛与入队
+            3. 若类型为 FORWARD_COMMITMENT 或 UNRESOLVED_ISSUE，对候选对执行预筛与入队
             4. 不在 add_entry() 中触发 LLM 关系判断
         """
         conflict_warnings: List[str] = []
@@ -89,7 +89,7 @@ class DiscourseLedger:
         self._relations.setdefault(entry.entry_id, [])
         self._relations_by_target.setdefault(entry.entry_id, [])
 
-        if entry.commitment_type in (CommitmentType.COMMITMENT, CommitmentType.OPEN_LOOP):
+        if entry.commitment_type in (CommitmentType.FORWARD_COMMITMENT, CommitmentType.UNRESOLVED_ISSUE):
             for eid, existing in self._entries.items():
                 if eid == entry.entry_id or not existing.is_active():
                     continue
@@ -174,11 +174,11 @@ class DiscourseLedger:
     # ------------------------------------------------------------------
 
     def _get_type_pair_bonus(self, a: LedgerEntry, b: LedgerEntry) -> float:
-        if a.commitment_type == CommitmentType.COMMITMENT and b.commitment_type == CommitmentType.OPEN_LOOP:
+        if a.commitment_type == CommitmentType.FORWARD_COMMITMENT and b.commitment_type == CommitmentType.UNRESOLVED_ISSUE:
             return 1.0
-        if a.commitment_type == CommitmentType.OPEN_LOOP and b.commitment_type == CommitmentType.COMMITMENT:
+        if a.commitment_type == CommitmentType.UNRESOLVED_ISSUE and b.commitment_type == CommitmentType.FORWARD_COMMITMENT:
             return 1.0
-        if a.commitment_type == CommitmentType.COMMITMENT and b.commitment_type == CommitmentType.COMMITMENT:
+        if a.commitment_type == CommitmentType.FORWARD_COMMITMENT and b.commitment_type == CommitmentType.FORWARD_COMMITMENT:
             return 0.5
         return 0.0
 
@@ -198,13 +198,13 @@ class DiscourseLedger:
             return a, b
 
         if (
-            entry_a.commitment_type == CommitmentType.COMMITMENT
-            and entry_b.commitment_type == CommitmentType.OPEN_LOOP
+            entry_a.commitment_type == CommitmentType.FORWARD_COMMITMENT
+            and entry_b.commitment_type == CommitmentType.UNRESOLVED_ISSUE
         ):
             return a, b
         if (
-            entry_a.commitment_type == CommitmentType.OPEN_LOOP
-            and entry_b.commitment_type == CommitmentType.COMMITMENT
+            entry_a.commitment_type == CommitmentType.UNRESOLVED_ISSUE
+            and entry_b.commitment_type == CommitmentType.FORWARD_COMMITMENT
         ):
             return b, a
         return a, b
@@ -249,8 +249,8 @@ class DiscourseLedger:
         keep = gate_score >= self.candidate_score_threshold
         if (
             keep
-            and new_entry.commitment_type == CommitmentType.COMMITMENT
-            and existing_entry.commitment_type == CommitmentType.COMMITMENT
+            and new_entry.commitment_type == CommitmentType.FORWARD_COMMITMENT
+            and existing_entry.commitment_type == CommitmentType.FORWARD_COMMITMENT
             and term_score < 1.0
         ):
             keep = False
@@ -271,8 +271,8 @@ class DiscourseLedger:
 
         priority = 0.0
         if (
-            source.commitment_type == CommitmentType.COMMITMENT
-            and target.commitment_type == CommitmentType.OPEN_LOOP
+            source.commitment_type == CommitmentType.FORWARD_COMMITMENT
+            and target.commitment_type == CommitmentType.UNRESOLVED_ISSUE
         ):
             priority += 2.0
 
@@ -374,7 +374,7 @@ class DiscourseLedger:
             if (
                 source is not None
                 and target is not None
-                and target.commitment_type == CommitmentType.OPEN_LOOP
+                and target.commitment_type == CommitmentType.UNRESOLVED_ISSUE
             ):
                 target.is_resolved = True
                 target.resolved_in = source.source_section
@@ -619,7 +619,7 @@ class DiscourseLedger:
         for eid, entry in self._entries.items():
             if (
                 entry.source_section == contaminated_section
-                and entry.commitment_type == CommitmentType.FACT
+                and entry.commitment_type == CommitmentType.ESTABLISHED_CLAIM
                 and entry.is_active()
             ):
                 entry_keywords = self._extract_keywords(entry.content)
@@ -645,10 +645,10 @@ class DiscourseLedger:
     ) -> List[LedgerEntry]:
         """获取用于 prompt 注入的账本条目（按 salience 排序取前 K 条）。"""
         injectable_types = {
-            CommitmentType.FACT,
-            CommitmentType.COMMITMENT,
-            CommitmentType.OPEN_LOOP,
-            CommitmentType.STYLE_POLICY,
+            CommitmentType.ESTABLISHED_CLAIM,
+            CommitmentType.FORWARD_COMMITMENT,
+            CommitmentType.UNRESOLVED_ISSUE,
+            CommitmentType.DISCOURSE_POLICY,
         }
         target_title = outline.get(target_section_id, "")
         target_keywords = self._extract_keywords(target_title)
@@ -674,7 +674,14 @@ class DiscourseLedger:
             scored.append((salience, entry))
 
         scored.sort(key=lambda x: x[0], reverse=True)
-        return [entry for _, entry in scored[: self.max_inject_entries]]
+        result = [entry for _, entry in scored[: self.max_inject_entries]]
+
+        # Phase 3：更新 used_by_sections（DSL 溯源传播记录）
+        for entry in result:
+            if target_section_id and target_section_id not in entry.used_by_sections:
+                entry.used_by_sections.append(target_section_id)
+
+        return result
 
     def _compute_salience(
         self,
@@ -691,7 +698,7 @@ class DiscourseLedger:
         else:
             relative_pos = 1.0
 
-        if entry.commitment_type == CommitmentType.OPEN_LOOP and not entry.is_resolved:
+        if entry.commitment_type == CommitmentType.UNRESOLVED_ISSUE and not entry.is_resolved:
             time_relevance = 1.0 + relative_pos * 2.0
         else:
             time_relevance = max(0.1, 1.0 - relative_pos * 0.5)
@@ -700,7 +707,7 @@ class DiscourseLedger:
         failure_history = 0.3 if entry.entry_id in failure_ids_set else 0.0
 
         commitment_urgency = 0.0
-        if entry.commitment_type == CommitmentType.COMMITMENT:
+        if entry.commitment_type == CommitmentType.FORWARD_COMMITMENT:
             remaining = total_sections - 1 - target_section_idx
             if remaining <= 2:
                 commitment_urgency = 1.0 - remaining * 0.4
@@ -737,7 +744,7 @@ class DiscourseLedger:
     def get_open_loops(self) -> List[LedgerEntry]:
         return [
             e for e in self._entries.values()
-            if e.commitment_type == CommitmentType.OPEN_LOOP
+            if e.commitment_type == CommitmentType.UNRESOLVED_ISSUE
             and not e.is_resolved
             and e.is_active()
         ]
@@ -746,6 +753,21 @@ class DiscourseLedger:
         return [
             eid for eid, entry in self._entries.items()
             if entry.is_active() and entry.trust_level < threshold
+        ]
+
+    def get_entries_by_source_node(self, source_node_id: str) -> List[LedgerEntry]:
+        """
+        按 DTG 节点 ID 查询由该节点产生的所有账本条目（Phase 3 DSL 溯源接口）。
+
+        参数：
+            source_node_id: DTG 节点 ID（decision_id 或 intent_node_id）
+
+        返回：
+            List[LedgerEntry]：source_node 字段匹配的条目列表
+        """
+        return [
+            entry for entry in self._entries.values()
+            if entry.source_node == source_node_id
         ]
 
     def to_dict(self) -> Dict:

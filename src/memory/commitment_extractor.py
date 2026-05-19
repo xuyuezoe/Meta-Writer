@@ -35,13 +35,19 @@ class CommitmentExtractor:
         对无法解析的输出进行降级处理（跳过该条目，不抛出异常）。
     """
 
-    # 合法枚举值映射（LLM 输出 → 枚举）
+    # 合法枚举值映射（LLM 输出 → 枚举，同时兼容旧值和新值）
     _COMMITMENT_TYPE_MAP = {
-        "fact":         CommitmentType.FACT,
-        "commitment":   CommitmentType.COMMITMENT,
-        "open_loop":    CommitmentType.OPEN_LOOP,
-        "hypothesis":   CommitmentType.HYPOTHESIS,
-        "style_policy": CommitmentType.STYLE_POLICY,
+        "established_claim":  CommitmentType.ESTABLISHED_CLAIM,
+        "forward_commitment": CommitmentType.FORWARD_COMMITMENT,
+        "unresolved_issue":   CommitmentType.UNRESOLVED_ISSUE,
+        "tentative_claim":    CommitmentType.TENTATIVE_CLAIM,
+        "discourse_policy":   CommitmentType.DISCOURSE_POLICY,
+        # 向后兼容旧值
+        "fact":         CommitmentType.ESTABLISHED_CLAIM,
+        "commitment":   CommitmentType.FORWARD_COMMITMENT,
+        "open_loop":    CommitmentType.UNRESOLVED_ISSUE,
+        "hypothesis":   CommitmentType.TENTATIVE_CLAIM,
+        "style_policy": CommitmentType.DISCOURSE_POLICY,
     }
 
     _CONSTRAINT_TYPE_MAP = {
@@ -111,27 +117,27 @@ class CommitmentExtractor:
             else ""
         )
         return (
-            "You are a narrative analysis assistant. Extract every discourse commitment object "
-            "from the text below and return a JSON array only.\n\n"
+            "You are an academic discourse analyst. Extract every discourse commitment object "
+            "from the scholarly text below and return a JSON array only.\n\n"
             "All content values must be in English.\n\n"
             f"{context_block}"
             f"Current section content:\n{section_content}\n\n"
             "Each commitment object must use this schema:\n"
             "{\n"
             '  "content": "a concise commitment summary",\n'
-            '  "commitment_type": "fact"|"commitment"|"open_loop"|"hypothesis"|"style_policy",\n'
+            '  "commitment_type": "established_claim"|"forward_commitment"|"unresolved_issue"|"tentative_claim"|"discourse_policy",\n'
             '  "constraint_type": "immutable"|"stateful"|"soft"\n'
             "}\n\n"
             "Type guide:\n"
-            "  fact         - an established fact that later sections should not contradict\n"
-            "  commitment   - a forward-looking commitment about what the text will do next\n"
-            "  open_loop    - an unresolved question, tension, or dangling thread\n"
-            "  hypothesis   - a speculation or inference that should stay tentative\n"
-            "  style_policy - a global style rule such as tone, viewpoint, or formatting\n\n"
+            "  established_claim  - a factual assertion or empirical finding that later sections must not contradict\n"
+            "  forward_commitment - an explicit promise about what the scholarly text will cover next\n"
+            "  unresolved_issue   - an open research question, evidence gap, or ongoing debate\n"
+            "  tentative_claim    - a speculative interpretation or inference that must remain hedged\n"
+            "  discourse_policy   - a global writing convention such as citation style, tense, or scope\n\n"
             "Constraint strength guide:\n"
-            "  immutable - a stable setting or event that should remain fixed later\n"
-            "  stateful  - a condition that may evolve but must stay coherent over time\n"
-            "  soft      - a preference or lower-priority detail that may be adjusted\n\n"
+            "  immutable - a hard constraint from the task specification that must remain fixed\n"
+            "  stateful  - a dynamic claim that may be refined as the survey progresses\n"
+            "  soft      - a stylistic preference or low-priority detail that may be adjusted\n\n"
             "Current section content must be analyzed together with the prior summary when provided.\n"
             "Return a JSON array only."
         )

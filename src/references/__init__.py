@@ -6,9 +6,7 @@ from .types import (
     SectionReferenceReport,
 )
 from .corpus import CorpusLoader
-from .hyde import HyDEGenerator
-from .fusion import reciprocal_rank_fusion
-from .retriever import HyDERetriever, ReferenceRetriever
+from .retriever import DenseRetriever, HyDERetriever, ReferenceRetriever
 
 __all__ = [
     "GlobalPaperEntry",
@@ -17,8 +15,7 @@ __all__ = [
     "ReferenceBundle",
     "SectionReferenceReport",
     "CorpusLoader",
-    "HyDEGenerator",
+    "DenseRetriever",
     "HyDERetriever",
     "ReferenceRetriever",
-    "reciprocal_rank_fusion",
 ]
