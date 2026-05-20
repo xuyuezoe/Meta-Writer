@@ -44,6 +44,70 @@ class OrchestratorOutputTests(unittest.TestCase):
         self.assertIn("Single block here.", blocks[1])
 
 
+class SectionBudgetResolutionTests(unittest.TestCase):
+    def test_resolve_section_word_targets_prefers_reference_constraints(self) -> None:
+        outline = {
+            "sec1": "Scope",
+            "sec2": "Framework",
+            "sec3": "Evidence",
+            "sec4": "Findings",
+            "sec5": "Implications",
+            "sec6": "Limitations",
+        }
+        reference = {
+            "constraints": {
+                "section_word_targets": {
+                    "sec1": 305,
+                    "sec2": 516,
+                    "sec3": 631,
+                    "sec4": 674,
+                    "sec5": 544,
+                    "sec6": 246,
+                }
+            }
+        }
+
+        resolved = SelfCorrectingOrchestrator._resolve_section_word_targets(
+            task="Write an approximately 2916-word review article.",
+            outline=outline,
+            reference=reference,
+        )
+
+        self.assertEqual(
+            resolved,
+            {
+                "sec1": 305,
+                "sec2": 516,
+                "sec3": 631,
+                "sec4": 674,
+                "sec5": 544,
+                "sec6": 246,
+            },
+        )
+
+    def test_resolve_section_word_targets_falls_back_to_uniform_parse(self) -> None:
+        outline = {
+            "sec1": "Scope",
+            "sec2": "Framework",
+            "sec3": "Evidence",
+        }
+
+        resolved = SelfCorrectingOrchestrator._resolve_section_word_targets(
+            task="Write an approximately 900-word review article.",
+            outline=outline,
+            reference=None,
+        )
+
+        self.assertEqual(
+            resolved,
+            {
+                "sec1": 300,
+                "sec2": 300,
+                "sec3": 300,
+            },
+        )
+
+
 class CitationFailureGuardTests(unittest.TestCase):
     """验证引用密度失败不会触发 partial_rollback（Fix 2）。"""
 

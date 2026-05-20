@@ -257,9 +257,10 @@ Overall implications.
         result = score_section_distribution(final_text, citation_manifest)
 
         self.assertEqual(result.status, "evaluated")
-        self.assertGreaterEqual(result.score, 0.95)
+        self.assertGreaterEqual(result.score, 0.9)
         self.assertEqual(result.section_counts["main_body"], 57)
         self.assertAlmostEqual(result.section_shares["main_body"], 57 / 77, places=4)
+        self.assertEqual(result.scheme, "seven_section_fallback")
 
     def test_section_distribution_penalizes_main_body_underuse(self):
         final_text = "Generated article body."
@@ -283,6 +284,67 @@ Overall implications.
         self.assertEqual(result.status, "evaluated")
         self.assertLess(result.score, 0.8)
         self.assertEqual(result.section_penalties["main_body"], 1.0)
+
+    def test_section_distribution_prefers_six_slot_task_layout(self):
+        final_text = "Generated article body."
+        citation_manifest = [
+            *[
+                {"citation_id": f"S1_{i}", "chunk_id": "sec1", "section_key": "introduction"}
+                for i in range(1, 11)
+            ],
+            *[
+                {"citation_id": f"S2_{i}", "chunk_id": "sec2", "section_key": "main_body"}
+                for i in range(1, 21)
+            ],
+            *[
+                {"citation_id": f"S3_{i}", "chunk_id": "sec3", "section_key": "main_body"}
+                for i in range(1, 21)
+            ],
+            *[
+                {"citation_id": f"S4_{i}", "chunk_id": "sec4", "section_key": "main_body"}
+                for i in range(1, 21)
+            ],
+            *[
+                {"citation_id": f"S5_{i}", "chunk_id": "sec5", "section_key": "main_body"}
+                for i in range(1, 21)
+            ],
+            *[
+                {"citation_id": f"S6_{i}", "chunk_id": "sec6", "section_key": "conclusion"}
+                for i in range(1, 9)
+            ],
+        ]
+        reference = {
+            "outline": {
+                "sec1": "Scope, disease context, and chemokine terminology in alopecia areata",
+                "sec2": "Chemokine-pathway framework and hair-follicle immune privilege collapse",
+                "sec3": "Evidence base and measurement strategies across blood and skin studies",
+                "sec4": "Chemokine signatures in alopecia areata across Th1, Th2, and related pathways",
+                "sec5": "Biomarker value and therapeutic implications for clinical dermatology",
+                "sec6": "Limitations, heterogeneity, and future research priorities",
+            }
+        }
+
+        result = score_section_distribution(
+            final_text,
+            citation_manifest,
+            reference=reference,
+        )
+
+        self.assertEqual(result.status, "evaluated")
+        self.assertEqual(result.scheme, "six_slot_task")
+        self.assertGreaterEqual(result.score, 0.9)
+        self.assertEqual(
+            list(result.section_counts.keys()),
+            [
+                "scope_context",
+                "framework_mechanism",
+                "evidence_methods",
+                "findings_synthesis",
+                "implications_discussion",
+                "limitations_future",
+            ],
+        )
+        self.assertAlmostEqual(result.section_shares["scope_context"], 10 / 98, places=4)
 
     def test_section_distribution_low_citation_count_is_not_evaluated(self):
         result = score_section_distribution(

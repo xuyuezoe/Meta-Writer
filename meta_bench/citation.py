@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import json
 import re
 from collections import Counter, defaultdict
 from dataclasses import dataclass
-from typing import Iterable, Mapping, Sequence, cast
+from functools import lru_cache
+from typing import Callable, Iterable, Mapping, Sequence, cast
 
 from .structure import count_length_units, parse_markdown_sections
 
@@ -114,6 +116,7 @@ NON_MAIN_HEADINGS = {
     "associated data",
     "generative ai statement",
 }
+CITATION_NON_CONTENT_HEADINGS = NON_MAIN_HEADINGS - CONCLUSION_HEADINGS
 
 BRACKET_CITATION_RE = re.compile(r"\[(.*?)\]")
 PAREN_CITATION_RE = re.compile(r"\((.*?)\)")
@@ -597,6 +600,7 @@ class SectionDistributionResult:
     section_penalties: dict[str, float]
     thresholds: dict[str, dict[str, float]]
     source: str
+    scheme: str = "seven_section"
     reason: str = ""
 
     def to_dict(self) -> dict[str, object]:
@@ -610,6 +614,7 @@ class SectionDistributionResult:
             "section_penalties": self.section_penalties,
             "thresholds": self.thresholds,
             "source": self.source,
+            "scheme": self.scheme,
         }
         if self.reason:
             output["reason"] = self.reason
@@ -1390,6 +1395,122 @@ def _seven_section_key_from_value(value: object) -> str | None:
     return None
 
 
+def _six_slot_key_from_value(value: object) -> str | None:
+    normalized = _normalize_token(value)
+    aliases = {
+        "scope_context": "scope_context",
+        "scope": "scope_context",
+        "intro": "scope_context",
+        "introduction": "scope_context",
+        "framework_mechanism": "framework_mechanism",
+        "framework": "framework_mechanism",
+        "mechanism": "framework_mechanism",
+        "evidence_methods": "evidence_methods",
+        "methods": "evidence_methods",
+        "findings_synthesis": "findings_synthesis",
+        "findings": "findings_synthesis",
+        "synthesis": "findings_synthesis",
+        "implications_discussion": "implications_discussion",
+        "discussion": "implications_discussion",
+        "implications": "implications_discussion",
+        "limitations_future": "limitations_future",
+        "limitations_gaps": "limitations_future",
+        "limitations": "limitations_future",
+        "conclusion": "limitations_future",
+        "future_work": "limitations_future",
+        "future": "limitations_future",
+    }
+    return aliases.get(normalized)
+
+
+def _extract_outline_items(
+    reference: Mapping[str, object] | None,
+) -> list[tuple[str, str]]:
+    if reference is None:
+        return []
+    raw_outline = reference.get("outline")
+    if not isinstance(raw_outline, Mapping):
+        return []
+    outline_items: list[tuple[str, str]] = []
+    for raw_section_id, raw_title in raw_outline.items():
+        section_id = str(raw_section_id).strip()
+        if not section_id:
+            continue
+        outline_items.append((section_id, str(raw_title).strip()))
+    return outline_items
+
+
+@lru_cache(maxsize=1)
+def _load_six_slot_section_distribution_thresholds() -> dict[str, dict[str, float]] | None:
+    from .six_slot_priors import SIX_SLOT_ORDER, SIX_SLOT_PRIORS_PATH
+
+    if not SIX_SLOT_PRIORS_PATH.exists():
+        return None
+    payload = json.loads(SIX_SLOT_PRIORS_PATH.read_text(encoding="utf-8"))
+    raw_stats = payload.get("slot_stats")
+    raw_mean_shares = payload.get("normalized_mean_shares")
+    if not isinstance(raw_stats, Mapping) or not isinstance(raw_mean_shares, Mapping):
+        return None
+
+    thresholds: dict[str, dict[str, float]] = {}
+    for slot in SIX_SLOT_ORDER:
+        slot_stats = raw_stats.get(slot)
+        raw_weight = raw_mean_shares.get(slot)
+        if not isinstance(slot_stats, Mapping) or not isinstance(raw_weight, (int, float)):
+            return None
+        p25 = float(slot_stats.get("p25_share", 0.0))
+        p75 = float(slot_stats.get("p75_share", 0.0))
+        iqr = max(0.0, p75 - p25)
+        soft_pad = 0.25 * iqr
+        hard_lower = max(0.0, p25 - 1.5 * iqr)
+        hard_upper = min(1.0, p75 + 1.5 * iqr)
+        thresholds[slot] = {
+            "soft_lower": round(max(0.0, p25 - soft_pad), 6),
+            "soft_upper": round(min(1.0, p75 + soft_pad), 6),
+            "hard_lower": round(min(hard_lower, p25), 6),
+            "hard_upper": round(max(hard_upper, p75), 6),
+            "weight": round(float(raw_weight), 6),
+        }
+    return thresholds
+
+
+def _resolve_six_slot_section_mapping(
+    reference: Mapping[str, object] | None,
+    chunk_map: object | None,
+) -> tuple[list[str], dict[str, str], dict[str, dict[str, float]]] | None:
+    from .six_slot_priors import SIX_SLOT_ORDER, classify_outline_to_six_slots
+
+    outline_items = _extract_outline_items(reference)
+    if not outline_items:
+        return None
+
+    slot_by_section = classify_outline_to_six_slots(outline_items)
+    if not slot_by_section:
+        return None
+
+    thresholds = _load_six_slot_section_distribution_thresholds()
+    if thresholds is None:
+        return None
+
+    mapping: dict[str, str] = dict(slot_by_section)
+    if isinstance(chunk_map, list):
+        for raw_item in chunk_map:
+            if not isinstance(raw_item, Mapping):
+                continue
+            item = cast(Mapping[str, object], raw_item)
+            section_id = str(item.get("section_id", "")).strip()
+            chunk_id = str(item.get("chunk_id", "")).strip()
+            slot = slot_by_section.get(section_id)
+            if slot is None:
+                continue
+            if section_id:
+                mapping[section_id] = slot
+            if chunk_id:
+                mapping[chunk_id] = slot
+
+    return list(SIX_SLOT_ORDER), mapping, thresholds
+
+
 def _section_key_by_chunk_id(
     reference: Mapping[str, object] | None,
     chunk_map: object | None,
@@ -1457,6 +1578,92 @@ def _citation_counts_from_manifest(
         counts[section_key] += 1
     if mapped_count == 0:
         return None
+    return counts
+
+
+def _citation_counts_from_manifest_by_keys(
+    citation_manifest: Sequence[object],
+    *,
+    valid_keys: Sequence[str],
+    mapping: Mapping[str, str] | None = None,
+    key_resolver: Callable[[object], str | None] | None = None,
+    prefer_mapping: bool = False,
+) -> dict[str, int] | None:
+    counts = {section_key: 0 for section_key in valid_keys}
+    mapped_count = 0
+    for raw_item in citation_manifest:
+        if not isinstance(raw_item, Mapping):
+            raise TypeError("each citation event must be a mapping")
+        item = cast(Mapping[str, object], raw_item)
+        chunk_id = str(
+            item.get("chunk_id", item.get("section_id", item.get("section", "")))
+        ).strip()
+
+        section_key = None
+        if prefer_mapping and mapping and chunk_id:
+            section_key = mapping.get(chunk_id)
+
+        if section_key is None and key_resolver is not None:
+            for key in ("slot", "section_key", "seven_section", "section_group"):
+                if key in item:
+                    resolved = key_resolver(item.get(key))
+                    if resolved in counts:
+                        section_key = resolved
+                        break
+
+        if section_key is None and mapping and chunk_id:
+            section_key = mapping.get(chunk_id)
+        if section_key is None and mapping and item.get("section_id") is not None:
+            section_key = mapping.get(str(item.get("section_id")).strip())
+        if section_key is None and key_resolver is not None and chunk_id:
+            resolved = key_resolver(chunk_id)
+            if resolved in counts:
+                section_key = resolved
+        if section_key is None:
+            continue
+        mapped_count += 1
+        counts[section_key] += 1
+
+    if mapped_count == 0:
+        return None
+    return counts
+
+
+def _content_sections_for_distribution(final_text: str) -> list[str]:
+    content_sections: list[str] = []
+    for section in parse_markdown_sections(final_text):
+        if section.is_title:
+            continue
+        normalized_heading = normalize_section_heading(section.heading)
+        if normalized_heading in REFERENCE_HEADINGS:
+            continue
+        if normalized_heading in {"abstract", "keywords", "keyword"}:
+            continue
+        if normalized_heading in CITATION_NON_CONTENT_HEADINGS:
+            continue
+        if section.body.strip():
+            content_sections.append(section.body)
+    return content_sections
+
+
+def _citation_counts_from_six_slot_text(
+    final_text: str,
+    *,
+    slot_order: Sequence[str],
+) -> dict[str, int] | None:
+    content_sections = _content_sections_for_distribution(final_text)
+    if len(content_sections) != len(slot_order):
+        return None
+
+    reference_item_count = count_reference_items(
+        split_into_seven_sections(final_text)["references"].text
+    )
+    counts = {slot: 0 for slot in slot_order}
+    for slot, text in zip(slot_order, content_sections):
+        counts[slot] = count_citations_in_text(
+            text,
+            max_reference_number=reference_item_count,
+        ).total_citations
     return counts
 
 
@@ -1644,8 +1851,12 @@ def score_source_balance(
     )
 
 
-def _section_distribution_penalty(section_key: str, share: float) -> float:
-    threshold = SECTION_DISTRIBUTION_THRESHOLDS[section_key]
+def _section_distribution_penalty(
+    section_key: str,
+    share: float,
+    thresholds: Mapping[str, Mapping[str, float]],
+) -> float:
+    threshold = thresholds[section_key]
     soft_lower = threshold["soft_lower"]
     soft_upper = threshold["soft_upper"]
     hard_lower = threshold["hard_lower"]
@@ -1664,56 +1875,29 @@ def _section_distribution_penalty(section_key: str, share: float) -> float:
     return _clamp((share - soft_upper) / denominator, 0.0, 1.0)
 
 
-def score_section_distribution(
-    final_text: str,
-    citation_manifest: Sequence[object] | None = None,
+def _score_section_distribution_from_counts(
     *,
-    reference: Mapping[str, object] | None = None,
-    chunk_map: object | None = None,
-    min_citations: int = MIN_CITATIONS_FOR_DISTRIBUTION,
+    section_counts: dict[str, int],
+    thresholds: dict[str, dict[str, float]],
+    source: str,
+    scheme: str,
+    min_citations: int,
 ) -> SectionDistributionResult:
-    """Score whether citations are reasonably distributed across seven sections."""
-
-    if not isinstance(final_text, str) or final_text.strip() == "":
-        raise ValueError("final_text must be a non-empty string")
-    if min_citations <= 0:
-        raise ValueError("min_citations must be positive")
-
-    if citation_manifest:
-        manifest_counts = _citation_counts_from_manifest(
-            citation_manifest,
-            reference=reference,
-            chunk_map=chunk_map,
-        )
-        if manifest_counts is not None:
-            section_counts = manifest_counts
-            source = "citation_manifest"
-        else:
-            section_counts = _citation_counts_from_text(final_text)
-            source = "text_regex_manifest_unmapped"
-    else:
-        section_counts = _citation_counts_from_text(final_text)
-        source = "text_regex"
-
-    total_citations = sum(
-        section_counts.get(section_key, 0)
-        for section_key in SEVEN_SECTION_KEYS
+    counted_keys = [
+        section_key
+        for section_key in thresholds
         if section_key != "references"
-    )
+    ]
+    total_citations = sum(section_counts.get(section_key, 0) for section_key in counted_keys)
     if total_citations < min_citations:
-        section_shares = {
-            section_key: 0.0
-            for section_key in SEVEN_SECTION_KEYS
-        }
+        section_shares = {section_key: 0.0 for section_key in thresholds}
         if total_citations > 0:
             section_shares = {
                 section_key: round(
                     section_counts.get(section_key, 0) / total_citations,
                     4,
                 )
-                if section_key != "references"
-                else 0.0
-                for section_key in SEVEN_SECTION_KEYS
+                for section_key in thresholds
             }
         return SectionDistributionResult(
             score=None,
@@ -1723,27 +1907,23 @@ def score_section_distribution(
             section_counts=section_counts,
             section_shares=section_shares,
             section_penalties={},
-            thresholds=SECTION_DISTRIBUTION_THRESHOLDS,
+            thresholds=thresholds,
             source=source,
+            scheme=scheme,
             reason="low_citation_count",
         )
 
     raw_shares = {
-        section_key: (
-            section_counts.get(section_key, 0) / total_citations
-            if section_key != "references"
-            else section_counts.get(section_key, 0) / total_citations
-        )
-        for section_key in SEVEN_SECTION_KEYS
+        section_key: section_counts.get(section_key, 0) / total_citations
+        for section_key in thresholds
     }
     section_penalties = {
-        section_key: _section_distribution_penalty(section_key, share)
+        section_key: _section_distribution_penalty(section_key, share, thresholds)
         for section_key, share in raw_shares.items()
     }
     weighted_penalty = sum(
-        section_penalties[section_key]
-        * SECTION_DISTRIBUTION_THRESHOLDS[section_key]["weight"]
-        for section_key in SEVEN_SECTION_KEYS
+        section_penalties[section_key] * thresholds[section_key]["weight"]
+        for section_key in thresholds
     )
     return SectionDistributionResult(
         score=round(1.0 - weighted_penalty, 4),
@@ -1759,8 +1939,99 @@ def score_section_distribution(
             section_key: round(penalty, 4)
             for section_key, penalty in section_penalties.items()
         },
+        thresholds=thresholds,
+        source=source,
+        scheme=scheme,
+    )
+
+
+def score_section_distribution(
+    final_text: str,
+    citation_manifest: Sequence[object] | None = None,
+    *,
+    reference: Mapping[str, object] | None = None,
+    chunk_map: object | None = None,
+    min_citations: int = MIN_CITATIONS_FOR_DISTRIBUTION,
+) -> SectionDistributionResult:
+    """Score whether citations are reasonably distributed across the task layout."""
+
+    if not isinstance(final_text, str) or final_text.strip() == "":
+        raise ValueError("final_text must be a non-empty string")
+    if min_citations <= 0:
+        raise ValueError("min_citations must be positive")
+
+    six_slot_layout = _resolve_six_slot_section_mapping(reference, chunk_map)
+    if six_slot_layout is not None:
+        slot_order, slot_mapping, six_slot_thresholds = six_slot_layout
+        if citation_manifest:
+            manifest_counts = _citation_counts_from_manifest_by_keys(
+                citation_manifest,
+                valid_keys=slot_order,
+                mapping=slot_mapping,
+                key_resolver=_six_slot_key_from_value,
+                prefer_mapping=True,
+            )
+            if manifest_counts is not None:
+                return _score_section_distribution_from_counts(
+                    section_counts=manifest_counts,
+                    thresholds=six_slot_thresholds,
+                    source="citation_manifest",
+                    scheme="six_slot_task",
+                    min_citations=min_citations,
+                )
+
+            text_counts = _citation_counts_from_six_slot_text(
+                final_text,
+                slot_order=slot_order,
+            )
+            if text_counts is not None:
+                return _score_section_distribution_from_counts(
+                    section_counts=text_counts,
+                    thresholds=six_slot_thresholds,
+                    source="text_regex_manifest_unmapped",
+                    scheme="six_slot_task",
+                    min_citations=min_citations,
+                )
+        else:
+            text_counts = _citation_counts_from_six_slot_text(
+                final_text,
+                slot_order=slot_order,
+            )
+            if text_counts is not None:
+                return _score_section_distribution_from_counts(
+                    section_counts=text_counts,
+                    thresholds=six_slot_thresholds,
+                    source="text_regex",
+                    scheme="six_slot_task",
+                    min_citations=min_citations,
+                )
+
+    if citation_manifest:
+        manifest_counts = _citation_counts_from_manifest(
+            citation_manifest,
+            reference=reference,
+            chunk_map=chunk_map,
+        )
+        if manifest_counts is not None:
+            return _score_section_distribution_from_counts(
+                section_counts=manifest_counts,
+                thresholds=SECTION_DISTRIBUTION_THRESHOLDS,
+                source="citation_manifest",
+                scheme="seven_section_fallback",
+                min_citations=min_citations,
+            )
+        section_counts = _citation_counts_from_text(final_text)
+        source = "text_regex_manifest_unmapped"
+    else:
+        section_counts = _citation_counts_from_text(final_text)
+        source = "text_regex"
+
+    return _score_section_distribution_from_counts(
+        section_counts=section_counts,
         thresholds=SECTION_DISTRIBUTION_THRESHOLDS,
         source=source,
+        scheme="seven_section_fallback",
+        min_citations=min_citations,
     )
 
 
