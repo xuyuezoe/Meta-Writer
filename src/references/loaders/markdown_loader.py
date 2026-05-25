@@ -1,5 +1,5 @@
 """
-Markdown corpus loader for metabench/output/*.md files.
+Markdown corpus loader for local paper-corpus `*.md` files.
 
 Each file has a YAML frontmatter block (between --- delimiters) followed by
 the paper body in Markdown.  We extract structured metadata from the frontmatter
@@ -41,7 +41,7 @@ def _parse_frontmatter(raw: str) -> tuple[dict, str]:
     """
     Split raw file content into (frontmatter_dict, body).
 
-    Handles the simple subset of YAML used by the metabench files:
+    Handles the simple subset of YAML used by the local corpus files:
     scalar strings, lists, nested dicts (affiliations), nulls.
     Returns ({}, raw) if no frontmatter delimiters are found.
     """
@@ -66,7 +66,7 @@ def _parse_frontmatter(raw: str) -> tuple[dict, str]:
 
 def _simple_yaml_parse(text: str) -> dict:
     """
-    Minimal YAML parser covering the metabench frontmatter structure.
+    Minimal YAML parser covering the local corpus frontmatter structure.
     Falls back gracefully on anything it cannot handle.
     """
     result: dict = {}
@@ -181,7 +181,7 @@ def _chunk_markdown(paper_id: str, body: str) -> List[dict]:
 
 def load_paper_file(path: Path) -> Optional[dict]:
     """
-    Parse one metabench .md file and return a structured paper dict.
+    Parse one paper `.md` file and return a structured paper dict.
     Returns None if the file cannot be parsed meaningfully.
     """
     try:
@@ -220,7 +220,7 @@ def load_paper_file(path: Path) -> Optional[dict]:
     chunks = _chunk_markdown(paper_id, body)
 
     # 标题回退：若 frontmatter title 过短（<4词），从 body 第一个 heading 提取。
-    # 部分 metabench 文件存在 title 被截断的情况（如 "Nationwide Cohort Study"），
+    # 部分语料文件存在 title 被截断的情况（如 "Nationwide Cohort Study"），
     # 真实完整标题保存在 Markdown body 的首个 heading 中。
     if len(title.split()) < 4 and chunks:
         candidate = chunks[0].get("section_title", "")

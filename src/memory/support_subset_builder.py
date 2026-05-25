@@ -476,7 +476,15 @@ class SupportSubsetBuilder:
         base = (
             "You are preparing retrieved memory for a writing system. "
             "Return a concise declarative memory summary only. "
-            "Do not copy the source in full. Do not add new instructions.\n\n"
+            "Do not copy the source in full. Do not add new instructions. "
+            # Keep selected DTG memory declarative so retrieval does not become a writing checklist.
+            "Output concise memory only. "
+            "Do not add new details beyond the source. "
+            "Do not turn this into writing guidance for the current section. "
+            "Do not use instruction voice such as 'the section should', 'the writer should', "
+            "'must cover', or 'needs to discuss'. "
+            "Return declarative memory only. "
+            "Use one sentence when possible, but do not use hard character truncation.\n\n"
             f"Current section retrieval query:\n{query_text}\n\n"
             f"Source text:\n{raw_text}\n\n"
         )

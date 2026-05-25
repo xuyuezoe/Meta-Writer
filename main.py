@@ -12,14 +12,15 @@ Usage:
     python -m main --task-id med_s010
     python -m main --all
 """
-
 from __future__ import annotations
 
 import argparse
 import json
 import os
+import shutil
 import sys
 import traceback
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Sequence
 
@@ -27,46 +28,39 @@ from dotenv import load_dotenv
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from examples.benchmark_template import evaluate_output, list_benchmark_task_ids
-from examples.tasks import TASK_REGISTRY
-
-
-# 目的：
-#   保持 `python main.py` 无参数时直接跑完整 benchmark 主链路，
-#   让默认入口与正式批量评测行为保持一致。
-BENCHMARK_TASK_PREFIX = "metabench_"
-
+from examples.tasks import META_BENCH_TASK_NAMES, TASK_ID_REGISTRY, TASK_REGISTRY
+from meta_bench import META_BENCH_METRIC_ORDER, evaluate_meta_bench
+from src.memory.bm25_similarity import BM25SimilarityService
 
 def _parse_args() -> argparse.Namespace:
-    """解析命令行参数。"""
-    parser = argparse.ArgumentParser(description="Run a MetaWriter task or benchmark sample")
+    parser = argparse.ArgumentParser(description="Run a MetaWriter task or MetaBench task")
     parser.add_argument(
         "-t",
         "--task",
         "--task-name",
         dest="task_name",
         type=str,
-        help="Run a registered task such as survey_paper, argumentative_essay, or metabench_med_s010",
+        help="Run a registered task such as scifi_story or metabench_sample.",
     )
     parser.add_argument(
         "--task-id",
         type=str,
-        help="Run a benchmark sample by ID, for example med_s010",
+        help="Run a registered MetaBench task by task_id, for example med_s001.",
     )
     parser.add_argument(
         "--all",
         action="store_true",
-        help="Run all benchmark samples in batch mode and score each generated result",
+        help="Run all registered MetaBench tasks in batch mode.",
     )
     parser.add_argument(
         "--list-tasks",
         action="store_true",
-        help="List available tasks and exit",
+        help="List available tasks and exit.",
     )
     parser.add_argument(
         "--print-response",
         action="store_true",
-        help="Print the full generated text in the terminal; otherwise only a preview is shown",
+        help="Print the full generated text in the terminal.",
     )
     args = parser.parse_args()
 
@@ -78,65 +72,64 @@ def _parse_args() -> argparse.Namespace:
     return args
 
 
-def _benchmark_task_name(task_id: str) -> str:
-    """将 benchmark 样本 ID 转换为任务注册表中的动态任务名。"""
-    return f"{BENCHMARK_TASK_PREFIX}{task_id}"
-
-
-def _extract_benchmark_task_id(task_name: str) -> str | None:
-    """如果任务名对应动态 benchmark 样本，则返回样本 ID。"""
-    if not task_name.startswith(BENCHMARK_TASK_PREFIX):
+def _task_id_for_name(task_name: str) -> str | None:
+    task_factory = TASK_REGISTRY.get(task_name)
+    if task_factory is None:
         return None
 
-    task_id = task_name[len(BENCHMARK_TASK_PREFIX) :]
-    if task_id in set(list_benchmark_task_ids()):
-        return task_id
-    return None
+    config = task_factory()
+    reference = config.get("reference")
+    if not isinstance(reference, dict):
+        return None
+
+    raw_task_id = reference.get("task_id")
+    if not isinstance(raw_task_id, str):
+        return None
+
+    task_id = raw_task_id.strip()
+    return task_id or None
 
 
-def _resolve_requested_task_names(args: argparse.Namespace) -> List[str]:
-    """根据 CLI 参数解析实际要运行的任务名列表。"""
-    benchmark_task_ids = list_benchmark_task_ids()
-    benchmark_task_names = [
-        _benchmark_task_name(task_id) for task_id in benchmark_task_ids
-    ]
-
+def _resolve_requested_task_names(args: argparse.Namespace) -> list[str]:
     if args.all:
-        return benchmark_task_names
+        return list(META_BENCH_TASK_NAMES)
 
     if args.task_id:
-        if args.task_id not in benchmark_task_ids:
-            raise ValueError(f"Unknown benchmark task_id: {args.task_id}")
-        return [_benchmark_task_name(args.task_id)]
+        task_name = TASK_ID_REGISTRY.get(args.task_id)
+        if task_name is None:
+            raise ValueError(f"Unknown task_id: {args.task_id}")
+        return [task_name]
 
     if args.task_name:
         return [args.task_name]
 
-    return benchmark_task_names
+    if META_BENCH_TASK_NAMES:
+        return [META_BENCH_TASK_NAMES[0]]
+
+    raise ValueError("No MetaBench tasks are registered.")
 
 
 def _print_available_tasks() -> None:
-    """列出当前可用普通任务与 benchmark 样本。"""
     regular_tasks = [
         task_name
         for task_name in sorted(TASK_REGISTRY.keys())
-        if _extract_benchmark_task_id(task_name) is None
+        if task_name not in META_BENCH_TASK_NAMES
     ]
-    benchmark_task_ids = list_benchmark_task_ids()
 
     print("Available regular tasks:")
     for task_name in regular_tasks:
         print(f"  - {task_name}")
 
-    print("\nAvailable benchmark samples:")
-    print(f"  {len(benchmark_task_ids)} samples available. You can run one directly with --task-id, for example:")
-    print("  python main.py --task-id med_s010")
-    print("  python -m main --task-id med_s010")
-    print("  python main.py --all")
+    print("\nAvailable MetaBench tasks:")
+    for task_name in META_BENCH_TASK_NAMES:
+        task_id = _task_id_for_name(task_name)
+        if task_id is None:
+            print(f"  - {task_name}")
+        else:
+            print(f"  - {task_name} (task_id: {task_id})")
 
 
-def _load_runtime_settings() -> Dict[str, str | None]:
-    """加载运行所需环境变量。"""
+def _load_runtime_settings() -> dict[str, str | None]:
     load_dotenv(override=True)
     api_key = os.getenv("API_KEY")
     if not api_key:
@@ -149,23 +142,23 @@ def _load_runtime_settings() -> Dict[str, str | None]:
     }
 
 
-def _write_json(path: Path, payload: Dict[str, object]) -> Path:
-    """写入 JSON 文件。"""
+def _write_json(path: Path, payload: object) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     return path
 
 
 def _clean_output_files(output_dir: Path, session_name: str) -> None:
-    """清理当前任务已有输出，避免旧结果混入新实验。"""
     output_dir.mkdir(parents=True, exist_ok=True)
     for old_file in output_dir.glob(f"{session_name}_*"):
         if old_file.is_file():
             old_file.unlink()
+    bundle_dir = output_dir / session_name
+    if bundle_dir.exists() and bundle_dir.is_dir():
+        shutil.rmtree(bundle_dir)
 
 
-def _load_task_config(task_name: str) -> Dict[str, object]:
-    """从任务注册表加载任务配置。"""
+def _load_task_config(task_name: str) -> dict[str, object]:
     if task_name not in TASK_REGISTRY:
         available_tasks = sorted(TASK_REGISTRY.keys())
         raise KeyError(f"Unknown task '{task_name}'. Available tasks: {available_tasks}")
@@ -178,22 +171,101 @@ def _load_task_config(task_name: str) -> Dict[str, object]:
     return config
 
 
+def _build_task_input_snapshot(
+    *,
+    task_name: str,
+    config: dict[str, object],
+    session_name: str,
+) -> dict[str, object]:
+    snapshot: dict[str, object] = {
+        "framework": "meta_bench",
+        "saved_at": datetime.now().isoformat(timespec="seconds"),
+        "task_name": task_name,
+        "task_id": _task_id_for_name(task_name),
+        "session_name": session_name,
+        "task": str(config["task"]),
+        "constraints": list(config["constraints"]) if isinstance(config["constraints"], list) else [],
+        "outline": dict(config["outline"]) if isinstance(config["outline"], dict) else {},
+    }
+
+    reference = config.get("reference")
+    if isinstance(reference, dict):
+        snapshot["reference"] = reference
+    corpus_dir = config.get("corpus_dir")
+    if isinstance(corpus_dir, str) and corpus_dir.strip():
+        snapshot["corpus_dir"] = corpus_dir
+
+    return snapshot
+
+
+def _write_run_bundle(
+    *,
+    output_dir: Path,
+    session_name: str,
+    task_input_file: Path,
+    text_file: Path,
+    correction_log_file: Path,
+    dtg_file: Path,
+    summary_file: Path,
+    session_file: Path,
+    run_log_file: Path | None,
+    meta_bench_eval_file: Path | None,
+    citation_manifest_file: Path | None = None,
+    chunk_map_file: Path | None = None,
+) -> Path:
+    bundle_dir = output_dir / session_name
+    bundle_dir.mkdir(parents=True, exist_ok=True)
+
+    bundle_artifacts: dict[str, str] = {}
+    copy_plan = {
+        "task_input": (task_input_file, "task_input.json"),
+        "text": (text_file, "text.txt"),
+        "correction_log": (correction_log_file, "correction_log.json"),
+        "dtg": (dtg_file, "dtg.json"),
+        "summary": (summary_file, "summary.json"),
+        "session": (session_file, "session.json"),
+    }
+    if run_log_file is not None:
+        copy_plan["run_log"] = (run_log_file, "run.log")
+    if meta_bench_eval_file is not None:
+        copy_plan["meta_bench_eval"] = (meta_bench_eval_file, "meta_bench_eval.json")
+    if citation_manifest_file is not None:
+        copy_plan["citation_manifest"] = (citation_manifest_file, "citation_manifest.json")
+    if chunk_map_file is not None:
+        copy_plan["chunk_map"] = (chunk_map_file, "chunk_map.json")
+
+    for artifact_name, (source_path, target_name) in copy_plan.items():
+        if not source_path.exists():
+            continue
+        target_path = bundle_dir / target_name
+        shutil.copy2(source_path, target_path)
+        bundle_artifacts[artifact_name] = str(target_path)
+
+    manifest = {
+        "framework": "meta_bench",
+        "session_name": session_name,
+        "bundle_dir": str(bundle_dir),
+        "artifacts": bundle_artifacts,
+    }
+    _write_json(bundle_dir / "artifact_manifest.json", manifest)
+    return bundle_dir
+
+
 def _build_run_result(
     *,
     task_name: str,
-    config: Dict[str, object],
+    config: dict[str, object],
     session_name: str,
     final_text: str,
     run_status: str,
-    correction_stats: Dict[str, object],
-    dtg_stats: Dict[str, object],
-    metric_summary: Dict[str, object],
-    llm_stats: Dict[str, object],
-    artifacts: Dict[str, str],
-    benchmark_evaluation: Dict[str, object] | None,
-) -> Dict[str, object]:
-    """构造单次运行的结构化结果。"""
-    result: Dict[str, object] = {
+    correction_stats: dict[str, object],
+    dtg_stats: dict[str, object],
+    metric_summary: dict[str, object],
+    llm_stats: dict[str, object],
+    artifacts: dict[str, str],
+    meta_bench_evaluation: dict[str, object] | None,
+) -> dict[str, object]:
+    result: dict[str, object] = {
         "status": run_status,
         "task_name": task_name,
         "session_name": session_name,
@@ -210,12 +282,28 @@ def _build_run_result(
         "artifacts": artifacts,
     }
 
-    benchmark_task_id = _extract_benchmark_task_id(task_name)
-    if benchmark_task_id is not None:
-        result["benchmark_task_id"] = benchmark_task_id
+    task_id = _task_id_for_name(task_name)
+    if task_id is not None:
+        result["task_id"] = task_id
 
-    if benchmark_evaluation is not None:
-        result["benchmark_evaluation"] = benchmark_evaluation
+    if meta_bench_evaluation is not None:
+        metric_scores = meta_bench_evaluation.get("metric_scores", {})
+        if isinstance(metric_scores, dict):
+            ordered_metric_scores = {
+                metric_name: float(metric_scores[metric_name])
+                for metric_name in META_BENCH_METRIC_ORDER
+                if isinstance(metric_scores.get(metric_name), (int, float))
+            }
+            extra_metric_scores = {
+                str(metric_name): float(metric_value)
+                for metric_name, metric_value in metric_scores.items()
+                if metric_name not in ordered_metric_scores
+                and isinstance(metric_value, (int, float))
+            }
+            ordered_metric_scores.update(extra_metric_scores)
+            result["meta_bench_scores"] = ordered_metric_scores
+
+        result["meta_bench_evaluation"] = meta_bench_evaluation
 
     return result
 
@@ -224,14 +312,13 @@ def _print_task_header(
     task_name: str,
     task_description: str,
     constraints: Sequence[str],
-    outline: Dict[str, object],
+    outline: dict[str, object],
 ) -> None:
-    """打印任务基本信息。"""
     print("=" * 60)
     print(f"MetaWriter | Task: {task_name}")
-    benchmark_task_id = _extract_benchmark_task_id(task_name)
-    if benchmark_task_id is not None:
-        print(f"Benchmark sample: {benchmark_task_id}")
+    task_id = _task_id_for_name(task_name)
+    if task_id is not None:
+        print(f"MetaBench task_id: {task_id}")
     print("=" * 60)
     print(f"\nTask description: {task_description}")
     print(f"Constraint count: {len(constraints)}")
@@ -247,16 +334,15 @@ def _print_run_summary(
     *,
     task_name: str,
     final_text: str,
-    correction_stats: Dict[str, object],
-    dtg_stats: Dict[str, object],
-    metric_summary: Dict[str, object],
-    llm_stats: Dict[str, object],
-    benchmark_evaluation: Dict[str, object] | None,
+    correction_stats: dict[str, object],
+    dtg_stats: dict[str, object],
+    metric_summary: dict[str, object],
+    llm_stats: dict[str, object],
+    meta_bench_evaluation: dict[str, object] | None,
     print_response: bool,
     show_preview: bool,
     summary_file: Path,
 ) -> None:
-    """打印单次运行摘要。"""
     print("\n" + "=" * 60)
     print("Correction Statistics")
     print("=" * 60)
@@ -298,9 +384,9 @@ def _print_run_summary(
     print(f"  Total tokens:      {llm_stats['total_tokens']:,}")
     print(f"  Request count:     {llm_stats['request_count']}")
 
-    if benchmark_evaluation is not None:
-        print("\nBenchmark Evaluation:")
-        print(json.dumps(benchmark_evaluation, ensure_ascii=False, indent=2))
+    if meta_bench_evaluation is not None:
+        print("\nMetaBench Evaluation:")
+        print(json.dumps(meta_bench_evaluation, ensure_ascii=False, indent=2))
 
     if print_response:
         print("\n" + "=" * 60)
@@ -318,15 +404,13 @@ def _print_run_summary(
 
 def _run_single_task(
     task_name: str,
-    runtime_settings: Dict[str, str | None],
+    runtime_settings: dict[str, str | None],
     *,
     output_dir: Path,
     memory_dir: Path,
     print_response: bool,
     show_preview: bool,
-) -> Dict[str, object]:
-    """运行单个任务。"""
-    from src.memory.bm25_similarity import BM25SimilarityService
+) -> dict[str, object]:
     from src.orchestrator_v2 import SelfCorrectingOrchestrator
     from src.utils.llm_client import LLMClient
 
@@ -355,12 +439,15 @@ def _run_single_task(
     )
     similarity_service = BM25SimilarityService()
 
+    corpus_dir_value = config.get("corpus_dir")
+    corpus_dir = str(corpus_dir_value) if isinstance(corpus_dir_value, str) else "./data_sample/med_papers"
     orchestrator = SelfCorrectingOrchestrator(
         client,
         memory_path=str(memory_dir),
         session_name=session_name,
         output_dir=str(output_dir),
         similarity_service=similarity_service,
+        corpus_dir=corpus_dir,
     )
 
     final_text, _decisions, correction_log = orchestrator.generate_with_self_correction(
@@ -380,6 +467,14 @@ def _run_single_task(
     text_file = output_dir / f"{session_name}_text.txt"
     text_file.write_text(final_text, encoding="utf-8")
 
+    task_input_snapshot = _build_task_input_snapshot(
+        task_name=task_name,
+        config=config,
+        session_name=session_name,
+    )
+    task_input_file = output_dir / f"{session_name}_task_input.json"
+    _write_json(task_input_file, task_input_snapshot)
+
     correction_log_file = output_dir / f"{session_name}_correction_log.json"
     correction_log.save(str(correction_log_file))
 
@@ -391,35 +486,57 @@ def _run_single_task(
 
     orchestrator.dtg.save_to_disk(session_name)
     session_file = memory_dir / f"{session_name}.json"
+    run_log_file = output_dir / f"{session_name}_run.log"
+    citation_manifest_file: Path | None = None
+    chunk_map_file: Path | None = None
 
     run_status = "completed" if correction_stats["total_failures"] == 0 else "degraded"
 
-    benchmark_evaluation: Dict[str, object] | None = None
-    benchmark_eval_file: Path | None = None
+    meta_bench_evaluation: dict[str, object] | None = None
+    meta_bench_eval_file: Path | None = None
     reference = config.get("reference")
-    if isinstance(reference, (dict, str)):
+    if isinstance(reference, dict):
+        runtime_reference = dict(reference)
+        chunk_map = list(orchestrator.last_chunk_map)
+        citation_manifest = list(orchestrator.last_citation_manifest)
+        runtime_reference["chunk_map"] = chunk_map
+        runtime_reference["citation_manifest"] = citation_manifest
+
+        chunk_map_file = output_dir / f"{session_name}_chunk_map.json"
+        _write_json(chunk_map_file, chunk_map)
+
+        citation_manifest_file = output_dir / f"{session_name}_citation_manifest.json"
+        _write_json(citation_manifest_file, citation_manifest)
+
         if run_status == "completed":
-            benchmark_evaluation = evaluate_output(final_text, reference)
+            meta_bench_evaluation = evaluate_meta_bench(final_text, runtime_reference)
         else:
-            benchmark_evaluation = {
+            meta_bench_evaluation = {
                 "status": "skipped",
                 "reason": "generation_degraded",
                 "details": {
                     "total_failures": correction_stats["total_failures"],
-                    "message": "One or more sections failed generation, so degraded sections are excluded from formal benchmark scoring.",
+                    "message": "One or more sections failed generation, so degraded sections are excluded from formal MetaBench scoring.",
                 },
             }
-        benchmark_eval_file = output_dir / f"{session_name}_benchmark_eval.json"
-        _write_json(benchmark_eval_file, benchmark_evaluation)
+        meta_bench_eval_file = output_dir / f"{session_name}_meta_bench_eval.json"
+        _write_json(meta_bench_eval_file, meta_bench_evaluation)
 
     artifacts = {
+        "task_input_file": str(task_input_file),
         "text_file": str(text_file),
         "correction_log_file": str(correction_log_file),
         "dtg_file": str(dtg_file),
         "session_file": str(session_file),
     }
-    if benchmark_eval_file is not None:
-        artifacts["benchmark_eval_file"] = str(benchmark_eval_file)
+    if run_log_file.exists():
+        artifacts["run_log_file"] = str(run_log_file)
+    if meta_bench_eval_file is not None:
+        artifacts["meta_bench_eval_file"] = str(meta_bench_eval_file)
+    if citation_manifest_file is not None:
+        artifacts["citation_manifest_file"] = str(citation_manifest_file)
+    if chunk_map_file is not None:
+        artifacts["chunk_map_file"] = str(chunk_map_file)
 
     summary_file = output_dir / f"{session_name}_summary.json"
     artifacts["summary_file"] = str(summary_file)
@@ -435,9 +552,27 @@ def _run_single_task(
         metric_summary=metric_summary,
         llm_stats=llm_stats,
         artifacts=artifacts,
-        benchmark_evaluation=benchmark_evaluation,
+        meta_bench_evaluation=meta_bench_evaluation,
     )
     _write_json(summary_file, result)
+
+    bundle_dir = _write_run_bundle(
+        output_dir=output_dir,
+        session_name=session_name,
+        task_input_file=task_input_file,
+        text_file=text_file,
+        correction_log_file=correction_log_file,
+        dtg_file=dtg_file,
+        summary_file=summary_file,
+        session_file=session_file,
+        run_log_file=run_log_file if run_log_file.exists() else None,
+        meta_bench_eval_file=meta_bench_eval_file,
+        citation_manifest_file=citation_manifest_file,
+        chunk_map_file=chunk_map_file,
+    )
+    result["artifacts"]["bundle_dir"] = str(bundle_dir)
+    _write_json(summary_file, result)
+    _write_json(bundle_dir / "summary.json", result)
 
     _print_run_summary(
         task_name=task_name,
@@ -446,7 +581,7 @@ def _run_single_task(
         dtg_stats=dtg_stats,
         metric_summary=metric_summary,
         llm_stats=llm_stats,
-        benchmark_evaluation=benchmark_evaluation,
+        meta_bench_evaluation=meta_bench_evaluation,
         print_response=print_response,
         show_preview=show_preview,
         summary_file=summary_file,
@@ -455,52 +590,46 @@ def _run_single_task(
     return result
 
 
-def _build_batch_summary(results: List[Dict[str, object]]) -> Dict[str, object]:
-    """构造批量 benchmark 运行汇总。"""
+def _build_batch_summary(results: list[dict[str, object]]) -> dict[str, object]:
     success_results = [item for item in results if str(item.get("status")) == "completed"]
     degraded_results = [item for item in results if str(item.get("status")) == "degraded"]
     failed_results = [item for item in results if str(item.get("status")) == "failed"]
 
-    benchmark_eval_results = []
+    evaluations: list[dict[str, object]] = []
     for item in success_results:
-        evaluation = item.get("benchmark_evaluation")
-        if isinstance(evaluation, dict):
-            if str(evaluation.get("status")) == "skipped":
-                continue
-            benchmark_eval_results.append(evaluation)
+        evaluation = item.get("meta_bench_evaluation")
+        if isinstance(evaluation, dict) and str(evaluation.get("status")) != "skipped":
+            evaluations.append(evaluation)
 
-    average_scores: Dict[str, float] = {}
-    if benchmark_eval_results:
-        average_scores = {
-            "constraint_violation_rate": round(
-                sum(float(item["constraint_violation_rate"]) for item in benchmark_eval_results)
-                / len(benchmark_eval_results),
-                4,
-            ),
-            "entity_consistency_score": round(
-                sum(float(item["entity_consistency_score"]) for item in benchmark_eval_results)
-                / len(benchmark_eval_results),
-                4,
-            ),
-            "logical_coherence": round(
-                sum(float(item["logical_coherence"]) for item in benchmark_eval_results)
-                / len(benchmark_eval_results),
-                4,
-            ),
-        }
+    average_metric_scores: dict[str, float] = {}
+
+    if evaluations:
+        for metric_name in META_BENCH_METRIC_ORDER:
+            metric_values: list[float] = []
+            for evaluation in evaluations:
+                metric_scores = evaluation.get("metric_scores", {})
+                if not isinstance(metric_scores, dict):
+                    continue
+                raw_value = metric_scores.get(metric_name)
+                if isinstance(raw_value, (int, float)):
+                    metric_values.append(float(raw_value))
+            if metric_values:
+                average_metric_scores[metric_name] = round(
+                    sum(metric_values) / len(metric_values),
+                    4,
+                )
 
     return {
         "task_count": len(results),
         "success_count": len(success_results),
         "degraded_count": len(degraded_results),
         "failure_count": len(failed_results),
-        "average_benchmark_scores": average_scores,
+        "average_metric_scores": average_metric_scores,
         "results": results,
     }
 
 
 def main() -> None:
-    """程序主入口。"""
     args = _parse_args()
 
     if args.list_tasks:
@@ -523,7 +652,7 @@ def main() -> None:
     memory_dir = Path("./sessions")
     is_batch_mode = len(task_names) > 1
 
-    batch_results: List[Dict[str, object]] = []
+    batch_results: list[dict[str, object]] = []
     batch_failed = False
 
     for task_name in task_names:
@@ -538,15 +667,15 @@ def main() -> None:
             )
             batch_results.append(run_result)
             if is_batch_mode:
-                result_task_id = run_result.get("benchmark_task_id", task_name)
+                task_label = run_result.get("task_id", task_name)
                 summary_file = run_result["artifacts"]["summary_file"]
-                print(f"\n[OK] {result_task_id} -> {summary_file}")
+                print(f"\n[OK] {task_label} -> {summary_file}")
         except Exception:
             batch_failed = True
             error_result = {
                 "status": "failed",
                 "task_name": task_name,
-                "benchmark_task_id": _extract_benchmark_task_id(task_name),
+                "task_id": _task_id_for_name(task_name),
                 "error": traceback.format_exc().splitlines()[-1] if traceback.format_exc() else "unknown error",
                 "traceback": traceback.format_exc(),
             }
@@ -558,21 +687,20 @@ def main() -> None:
 
     if is_batch_mode:
         batch_summary = _build_batch_summary(batch_results)
-        batch_summary_file = output_dir / "metabench_batch_summary.json"
+        batch_summary_file = output_dir / "meta_bench_batch_summary.json"
         _write_json(batch_summary_file, batch_summary)
 
         print("\n" + "=" * 60)
-        print("Benchmark Batch Run Complete")
+        print("MetaBench Batch Run Complete")
         print("=" * 60)
         print(f"Total tasks: {batch_summary['task_count']}")
         print(f"Completed:   {batch_summary['success_count']}")
         print(f"Degraded:    {batch_summary['degraded_count']}")
         print(f"Failed:      {batch_summary['failure_count']}")
-        average_scores = batch_summary["average_benchmark_scores"]
-        if average_scores:
-            print(f"Average ECS: {average_scores['entity_consistency_score']}")
-            print(f"Average LC:  {average_scores['logical_coherence']}")
-            print(f"Average CVR: {average_scores['constraint_violation_rate']}")
+        if batch_summary["average_metric_scores"]:
+            print("Average metric scores:")
+            for metric_name, score in batch_summary["average_metric_scores"].items():
+                print(f"  {metric_name}: {score}")
         print(f"\nBatch summary: {batch_summary_file}")
 
         if batch_failed:

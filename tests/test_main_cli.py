@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import argparse
+import tempfile
 import unittest
+from pathlib import Path
 
 import main
 
@@ -22,49 +24,56 @@ class MainCliTests(unittest.TestCase):
             print_response=False,
         )
 
-    def test_resolve_default_tasks_runs_full_benchmark_batch(self) -> None:
+    def test_resolve_default_tasks_runs_first_registered_meta_bench_task(self) -> None:
         args = self._make_args()
         self.assertEqual(
             main._resolve_requested_task_names(args),
-            [
-                f"{main.BENCHMARK_TASK_PREFIX}{task_id}"
-                for task_id in main.list_benchmark_task_ids()
-            ],
+            [main.META_BENCH_TASK_NAMES[0]],
         )
 
-    def test_resolve_single_benchmark_task_id(self) -> None:
-        args = self._make_args(task_id="med_s010")
+    def test_resolve_single_task_id(self) -> None:
+        args = self._make_args(task_id="med_s001")
         self.assertEqual(
             main._resolve_requested_task_names(args),
-            [f"{main.BENCHMARK_TASK_PREFIX}med_s010"],
+            ["metabench_sample"],
         )
 
-    def test_resolve_all_benchmark_tasks(self) -> None:
+    def test_resolve_all_meta_bench_tasks(self) -> None:
         args = self._make_args(all_tasks=True)
         resolved = main._resolve_requested_task_names(args)
-        expected = [
-            f"{main.BENCHMARK_TASK_PREFIX}{task_id}"
-            for task_id in main.list_benchmark_task_ids()
-        ]
-        self.assertEqual(resolved, expected)
+        self.assertEqual(resolved, main.META_BENCH_TASK_NAMES)
 
     def test_build_batch_summary(self) -> None:
         summary = main._build_batch_summary(
             [
                 {
                     "status": "completed",
-                    "benchmark_evaluation": {
-                        "constraint_violation_rate": 0.1,
-                        "entity_consistency_score": 0.8,
-                        "logical_coherence": 0.9,
+                    "meta_bench_evaluation": {
+                        "metric_scores": {
+                            "entity_consistency_score": 0.9,
+                            "proxy_hit_rate": 0.6,
+                            "length_score": 0.8,
+                            "completion_rate": 0.9,
+                            "source_fidelity": 0.7,
+                            "section_distribution": 0.8,
+                            "citation_count": 0.85,
+                            "source_balance": 0.85,
+                        },
                     },
                 },
                 {
                     "status": "completed",
-                    "benchmark_evaluation": {
-                        "constraint_violation_rate": 0.3,
-                        "entity_consistency_score": 0.6,
-                        "logical_coherence": 0.7,
+                    "meta_bench_evaluation": {
+                        "metric_scores": {
+                            "entity_consistency_score": 0.7,
+                            "proxy_hit_rate": 0.3,
+                            "length_score": 0.7,
+                            "completion_rate": 0.7,
+                            "source_fidelity": 0.5,
+                            "section_distribution": 0.6,
+                            "citation_count": 0.65,
+                            "source_balance": 0.65,
+                        },
                     },
                 },
                 {
@@ -78,13 +87,74 @@ class MainCliTests(unittest.TestCase):
         self.assertEqual(summary["success_count"], 2)
         self.assertEqual(summary["failure_count"], 1)
         self.assertEqual(
-            summary["average_benchmark_scores"],
-            {
-                "constraint_violation_rate": 0.2,
-                "entity_consistency_score": 0.7,
-                "logical_coherence": 0.8,
-            },
+            summary["average_metric_scores"]["entity_consistency_score"],
+            0.8,
         )
+        self.assertEqual(
+            summary["average_metric_scores"]["proxy_hit_rate"],
+            0.45,
+        )
+
+    def test_write_run_bundle_copies_expected_files(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            output_dir = root / "outputs"
+            session_dir = root / "sessions"
+            output_dir.mkdir()
+            session_dir.mkdir()
+
+            task_input_file = output_dir / "demo_task_input.json"
+            text_file = output_dir / "demo_text.txt"
+            correction_log_file = output_dir / "demo_correction_log.json"
+            dtg_file = output_dir / "demo_dtg.json"
+            summary_file = output_dir / "demo_summary.json"
+            run_log_file = output_dir / "demo_run.log"
+            eval_file = output_dir / "demo_meta_bench_eval.json"
+            citation_manifest_file = output_dir / "demo_citation_manifest.json"
+            chunk_map_file = output_dir / "demo_chunk_map.json"
+            session_file = session_dir / "demo.json"
+
+            for path in (
+                task_input_file,
+                text_file,
+                correction_log_file,
+                dtg_file,
+                summary_file,
+                run_log_file,
+                eval_file,
+                citation_manifest_file,
+                chunk_map_file,
+                session_file,
+            ):
+                path.write_text("{}", encoding="utf-8")
+
+            bundle_dir = main._write_run_bundle(
+                output_dir=output_dir,
+                session_name="demo",
+                task_input_file=task_input_file,
+                text_file=text_file,
+                correction_log_file=correction_log_file,
+                dtg_file=dtg_file,
+                summary_file=summary_file,
+                session_file=session_file,
+                run_log_file=run_log_file,
+                meta_bench_eval_file=eval_file,
+                citation_manifest_file=citation_manifest_file,
+                chunk_map_file=chunk_map_file,
+            )
+
+            self.assertTrue((bundle_dir / "task_input.json").exists())
+            self.assertTrue((bundle_dir / "text.txt").exists())
+            self.assertTrue((bundle_dir / "correction_log.json").exists())
+            self.assertTrue((bundle_dir / "dtg.json").exists())
+            self.assertTrue((bundle_dir / "summary.json").exists())
+            self.assertTrue((bundle_dir / "session.json").exists())
+            self.assertTrue((bundle_dir / "run.log").exists())
+            self.assertTrue((bundle_dir / "meta_bench_eval.json").exists())
+            self.assertTrue((bundle_dir / "citation_manifest.json").exists())
+            self.assertTrue((bundle_dir / "chunk_map.json").exists())
+            self.assertTrue((bundle_dir / "artifact_manifest.json").exists())
+
 
 if __name__ == "__main__":
     unittest.main()

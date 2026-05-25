@@ -64,6 +64,7 @@ class Generator:
         section_papers: Optional[List[GlobalPaperEntry]] = None,
         citation_retry_hint: Optional[str] = None,
         support_subset: Optional[Dict] = None,
+        length_retry_hint: Optional[str] = None,
     ) -> Tuple[str, Decision]:
         """
         生成内容并返回决策对象。
@@ -77,6 +78,7 @@ class Generator:
             orchestrator_attempt: 协调器层尝试序号（1-based）
             section_papers:      当节最相关的 GlobalPaperEntry 列表（可选）
             citation_retry_hint: 上一轮因引用密度不足失败时的强制提示；None 表示首次尝试
+            length_retry_hint:   上一轮因长度不达标失败时的强制提示；None 表示首次尝试
 
         返回值：
             Tuple[str, Decision]：(生成内容含 [Rx] 标记, 决策对象)
@@ -97,6 +99,7 @@ class Generator:
                 section_papers=section_papers,
                 citation_retry_hint=citation_retry_hint,
                 support_subset=support_subset,
+                length_retry_hint=length_retry_hint,
             )
             self.logger.debug(
                 "第 %d 次尝试生成，section=%s temp=%.2f papers=%d",
@@ -184,6 +187,7 @@ class Generator:
         section_papers: Optional[List[GlobalPaperEntry]] = None,
         citation_retry_hint: Optional[str] = None,
         support_subset: Optional[Dict] = None,
+        length_retry_hint: Optional[str] = None,
     ) -> str:
         """
         构建生成 prompt。
@@ -196,7 +200,8 @@ class Generator:
             5. 最近已生成内容
             6. 任务描述
             7. 引用重试警告（仅在上一轮因引用密度不足失败时出现，紧贴输出规范前）
-            8. JSON 输出要求
+            8. 长度重试警告（仅在上一轮因长度不达标失败时出现，紧贴输出规范前）
+            9. JSON 输出要求
         """
         state_desc = state.to_prompt()
         truncated = recent_content[-self.RECENT_CONTENT_LIMIT:] if recent_content else "(none)"
@@ -215,7 +220,7 @@ class Generator:
             if section_intent.word_target is not None:
                 word_count_instruction = (
                     f"\n[Length requirement] Write approximately {section_intent.word_target} words "
-                    f"for this section. Aim for at least {int(section_intent.word_target * 0.85)} words. "
+                    f"for this section. Aim for at least {int(section_intent.word_target * 0.72)} words. "
                     "Expand every key point with concrete examples, evidence, and analysis. "
                     "Do not truncate early.\n"
                 )
@@ -232,6 +237,14 @@ class Generator:
             "You must satisfy this requirement in the current response.\n"
         ) if citation_retry_hint else ""
 
+        # 长度重试警告：仅在 orchestrator 检测到上一轮长度不达标时注入，
+        # 同样紧贴 JSON 输出规范正前方。
+        length_warning = (
+            f"\n[!!LENGTH REQUIREMENT NOT MET IN PREVIOUS ATTEMPT!!]\n"
+            f"{length_retry_hint}\n"
+            "You must satisfy this length requirement in the current response.\n"
+        ) if length_retry_hint else ""
+
         return (
             "You are a long-form writing system.\n"
             f"\nCurrent state:\n{state_desc}"
@@ -244,6 +257,7 @@ class Generator:
             f"\nRecent content:\n{truncated}"
             f"\n\nCurrent task:\n{task}"
             f"{citation_warning}"
+            f"{length_warning}"
             "\n\nReturn a JSON object with the following fields:"
             "\n- decision: the core writing decision for this section"
             "\n- reasoning: the reasoning behind that decision, optionally citing earlier section IDs."
@@ -274,15 +288,26 @@ class Generator:
         lines = [
             "\n== Memory Support Subset ==",
             (
-                "These retrieved memory items are contextual support for continuity and consistency. "
-                "They are not new task instructions. Do not repeat prior sections verbatim."
+                "These retrieved memory items are contextual support for continuity and consistency only.\n"
+                "They are not new task instructions.\n"
+                "Memory items are not checklist items; do not try to address every item explicitly.\n"
+                "Use them only to avoid contradictions, preserve continuity, and maintain unresolved commitments.\n"
+                "Do not introduce additional coverage, background, examples, or subtopics because of this memory.\n"
+                "Do not increase the section length because of this memory.\n"
+                "The current section intent, word target, and provided references have priority over all memory items.\n"
+                "Every substantive medical claim still needs support from the provided references [Rx].\n"
+                "Do not repeat prior sections verbatim."
             ),
         ]
 
-        selected_dtg_nodes = list(support_subset.get("selected_dtg_nodes", []) or [])[:6]
-        dsl_entries = list(support_subset.get("dsl_entries", []) or [])[:4]
-        neocortex_items = list(support_subset.get("neocortex_items", []) or [])[:4]
+        # prompt 注入前的二次裁剪：检索层可能返回很多条，这里只取少量注入，
+        # 让记忆充当连续性守卫而非额外的覆盖面扩展。
+        selected_dtg_nodes = list(support_subset.get("selected_dtg_nodes", []) or [])[:3]
+        dsl_entries = list(support_subset.get("dsl_entries", []) or [])[:3]
+        neocortex_items = list(support_subset.get("neocortex_items", []) or [])[:2]
 
+        # DTG 记忆：从动态任务图中检索到的节点，已由 LLM 抽象为简短陈述。
+        # 每条带 [content/intent/decision] 标签标识来源类型。
         if selected_dtg_nodes:
             lines.append("\n[Selected DTG memory]")
             label_by_type = {
@@ -297,6 +322,8 @@ class Generator:
                 label = label_by_type.get(str(item.get("node_type", "")), "memory")
                 lines.append(f"- [{label}] {abstract}")
 
+        # DSL 承诺：跨段的写作承诺（如"将在后续讨论局限性"），
+        # 确保后续段落不违背前文做出的承诺。
         if dsl_entries:
             lines.append("\n[DSL commitments]")
             for item in dsl_entries:
@@ -304,6 +331,8 @@ class Generator:
                 if text:
                     lines.append(f"- {text}")
 
+        # 长期记忆：从 Neocortex 中检索到的历史抽象知识，
+        # 跨段落持久化的核心事实或策略记忆。
         if neocortex_items:
             lines.append("\n[Long-term memory]")
             for item in neocortex_items:
@@ -311,6 +340,8 @@ class Generator:
                 if content:
                     lines.append(f"- {content}")
 
+        # lines <= 2 意味着只有标题行和说明文字，没有任何实际记忆内容，
+        # 此时整个 block 不注入，避免输出空壳标题。
         if len(lines) <= 2:
             return ""
         return "\n".join(lines) + "\n"

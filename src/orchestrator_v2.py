@@ -78,7 +78,7 @@ class SelfCorrectingOrchestrator:
         session_name: str = "session",
         output_dir: str = "./outputs",
         similarity_service=None,
-        corpus_dir: str = "./metabench/output",
+        corpus_dir: str = "./data_sample/med_papers",
     ):
         """
         初始化自我修正协调器
@@ -92,7 +92,7 @@ class SelfCorrectingOrchestrator:
             memory_path: DTG 存储路径
             session_name: 会话名称
             output_dir: 输出目录（运行日志和相关工件的统一落盘位置）
-            corpus_dir: 论文数据集目录（metabench/output/*.md）
+            corpus_dir: 论文数据集目录（Markdown paper corpus）
         """
         self.llm_client       = llm_client
         self.dtg              = DTGStore(memory_path, session_name=session_name)
@@ -136,6 +136,8 @@ class SelfCorrectingOrchestrator:
         self._corpus = CorpusLoader(corpus_dir)
         self.retriever = HyDERetriever(self._corpus, llm_client=llm_client)
         self.retriever.attach_run_logger(self.run_logger)
+        self.last_chunk_map: List[Dict[str, Any]] = []
+        self.last_citation_manifest: List[Dict[str, Any]] = []
 
     # ------------------------------------------------------------------
     # 主入口
@@ -279,6 +281,7 @@ class SelfCorrectingOrchestrator:
                 decision: Optional[Decision] = None
                 last_failure_reason: Optional[str] = None
                 citation_retry_hint: Optional[str] = None  # 每节重置；引用失败后由验证路径填充
+                length_retry_hint: Optional[str] = None    # 每节重置；长度验证失败后由验证路径填充
 
                 for attempt in range(self.MAX_RETRIES_PER_SECTION):
                     # 第二阶段：生成
@@ -295,6 +298,7 @@ class SelfCorrectingOrchestrator:
                             section_papers=section_papers,
                             citation_retry_hint=citation_retry_hint,
                             support_subset=support_subset,
+                            length_retry_hint=length_retry_hint,
                         )
                     except Exception as e:
                         self.logger.error("生成异常（section=%s attempt=%d）: %s", section_id, attempt + 1, e)
@@ -453,6 +457,50 @@ class SelfCorrectingOrchestrator:
                                 section_id,
                             )
 
+                    # 长度失败检测：从 format issue 中提取 actual/target 词数，构建 length_retry_hint。
+                    # 目的：让下轮生成明确知道上次的实际词数与目标的差距。
+                    length_format_issues = [
+                        i for i in (report.issues if report else [])
+                        if i.type == "format" and "actual=" in i.description
+                    ]
+                    if length_format_issues:
+                        _m_actual = re.search(r'actual=(\d+)', length_format_issues[0].description)
+                        _m_target = re.search(r'target=(\d+)', length_format_issues[0].description)
+                        if _m_actual and _m_target:
+                            _actual = int(_m_actual.group(1))
+                            _target = int(_m_target.group(1))
+                            if _actual < _target:
+                                if _actual < int(_target * 0.35):
+                                    length_retry_hint = (
+                                        f"Previous attempt was severely under-generated: "
+                                        f"only {_actual} words against a target of {_target} words. "
+                                        f"You MUST write approximately {_target} words. "
+                                        "Every paragraph must be fully developed with citations, "
+                                        "evidence, and in-depth analysis. Do not truncate early."
+                                    )
+                                else:
+                                    length_retry_hint = (
+                                        f"Previous attempt was too short: {_actual} words "
+                                        f"against a target of {_target} words. "
+                                        f"Write approximately {_target} words. "
+                                        "Expand every key point with concrete evidence, "
+                                        "analysis, and examples. Do not truncate early."
+                                    )
+                            else:
+                                length_retry_hint = (
+                                    f"Previous attempt was too long: {_actual} words "
+                                    f"against a target of {_target} words. "
+                                    f"Condense to approximately {_target} words. "
+                                    "Cut redundant phrasing and repetition while "
+                                    "preserving all key arguments and evidence."
+                                )
+                            self.logger.info(
+                                "length_retry_hint set for next attempt: section=%s actual=%d target=%d",
+                                section_id, _actual, _target,
+                            )
+                    else:
+                        length_retry_hint = None
+
                     # 执行修复
                     if not _citation_only_failure and diagnosis.repair_scope == "partial_rollback":
                         # 回退策略：需要 MetaState 门控
@@ -593,6 +641,11 @@ class SelfCorrectingOrchestrator:
                         current_idx += 1
 
             # 组装最终文本（含引用重编号和参考文献列表）
+            self.last_chunk_map = self._build_chunk_map(outline, generated_content)
+            self.last_citation_manifest = self._build_citation_manifest(
+                generated_content=generated_content,
+                global_index=global_index,
+            )
             final_text = self._post_process_references_v2(
                 outline, generated_content, global_index
             )
@@ -724,7 +777,7 @@ class SelfCorrectingOrchestrator:
         )
         if injectable:
             state.dsl_injection = "\n".join(
-                f"- [{e.commitment_type.value}/{e.constraint_type.value}] {e.content}"
+                f"- {{{e.commitment_type.value}|{e.constraint_type.value}}} {e.content}"
                 for e in injectable
             )
         else:
@@ -1364,6 +1417,141 @@ Annotated text:"""
             counter,
         )
         return assembled
+
+    def _build_chunk_map(
+        self,
+        outline: Dict[str, str],
+        generated_content: Dict[str, str],
+    ) -> List[Dict[str, Any]]:
+        chunk_map: List[Dict[str, Any]] = []
+        total_sections = len(outline)
+        for section_index, (section_id, title) in enumerate(outline.items(), start=1):
+            text = generated_content.get(section_id, "").strip()
+            if section_index == 1:
+                section_key = "introduction"
+            elif section_index == total_sections:
+                section_key = "conclusion"
+            else:
+                section_key = "main_body"
+            chunk_map.append(
+                {
+                    "chunk_id": section_id,
+                    "section_id": section_id,
+                    "title": title,
+                    "text": text,
+                    "word_count": len(text.split()),
+                    "section_index": section_index,
+                    "section_key": section_key,
+                }
+            )
+        return chunk_map
+
+    def _build_citation_manifest(
+        self,
+        *,
+        generated_content: Dict[str, str],
+        global_index: GlobalPaperIndex,
+    ) -> List[Dict[str, Any]]:
+        if global_index.is_empty():
+            return []
+
+        manifest: List[Dict[str, Any]] = []
+        citation_id = 1
+        for section_id, content in generated_content.items():
+            for sentence_text, r_index in self._extract_citation_events(content):
+                entry = global_index.get_by_r(r_index)
+                if entry is None:
+                    continue
+                manifest.append(
+                    {
+                        "citation_id": f"C{citation_id:04d}",
+                        "chunk_id": section_id,
+                        "section_id": section_id,
+                        "source_id": entry.paper_id,
+                        "source_type": self._infer_source_type(entry),
+                        "claim_role": self._infer_claim_role(section_id, sentence_text),
+                        "claim_span": sentence_text,
+                        "source_excerpt": (entry.abstract or entry.top_chunk_text or "")[:1200],
+                        "r_index": entry.r_index,
+                        "title": entry.title,
+                        "doi": entry.doi,
+                    }
+                )
+                citation_id += 1
+        return manifest
+
+    @staticmethod
+    def _extract_citation_events(content: str) -> List[Tuple[str, int]]:
+        events: List[Tuple[str, int]] = []
+        if not content.strip():
+            return events
+
+        sentence_pattern = re.compile(
+            r"[^.!?]+[.!?]+(?:\s*\[R\d+\])+|[^.!?]+(?:\s*\[R\d+\])+"
+        )
+        for match in sentence_pattern.finditer(content):
+            sentence = match.group(0).strip()
+            markers = re.findall(r"\[R(\d+)\]", sentence)
+            if not markers:
+                continue
+            clean_sentence = re.sub(r"\s*\[R\d+\]", "", sentence).strip()
+            if not clean_sentence:
+                continue
+            for marker in markers:
+                events.append((clean_sentence, int(marker)))
+        return events
+
+    @staticmethod
+    def _infer_claim_role(section_id: str, sentence_text: str) -> str:
+        section_key = section_id.casefold()
+        text = sentence_text.casefold()
+        if section_key == "sec1":
+            if any(term in text for term in ("define", "defined", "refers to", "characterized")):
+                return "definition"
+            return "background"
+        if section_key == "sec2":
+            return "comparison"
+        if section_key == "sec3":
+            return "mechanism"
+        if section_key == "sec4":
+            return "evidence_synthesis"
+        if section_key == "sec5":
+            if any(term in text for term in ("should", "recommend", "must", "clinical practice")):
+                return "practice"
+            return "interpretation"
+        if section_key in {"sec6", "sec7"}:
+            return "gap"
+        if any(term in text for term in ("should", "recommend", "must")):
+            return "recommendation"
+        if any(term in text for term in ("compare", "compared", "higher", "lower", "versus")):
+            return "comparison"
+        if any(term in text for term in ("mechanism", "pathophysiology", "plaque", "thrombus")):
+            return "mechanism"
+        return "background"
+
+    @staticmethod
+    def _infer_source_type(entry: GlobalPaperEntry) -> str:
+        text = f"{entry.title}\n{entry.abstract}\n{entry.top_chunk_text}".casefold()
+        source_type_terms = (
+            ("meta_analysis", ("meta-analysis", "meta analysis")),
+            ("systematic_review", ("systematic review",)),
+            ("guideline", ("guideline", "guidelines", "consensus statement")),
+            ("rct", ("randomized", "randomised", "placebo-controlled")),
+            ("trial", ("trial", "trials")),
+            ("prospective", ("prospective",)),
+            ("cohort", ("cohort",)),
+            ("retrospective", ("retrospective",)),
+            ("case_control", ("case-control", "case control")),
+            ("observational", ("observational", "registry")),
+            ("mechanistic", ("mechanistic", "molecular", "pathway")),
+            ("animal", ("animal model", "murine", "mouse", "rat model")),
+            ("in_vitro", ("in vitro", "cell line")),
+            ("narrative", ("narrative review",)),
+        )
+        for source_type, terms in source_type_terms:
+            if any(term in text for term in terms):
+                return source_type
+        return "observational"
 
     def _assemble_text(
         self,
