@@ -1,0 +1,86 @@
+{
+  "source_corpus_dir": "C:\\Users\\asd\\OneDrive\\Desktop\\medical_reviews_300_ready",
+  "article_count": 300,
+  "mapped_article_count": 300,
+  "slot_order": [
+    "scope_context",
+    "framework_mechanism",
+    "evidence_methods",
+    "findings_synthesis",
+    "implications_discussion",
+    "limitations_future"
+  ],
+  "normalized_mean_shares": {
+    "scope_context": 0.104583,
+    "framework_mechanism": 0.177108,
+    "evidence_methods": 0.21642,
+    "findings_synthesis": 0.231115,
+    "implications_discussion": 0.186467,
+    "limitations_future": 0.084308
+  },
+  "slot_stats": {
+    "scope_context": {
+      "mean_share": 0.104583,
+      "median_share": 0.076137,
+      "p25_share": 0.050133,
+      "p75_share": 0.130676,
+      "mean_words": 145.09,
+      "median_words": 131.0,
+      "articles_with_content": 300
+    },
+    "framework_mechanism": {
+      "mean_share": 0.177108,
+      "median_share": 0.186385,
+      "p25_share": 0.168922,
+      "p75_share": 0.197113,
+      "mean_words": 353.8,
+      "median_words": 327.42,
+      "articles_with_content": 300
+    },
+    "evidence_methods": {
+      "mean_share": 0.21642,
+      "median_share": 0.22653,
+      "p25_share": 0.204467,
+      "p75_share": 0.23875,
+      "mean_words": 431.28,
+      "median_words": 398.67,
+      "articles_with_content": 300
+    },
+    "findings_synthesis": {
+      "mean_share": 0.231115,
+      "median_share": 0.242936,
+      "p25_share": 0.218471,
+      "p75_share": 0.258347,
+      "mean_words": 460.22,
+      "median_words": 429.18,
+      "articles_with_content": 300
+    },
+    "implications_discussion": {
+      "mean_share": 0.186467,
+      "median_share": 0.195041,
+      "p25_share": 0.175792,
+      "p75_share": 0.208443,
+      "mean_words": 371.49,
+      "median_words": 346.0,
+      "articles_with_content": 300
+    },
+    "limitations_future": {
+      "mean_share": 0.084308,
+      "median_share": 0.062632,
+      "p25_share": 0.040355,
+      "p75_share": 0.104302,
+      "mean_words": 120.89,
+      "median_words": 106.0,
+      "articles_with_content": 300
+    }
+  },
+  "method": {
+    "unit": "per-article normalized body-word share",
+    "aggregation": "mean share across mapped articles, then renormalized to sum to 1.0",
+    "notes": [
+      "Each article is first reduced with the same deterministic introduction/main_body/conclusion parser used elsewhere in MetaBench.",
+      "The introduction and conclusion map directly to slots 1 and 6.",
+      "Paragraphs inside the parsed main_body are softly distributed across the four middle slots using relative position plus light lexical cues, yielding a corpus-linked six-slot prior without an LLM."
+    ]
+  }
+}

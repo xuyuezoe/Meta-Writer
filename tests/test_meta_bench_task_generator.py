@@ -1,5 +1,8 @@
 import unittest
+from unittest.mock import patch
 
+from meta_bench.schemas import TaskSpec
+from meta_bench.section_budget import build_section_budget
 from meta_bench.task_generator import (
     build_generation_constraints,
     build_main_task_config,
@@ -8,7 +11,6 @@ from meta_bench.task_generator import (
     generate_proxy_questions,
     generate_review_task,
 )
-from meta_bench.schemas import TaskSpec
 
 
 class TaskGeneratorTests(unittest.TestCase):
@@ -72,7 +74,12 @@ class TaskGeneratorTests(unittest.TestCase):
 
         self.assertIsInstance(constraints, list)
         self.assertTrue(all(isinstance(item, str) for item in constraints))
-        self.assertTrue(any("4200 words overall, excluding the final references list" in item for item in constraints))
+        self.assertTrue(
+            any(
+                "4200 words overall, excluding the final references list" in item
+                for item in constraints
+            )
+        )
 
     def test_build_main_task_config_matches_main_runtime_shape(self):
         config = build_main_task_config(self.spec)
@@ -158,17 +165,84 @@ class TaskGeneratorTests(unittest.TestCase):
         reference_constraints = config["reference"]["constraints"]
         self.assertEqual(config["outline"], outline_override)
         self.assertEqual(config["reference"]["outline"], outline_override)
+        self.assertEqual(reference_constraints["section_roles"]["sec2"], "evidence_synthesis")
         self.assertEqual(reference_constraints["section_roles"]["sec5"], "discussion")
         self.assertEqual(
             reference_constraints["required_sections"],
             ["introduction", "main_body", "limitations_gaps"],
         )
         self.assertEqual(sum(reference_constraints["section_word_targets"].values()), 2916)
+        self.assertGreater(reference_constraints["section_word_targets"]["sec2"], 300)
+        self.assertGreater(
+            reference_constraints["section_word_targets"]["sec2"],
+            reference_constraints["section_word_targets"]["sec6"],
+        )
+
+    def test_true_taxonomy_titles_still_keep_taxonomy_role(self):
+        outline_override = {
+            "sec1": "Scope and terminology",
+            "sec2": "Classification framework, nomenclature, and phenotype categories",
+            "sec3": "Evidence synthesis across cohorts and trials",
+            "sec4": "Limitations and future research priorities",
+        }
+        spec = TaskSpec(
+            task_id="taxonomy_guardrail",
+            topic="immune phenotypes in chronic disease",
+            domain="translational medicine",
+            target_words=2400,
+            body_target_words=2400,
+            expected_sections=4,
+            practice_context="specialist clinical decision-making",
+            organizer="classification framework",
+            focus_points=["phenotype categories", "evidence synthesis"],
+        )
+
+        config = build_main_task_config(spec, outline_override=outline_override)
+        reference_constraints = config["reference"]["constraints"]
+
+        self.assertEqual(reference_constraints["section_roles"]["sec2"], "taxonomy")
+
+    def test_six_slot_priors_can_override_role_budget_for_six_section_tasks(self):
+        outline_override = {
+            "sec1": "Scope, disease context, and chemokine terminology in alopecia areata",
+            "sec2": "Chemokine-pathway framework and hair-follicle immune privilege collapse",
+            "sec3": "Evidence base and measurement strategies across blood and skin studies",
+            "sec4": "Chemokine signatures in alopecia areata across Th1, Th2, and related pathways",
+            "sec5": "Biomarker value and therapeutic implications for clinical dermatology",
+            "sec6": "Limitations, heterogeneity, and future research priorities",
+        }
+        mocked_priors = {
+            "scope_context": 0.22,
+            "framework_mechanism": 0.16,
+            "evidence_methods": 0.18,
+            "findings_synthesis": 0.19,
+            "implications_discussion": 0.16,
+            "limitations_future": 0.09,
+        }
+
+        with patch("meta_bench.section_budget.load_six_slot_priors", return_value=mocked_priors):
+            budget = build_section_budget(
+                task_id="six_slot_budget",
+                body_target_words=3000,
+                outline=outline_override,
+            )
+
+        self.assertEqual(sum(budget.section_word_targets.values()), 3000)
+        self.assertEqual(budget.section_word_targets["sec1"], 660)
+        self.assertEqual(budget.section_word_targets["sec2"], 480)
+        self.assertEqual(budget.section_word_targets["sec3"], 540)
+        self.assertEqual(budget.section_word_targets["sec4"], 570)
+        self.assertEqual(budget.section_word_targets["sec5"], 480)
+        self.assertEqual(budget.section_word_targets["sec6"], 270)
+        self.assertEqual(budget.role_base_shares, {})
 
     def test_outline_titles_are_clean_ascii_punctuation(self):
         outline = generate_outline(self.spec)
 
         for title in outline.values():
+            self.assertNotIn("闁", title)
+            self.assertNotIn("閳", title)
+            self.assertNotIn("鏂", title)
             self.assertNotIn("鈥", title)
             self.assertNotIn("бк", title)
 
