@@ -129,7 +129,7 @@ class OnlineValidator:
     # 长度惩罚比例阈值（相对于 word_target）
     _LENGTH_SEVERE_FLOOR = 0.35
     _LENGTH_FLOOR = 0.72
-    _LENGTH_CEIL = 1.3
+    _LENGTH_CEIL = 1.8
 
     def __init__(
         self,

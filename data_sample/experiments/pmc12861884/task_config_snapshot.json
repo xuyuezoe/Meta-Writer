@@ -1,0 +1,194 @@
+{
+  "task_name": "metabench_pmc12861884",
+  "source_article_path": "external:medical_reviews_300_ready/PMC12861884.md",
+  "task": "Write an approximately 1737-word medical review article in English on Association between prediabetes and the risk of atrial fibrillation within clinical evidence synthesis. Keep the piece as a long-form scholarly review rather than a case report, a popular-science summary, or an outline. Open by defining the scope, discussion boundaries, and terminology, while keeping evidence-based clinical decision-making as an explicit practice context. Organize the main body around a systematic evidence synthesis framework and keep evidence-based clinical decision-making on the main line of discussion. Compare and synthesize the literature around atrial fibrillation, meta-analysis, prediabetes, and risk factors. Develop at least 6 natural sections and close with limitations, and future work.",
+  "constraints": [
+    "Write the article in English.",
+    "Target body length is about 1737 words overall, excluding the final references list.",
+    "Develop approximately 6 major sections following the outline.",
+    "Keep the discussion centered on Association between prediabetes and the risk of atrial fibrillation within clinical evidence synthesis.",
+    "Use systematic evidence synthesis framework as a visible organizing logic in the main body.",
+    "Compare and synthesize evidence about atrial fibrillation, meta-analysis, prediabetes, and risk factors.",
+    "Explicitly connect the discussion to evidence-based clinical decision-making.",
+    "Close by addressing limitations, and future work."
+  ],
+  "outline": {
+    "sec1": "Scope, terminology, and practice context",
+    "sec2": "Mechanistic and organizing framework",
+    "sec3": "Evidence base, methods, and measurement strategy",
+    "sec4": "Findings and cross-study synthesis",
+    "sec5": "Clinical implications and interpretive discussion",
+    "sec6": "Limitations, heterogeneity, and future research priorities"
+  },
+  "section_word_targets": {
+    "sec1": 620,
+    "sec2": 94,
+    "sec3": 116,
+    "sec4": 123,
+    "sec5": 100,
+    "sec6": 684
+  },
+  "session_name": "metabench_pmc12861884",
+  "reference": {
+    "task_id": "med_pmc12861884",
+    "paper_type": "medical_review",
+    "topic": "Association between prediabetes and the risk of atrial fibrillation",
+    "domain": "clinical evidence synthesis",
+    "language": "English",
+    "constraints": {
+      "required_length_words": 1737,
+      "body_target_words": 1737,
+      "total_target_words": 3753,
+      "expected_sections": 6,
+      "must_include": [
+        "scope",
+        "systematic evidence synthesis framework",
+        "clinical evidence synthesis",
+        "Association between prediabetes and the risk of atrial fibrillation",
+        "atrial fibrillation",
+        "meta-analysis",
+        "prediabetes",
+        "risk factors",
+        "evidence-based clinical decision-making",
+        "limitations",
+        "future work",
+        "AF",
+        "CRD420251233423"
+      ],
+      "section_word_targets": {
+        "sec1": 620,
+        "sec2": 94,
+        "sec3": 116,
+        "sec4": 123,
+        "sec5": 100,
+        "sec6": 684
+      },
+      "section_roles": {
+        "sec1": "introduction",
+        "sec2": "evidence_synthesis",
+        "sec3": "evidence_synthesis",
+        "sec4": "evidence_synthesis",
+        "sec5": "discussion",
+        "sec6": "limitations_gaps"
+      },
+      "required_sections": [
+        "introduction",
+        "main_body",
+        "limitations_gaps"
+      ],
+      "periodic_requirements": [
+        "The main body should include explicit comparison or synthesis at regular intervals.",
+        "The second half should address limitations, evidence gaps, or future work."
+      ],
+      "section_prior_scheme": "real_article_six_slot_aligned",
+      "section_budget_trace": {
+        "source": "real_article_six_slot_alignment",
+        "source_article_path": "external:medical_reviews_300_ready/PMC12861884.md",
+        "raw_article_section_count": 4,
+        "raw_article_outline": {
+          "sec1": "Introduction",
+          "sec2": "Materials and methods",
+          "sec3": "Discussion",
+          "sec4": "Conclusion"
+        },
+        "raw_article_section_word_targets": {
+          "sec1": 573,
+          "sec2": 45,
+          "sec3": 675,
+          "sec4": 118
+        },
+        "six_slot_order": [
+          "scope_context",
+          "framework_mechanism",
+          "evidence_methods",
+          "findings_synthesis",
+          "implications_discussion",
+          "limitations_future"
+        ],
+        "six_slot_outline": {
+          "sec1": "Scope, terminology, and practice context",
+          "sec2": "Mechanistic and organizing framework",
+          "sec3": "Evidence base, methods, and measurement strategy",
+          "sec4": "Findings and cross-study synthesis",
+          "sec5": "Clinical implications and interpretive discussion",
+          "sec6": "Limitations, heterogeneity, and future research priorities"
+        },
+        "raw_six_slot_word_targets": {
+          "sec1": 573.0,
+          "sec2": 33.5515,
+          "sec3": 55.0393,
+          "sec4": 79.7019,
+          "sec5": 37.7072,
+          "sec6": 632.0
+        },
+        "actual_section_word_targets": {
+          "sec1": 503.5625,
+          "sec2": 76.8655,
+          "sec3": 93.9271,
+          "sec4": 100.3048,
+          "sec5": 80.9274,
+          "sec6": 555.4128
+        },
+        "slot_prior_floor_factor": 0.35,
+        "scaled_to_body_target_words": 1737
+      },
+      "six_slot_prior_version": "52bb45a3787b"
+    },
+    "outline": {
+      "sec1": "Scope, terminology, and practice context",
+      "sec2": "Mechanistic and organizing framework",
+      "sec3": "Evidence base, methods, and measurement strategy",
+      "sec4": "Findings and cross-study synthesis",
+      "sec5": "Clinical implications and interpretive discussion",
+      "sec6": "Limitations, heterogeneity, and future research priorities"
+    },
+    "proxy_questions": [
+      {
+        "qid": "q_scope",
+        "question": "Does the article define the scope, boundaries, and key terminology for Association between prediabetes and the risk of atrial fibrillation within clinical evidence synthesis?",
+        "required_points": [
+          "defines the scope of Association between prediabetes and the risk of atrial fibrillation",
+          "states discussion boundaries or terminology",
+          "situates the topic within clinical evidence synthesis"
+        ]
+      },
+      {
+        "qid": "q_organizer",
+        "question": "Does the article organize the discussion around a systematic evidence synthesis framework?",
+        "required_points": [
+          "uses systematic evidence synthesis framework as an organizing axis",
+          "separates or compares major categories rather than listing facts only"
+        ]
+      },
+      {
+        "qid": "q_evidence",
+        "question": "Does the article compare and synthesize evidence about atrial fibrillation, meta-analysis, prediabetes, and risk factors for Association between prediabetes and the risk of atrial fibrillation?",
+        "required_points": [
+          "discusses atrial fibrillation",
+          "discusses meta-analysis",
+          "discusses prediabetes",
+          "discusses risk factors",
+          "compares or synthesizes evidence rather than only mentioning isolated facts"
+        ]
+      },
+      {
+        "qid": "q_context",
+        "question": "Does the article connect Association between prediabetes and the risk of atrial fibrillation to the evidence-based clinical decision-making context?",
+        "required_points": [
+          "explicitly discusses evidence-based clinical decision-making",
+          "connects the topic to practical decisions, workflows, or constraints"
+        ]
+      },
+      {
+        "qid": "q_closing",
+        "question": "Does the article close by addressing limitations, and future work for Association between prediabetes and the risk of atrial fibrillation?",
+        "required_points": [
+          "discusses limitations",
+          "discusses future work",
+          "identifies uncertainty, open questions, or next steps"
+        ]
+      }
+    ]
+  },
+  "corpus_dir": "./data_sample/med_papers_review_augmented_strict"
+}

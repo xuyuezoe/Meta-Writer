@@ -1,0 +1,22 @@
+{
+  "paper_id": "PMC12886017",
+  "title": "Diagnostic accuracy of machine learning for endometriosis: a systematic review and meta-analysis",
+  "doi": "10.3389/fendo.2025.1735567",
+  "source_article_path": "external:medical_reviews_300_ready/PMC12886017.md",
+  "reference_section_found": true,
+  "parsed_reference_count": 43,
+  "first_reference_number": 1,
+  "last_reference_number": 43,
+  "missing_reference_numbers": [],
+  "article_summary": {
+    "paper_id": "PMC12886017",
+    "file_name": "PMC12886017.md",
+    "word_count_without_references": 920,
+    "word_count_with_references": 2842,
+    "body_citation_event_count": 26,
+    "citation_per_word_without_references": 0.02826087,
+    "max_single_source_mentions": 2,
+    "max_single_source_mentions_per_word": 0.00217391,
+    "has_reference_section": true
+  }
+}

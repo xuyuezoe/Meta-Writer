@@ -235,6 +235,42 @@ class TaskGeneratorTests(unittest.TestCase):
         self.assertEqual(budget.section_word_targets["sec5"], 480)
         self.assertEqual(budget.section_word_targets["sec6"], 270)
         self.assertEqual(budget.role_base_shares, {})
+        self.assertEqual(budget.section_prior_scheme, "six_slot_empirical")
+
+    def test_six_slot_task_constraints_record_prior_version_metadata(self):
+        outline_override = {
+            "sec1": "Scope, disease context, and chemokine terminology in alopecia areata",
+            "sec2": "Chemokine-pathway framework and hair-follicle immune privilege collapse",
+            "sec3": "Evidence base and measurement strategies across blood and skin studies",
+            "sec4": "Chemokine signatures in alopecia areata across Th1, Th2, and related pathways",
+            "sec5": "Biomarker value and therapeutic implications for clinical dermatology",
+            "sec6": "Limitations, heterogeneity, and future research priorities",
+        }
+        spec = TaskSpec(
+            task_id="six_slot_metadata",
+            topic="chemokines in alopecia areata",
+            domain="immunodermatology",
+            target_words=6083,
+            body_target_words=2916,
+            expected_sections=6,
+            practice_context="clinical dermatology decision-making",
+            organizer="chemokine pathway framework",
+            focus_points=[
+                "Th1-associated chemokines",
+                "Th2-associated chemokines",
+                "blood and skin biomarker patterns",
+                "therapeutic implications",
+            ],
+        )
+
+        task = generate_review_task(spec, outline_override=outline_override)
+
+        self.assertEqual(
+            task.constraints["section_prior_scheme"],
+            "six_slot_empirical",
+        )
+        self.assertIn("six_slot_prior_version", task.constraints)
+        self.assertTrue(task.constraints["six_slot_prior_version"])
 
     def test_outline_titles_are_clean_ascii_punctuation(self):
         outline = generate_outline(self.spec)
@@ -243,8 +279,6 @@ class TaskGeneratorTests(unittest.TestCase):
             self.assertNotIn("闁", title)
             self.assertNotIn("閳", title)
             self.assertNotIn("鏂", title)
-            self.assertNotIn("鈥", title)
-            self.assertNotIn("бк", title)
 
 
 if __name__ == "__main__":

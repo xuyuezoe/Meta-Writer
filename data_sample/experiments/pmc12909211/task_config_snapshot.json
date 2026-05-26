@@ -1,0 +1,187 @@
+{
+  "task_name": "metabench_pmc12909211",
+  "source_article_path": "external:medical_reviews_300_ready/PMC12909211.md",
+  "task": "Write an approximately 1358-word medical review article in English on The correlation between traditional Chinese medicine constitution and prediabetes within clinical evidence synthesis. Keep the piece as a long-form scholarly review rather than a case report, a popular-science summary, or an outline. Open by defining the scope, discussion boundaries, and terminology, while keeping evidence-based clinical decision-making as an explicit practice context. Organize the main body around a systematic evidence synthesis framework and keep evidence-based clinical decision-making on the main line of discussion. Compare and synthesize the literature around The correlation between traditional Chinese medicine constitution and prediabetes. Develop at least 6 natural sections and close with limitations, and future work.",
+  "constraints": [
+    "Write the article in English.",
+    "Target body length is about 1358 words overall, excluding the final references list.",
+    "Develop approximately 6 major sections following the outline.",
+    "Keep the discussion centered on The correlation between traditional Chinese medicine constitution and prediabetes within clinical evidence synthesis.",
+    "Use systematic evidence synthesis framework as a visible organizing logic in the main body.",
+    "Compare and synthesize evidence about The correlation between traditional Chinese medicine constitution and prediabetes.",
+    "Explicitly connect the discussion to evidence-based clinical decision-making.",
+    "Close by addressing limitations, and future work."
+  ],
+  "outline": {
+    "sec1": "Scope, terminology, and practice context",
+    "sec2": "Mechanistic and organizing framework",
+    "sec3": "Evidence base, methods, and measurement strategy",
+    "sec4": "Findings and cross-study synthesis",
+    "sec5": "Clinical implications and interpretive discussion",
+    "sec6": "Limitations, heterogeneity, and future research priorities"
+  },
+  "section_word_targets": {
+    "sec1": 862,
+    "sec2": 74,
+    "sec3": 90,
+    "sec4": 96,
+    "sec5": 78,
+    "sec6": 158
+  },
+  "session_name": "metabench_pmc12909211",
+  "reference": {
+    "task_id": "med_pmc12909211",
+    "paper_type": "medical_review",
+    "topic": "The correlation between traditional Chinese medicine constitution and prediabetes",
+    "domain": "clinical evidence synthesis",
+    "language": "English",
+    "constraints": {
+      "required_length_words": 1358,
+      "body_target_words": 1358,
+      "total_target_words": 5312,
+      "expected_sections": 6,
+      "must_include": [
+        "scope",
+        "systematic evidence synthesis framework",
+        "clinical evidence synthesis",
+        "The correlation between traditional Chinese medicine constitution and prediabetes",
+        "evidence-based clinical decision-making",
+        "limitations",
+        "future work",
+        "TCM",
+        "PDC",
+        "BC",
+        "YIDC"
+      ],
+      "section_word_targets": {
+        "sec1": 862,
+        "sec2": 74,
+        "sec3": 90,
+        "sec4": 96,
+        "sec5": 78,
+        "sec6": 158
+      },
+      "section_roles": {
+        "sec1": "introduction",
+        "sec2": "evidence_synthesis",
+        "sec3": "evidence_synthesis",
+        "sec4": "evidence_synthesis",
+        "sec5": "discussion",
+        "sec6": "limitations_gaps"
+      },
+      "required_sections": [
+        "introduction",
+        "main_body",
+        "limitations_gaps"
+      ],
+      "periodic_requirements": [
+        "The main body should include explicit comparison or synthesis at regular intervals.",
+        "The second half should address limitations, evidence gaps, or future work."
+      ],
+      "section_prior_scheme": "real_article_six_slot_aligned",
+      "section_budget_trace": {
+        "source": "real_article_six_slot_alignment",
+        "source_article_path": "external:medical_reviews_300_ready/PMC12909211.md",
+        "raw_article_section_count": 3,
+        "raw_article_outline": {
+          "sec1": "Introduction",
+          "sec2": "Discussion",
+          "sec3": "Conclusion"
+        },
+        "raw_article_section_word_targets": {
+          "sec1": 639,
+          "sec2": 127,
+          "sec3": 117
+        },
+        "six_slot_order": [
+          "scope_context",
+          "framework_mechanism",
+          "evidence_methods",
+          "findings_synthesis",
+          "implications_discussion",
+          "limitations_future"
+        ],
+        "six_slot_outline": {
+          "sec1": "Scope, terminology, and practice context",
+          "sec2": "Mechanistic and organizing framework",
+          "sec3": "Evidence base, methods, and measurement strategy",
+          "sec4": "Findings and cross-study synthesis",
+          "sec5": "Clinical implications and interpretive discussion",
+          "sec6": "Limitations, heterogeneity, and future research priorities"
+        },
+        "raw_six_slot_word_targets": {
+          "sec1": 639.0,
+          "sec2": 16.0561,
+          "sec3": 43.8222,
+          "sec4": 43.8222,
+          "sec5": 23.2994,
+          "sec6": 117.0
+        },
+        "actual_section_word_targets": {
+          "sec1": 560.4966,
+          "sec2": 48.0108,
+          "sec3": 58.6675,
+          "sec4": 62.6511,
+          "sec5": 50.5478,
+          "sec6": 102.6261
+        },
+        "slot_prior_floor_factor": 0.35,
+        "scaled_to_body_target_words": 1358
+      },
+      "six_slot_prior_version": "52bb45a3787b"
+    },
+    "outline": {
+      "sec1": "Scope, terminology, and practice context",
+      "sec2": "Mechanistic and organizing framework",
+      "sec3": "Evidence base, methods, and measurement strategy",
+      "sec4": "Findings and cross-study synthesis",
+      "sec5": "Clinical implications and interpretive discussion",
+      "sec6": "Limitations, heterogeneity, and future research priorities"
+    },
+    "proxy_questions": [
+      {
+        "qid": "q_scope",
+        "question": "Does the article define the scope, boundaries, and key terminology for The correlation between traditional Chinese medicine constitution and prediabetes within clinical evidence synthesis?",
+        "required_points": [
+          "defines the scope of The correlation between traditional Chinese medicine constitution and prediabetes",
+          "states discussion boundaries or terminology",
+          "situates the topic within clinical evidence synthesis"
+        ]
+      },
+      {
+        "qid": "q_organizer",
+        "question": "Does the article organize the discussion around a systematic evidence synthesis framework?",
+        "required_points": [
+          "uses systematic evidence synthesis framework as an organizing axis",
+          "separates or compares major categories rather than listing facts only"
+        ]
+      },
+      {
+        "qid": "q_evidence",
+        "question": "Does the article compare and synthesize evidence about The correlation between traditional Chinese medicine constitution and prediabetes for The correlation between traditional Chinese medicine constitution and prediabetes?",
+        "required_points": [
+          "discusses The correlation between traditional Chinese medicine constitution and prediabetes",
+          "compares or synthesizes evidence rather than only mentioning isolated facts"
+        ]
+      },
+      {
+        "qid": "q_context",
+        "question": "Does the article connect The correlation between traditional Chinese medicine constitution and prediabetes to the evidence-based clinical decision-making context?",
+        "required_points": [
+          "explicitly discusses evidence-based clinical decision-making",
+          "connects the topic to practical decisions, workflows, or constraints"
+        ]
+      },
+      {
+        "qid": "q_closing",
+        "question": "Does the article close by addressing limitations, and future work for The correlation between traditional Chinese medicine constitution and prediabetes?",
+        "required_points": [
+          "discusses limitations",
+          "discusses future work",
+          "identifies uncertainty, open questions, or next steps"
+        ]
+      }
+    ]
+  },
+  "corpus_dir": "./data_sample/med_papers_review_augmented_strict"
+}

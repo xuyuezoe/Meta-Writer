@@ -333,6 +333,12 @@ Overall implications.
         self.assertEqual(result.status, "evaluated")
         self.assertEqual(result.scheme, "six_slot_task")
         self.assertGreaterEqual(result.score, 0.9)
+        self.assertIsNotNone(result.prior_metadata)
+        self.assertIn("prior_version", result.prior_metadata)
+        self.assertEqual(
+            result.prior_metadata["threshold_source"],
+            "data_sample/six_slot_citation_priors.json",
+        )
         self.assertEqual(
             list(result.section_counts.keys()),
             [
@@ -379,6 +385,57 @@ Evidence synthesis.
 
         self.assertIn("section_distribution", result["diagnostics"])
         self.assertIn("section_distribution", result["scores"])
+
+    def test_section_distribution_diagnostics_include_six_slot_prior_metadata(self):
+        final_text = "Generated article body."
+        citation_manifest = [
+            *[
+                {"citation_id": f"S1_{i}", "chunk_id": "sec1", "section_key": "introduction"}
+                for i in range(1, 11)
+            ],
+            *[
+                {"citation_id": f"S2_{i}", "chunk_id": "sec2", "section_key": "main_body"}
+                for i in range(1, 21)
+            ],
+            *[
+                {"citation_id": f"S3_{i}", "chunk_id": "sec3", "section_key": "main_body"}
+                for i in range(1, 21)
+            ],
+            *[
+                {"citation_id": f"S4_{i}", "chunk_id": "sec4", "section_key": "main_body"}
+                for i in range(1, 21)
+            ],
+            *[
+                {"citation_id": f"S5_{i}", "chunk_id": "sec5", "section_key": "main_body"}
+                for i in range(1, 21)
+            ],
+            *[
+                {"citation_id": f"S6_{i}", "chunk_id": "sec6", "section_key": "conclusion"}
+                for i in range(1, 9)
+            ],
+        ]
+        reference = {
+            "outline": {
+                "sec1": "Scope, disease context, and chemokine terminology in alopecia areata",
+                "sec2": "Chemokine-pathway framework and hair-follicle immune privilege collapse",
+                "sec3": "Evidence base and measurement strategies across blood and skin studies",
+                "sec4": "Chemokine signatures in alopecia areata across Th1, Th2, and related pathways",
+                "sec5": "Biomarker value and therapeutic implications for clinical dermatology",
+                "sec6": "Limitations, heterogeneity, and future research priorities",
+            },
+            "citation_manifest": citation_manifest,
+        }
+
+        result = evaluate_citation_dimension(final_text, reference)
+
+        diagnostics = result["diagnostics"]["section_distribution"]
+        self.assertEqual(diagnostics["scheme"], "six_slot_task")
+        self.assertIn("prior_metadata", diagnostics)
+        self.assertIn("prior_version", diagnostics["prior_metadata"])
+        self.assertEqual(
+            diagnostics["prior_metadata"]["threshold_source"],
+            "data_sample/six_slot_citation_priors.json",
+        )
 
 
 class CitationCountScoreTests(unittest.TestCase):

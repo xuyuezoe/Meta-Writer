@@ -35,6 +35,8 @@ from typing import Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
+PLACEHOLDER_ONLY_MAX_WORDS = 80
+
 # ── YAML frontmatter parser (no external deps) ────────────────────────────────
 
 def _parse_frontmatter(raw: str) -> tuple[dict, str]:
@@ -179,6 +181,19 @@ def _chunk_markdown(paper_id: str, body: str) -> List[dict]:
 
 # ── Public API ────────────────────────────────────────────────────────────────
 
+def _count_word_units(text: str) -> int:
+    return len(re.findall(r"\b\w+(?:[-']\w+)?\b", text))
+
+
+def _is_placeholder_only_body(body: str) -> bool:
+    lowered = body.casefold()
+    if "no abstract or full text could be retrieved" in lowered:
+        return True
+    if "abstract unavailable" in lowered and _count_word_units(body) < PLACEHOLDER_ONLY_MAX_WORDS:
+        return True
+    return False
+
+
 def load_paper_file(path: Path) -> Optional[dict]:
     """
     Parse one paper `.md` file and return a structured paper dict.
@@ -217,7 +232,14 @@ def load_paper_file(path: Path) -> Optional[dict]:
     stats = meta.get("stats") or {}
     word_count = int(stats.get("word_count") or 0) if isinstance(stats, dict) else 0
 
+    if _is_placeholder_only_body(body):
+        logger.info("Skipping placeholder-only corpus file: %s", path)
+        return None
+
     chunks = _chunk_markdown(paper_id, body)
+    if not chunks:
+        logger.info("Skipping empty corpus file after chunking: %s", path)
+        return None
 
     # 标题回退：若 frontmatter title 过短（<4词），从 body 第一个 heading 提取。
     # 部分语料文件存在 title 被截断的情况（如 "Nationwide Cohort Study"），
@@ -254,7 +276,7 @@ def load_corpus_dir(corpus_dir: str) -> List[dict]:
         logger.warning("Corpus directory not found: %s", corpus_dir)
         return papers
 
-    for md_file in sorted(p.glob("*.md")):
+    for md_file in sorted(path for path in p.rglob("*.md") if path.is_file()):
         paper = load_paper_file(md_file)
         if paper and paper.get("paper_id"):
             papers.append(paper)

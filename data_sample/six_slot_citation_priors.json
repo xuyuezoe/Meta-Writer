@@ -1,0 +1,88 @@
+{
+  "source_corpus_dir": "external:medical_reviews_300_ready",
+  "article_count": 300,
+  "mapped_article_count": 272,
+  "total_citation_mentions": 12298,
+  "slot_order": [
+    "scope_context",
+    "framework_mechanism",
+    "evidence_methods",
+    "findings_synthesis",
+    "implications_discussion",
+    "limitations_future"
+  ],
+  "normalized_mean_shares": {
+    "scope_context": 0.195405,
+    "framework_mechanism": 0.201729,
+    "evidence_methods": 0.225507,
+    "findings_synthesis": 0.212431,
+    "implications_discussion": 0.156871,
+    "limitations_future": 0.008057
+  },
+  "slot_stats": {
+    "scope_context": {
+      "mean_share": 0.195405,
+      "median_share": 0.151923,
+      "p25_share": 0.087605,
+      "p75_share": 0.263406,
+      "mean_citations": 6.73,
+      "median_citations": 6.0,
+      "articles_with_citations": 259
+    },
+    "framework_mechanism": {
+      "mean_share": 0.201729,
+      "median_share": 0.209424,
+      "p25_share": 0.154306,
+      "p75_share": 0.252259,
+      "mean_citations": 9.93,
+      "median_citations": 7.72,
+      "articles_with_citations": 269
+    },
+    "evidence_methods": {
+      "mean_share": 0.225507,
+      "median_share": 0.233291,
+      "p25_share": 0.199566,
+      "p75_share": 0.257591,
+      "mean_citations": 10.91,
+      "median_citations": 8.52,
+      "articles_with_citations": 269
+    },
+    "findings_synthesis": {
+      "mean_share": 0.212431,
+      "median_share": 0.216246,
+      "p25_share": 0.180618,
+      "p75_share": 0.244846,
+      "mean_citations": 10.06,
+      "median_citations": 7.63,
+      "articles_with_citations": 269
+    },
+    "implications_discussion": {
+      "mean_share": 0.156871,
+      "median_share": 0.153577,
+      "p25_share": 0.12059,
+      "p75_share": 0.191639,
+      "mean_citations": 7.39,
+      "median_citations": 5.54,
+      "articles_with_citations": 269
+    },
+    "limitations_future": {
+      "mean_share": 0.008057,
+      "median_share": 0.0,
+      "p25_share": 0.0,
+      "p75_share": 0.0,
+      "mean_citations": 0.2,
+      "median_citations": 0.0,
+      "articles_with_citations": 20
+    }
+  },
+  "method": {
+    "unit": "per-article normalized body citation mention share",
+    "aggregation": "mean citation share across mapped articles, then renormalized to sum to 1.0",
+    "notes": [
+      "Numeric body citation markers such as (1), (1, 2), and [1-3] are counted as reference mentions.",
+      "Reference-list, abstract, keyword, funding, conflict, and other metadata sections are excluded.",
+      "The same deterministic introduction/main_body/conclusion reduction used for the six-slot word priors is reused here.",
+      "Introduction and conclusion map directly to slots 1 and 6; citation-bearing paragraphs inside the parsed main_body are softly distributed across the middle four slots using relative position plus light lexical cues."
+    ]
+  }
+}

@@ -215,11 +215,13 @@ class Generator:
                 "When this section ends, unresolved tension should still remain for later sections.\n"
             )
             if section_intent.word_target is not None:
+                lower_bound = int(section_intent.word_target * 0.72)
+                upper_bound = int(section_intent.word_target * 1.30)
                 word_count_instruction = (
                     f"\n[Length requirement] Write approximately {section_intent.word_target} words "
-                    f"for this section. Aim for at least {int(section_intent.word_target * 0.72)} words. "
-                    "Expand every key point with concrete examples, evidence, and analysis. "
-                    "Do not truncate early.\n"
+                    f"for this section, ideally between {lower_bound} and {upper_bound} words. "
+                    "Prioritize concise synthesis over exhaustive background. "
+                    "Do not pad the section or expand beyond the section's role.\n"
                 )
 
         reference_block = self._build_reference_block(section_papers)

@@ -9,6 +9,7 @@ from typing import Mapping
 
 HEADING_RE = re.compile(r"^(#{1,6})\s+(.*\S)\s*$", re.MULTILINE)
 DEFAULT_REQUIRED_COMPLETION_SLOTS = ["introduction", "main_body", "conclusion"]
+SMART_APOSTROPHES = "\u2018\u2019\u2032"
 
 TITLE_HEADINGS = {"title"}
 ABSTRACT_HEADINGS = {"abstract"}
@@ -60,15 +61,42 @@ NON_BODY_HEADINGS = {
     "acknowledgments",
     "funding",
     "funding statement",
+    "disclosure",
+    "disclosures",
     "author contributions",
     "authors' contributions",
+    "contributor information",
+    "author information",
     "data availability",
     "data availability statement",
+    "availability of data and materials",
     "conflict of interest",
     "conflicts of interest",
+    "competing interests",
     "ethics statement",
+    "institutional review board statement",
+    "informed consent",
+    "informed consent statement",
+    "consent",
+    "consent for publication",
+    "supporting information",
     "supplementary material",
+    "supplementary materials",
+    "supplementary information",
+    "generative ai statement",
+    "ai statement",
     "publisher's note",
+    "correction",
+    "correction note",
+    "author correction",
+    "publisher correction",
+    "erratum",
+    "errata",
+    "corrigendum",
+    "corrigenda",
+    "author response",
+    "response to reviewers",
+    "section",
 }
 FALLBACK_SIGNAL_TERMS = {
     "introduction": {
@@ -292,6 +320,8 @@ def normalize_heading(heading: str) -> str:
     """Normalize a Markdown heading for structural classification."""
 
     value = re.sub(r"^\d+(?:\.\d+)*\.?\s*", "", heading.strip())
+    for char in SMART_APOSTROPHES:
+        value = value.replace(char, "'")
     return re.sub(r"\s+", " ", value).casefold()
 
 

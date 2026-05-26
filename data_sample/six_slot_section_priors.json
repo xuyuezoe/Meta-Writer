@@ -1,5 +1,5 @@
 {
-  "source_corpus_dir": "C:\\Users\\asd\\OneDrive\\Desktop\\medical_reviews_300_ready",
+  "source_corpus_dir": "external:medical_reviews_300_ready",
   "article_count": 300,
   "mapped_article_count": 300,
   "slot_order": [

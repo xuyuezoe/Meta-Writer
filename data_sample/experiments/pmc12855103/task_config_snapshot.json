@@ -1,0 +1,196 @@
+{
+  "task_name": "metabench_pmc12855103",
+  "source_article_path": "external:medical_reviews_300_ready/PMC12855103.md",
+  "task": "Write an approximately 2297-word medical review article in English on Association between statin use and the risk of colorectal cancer in patients with inflammatory bowel disease within clinical evidence synthesis. Keep the piece as a long-form scholarly review rather than a case report, a popular-science summary, or an outline. Open by defining the scope, discussion boundaries, and terminology, while keeping evidence-based clinical decision-making as an explicit practice context. Organize the main body around a systematic evidence synthesis framework and keep evidence-based clinical decision-making on the main line of discussion. Compare and synthesize the literature around colorectal cancer, incidence, inflammatory bowel disease, and meta-analysis. Develop at least 6 natural sections and close with limitations, and future work.",
+  "constraints": [
+    "Write the article in English.",
+    "Target body length is about 2297 words overall, excluding the final references list.",
+    "Develop approximately 6 major sections following the outline.",
+    "Keep the discussion centered on Association between statin use and the risk of colorectal cancer in patients with inflammatory bowel disease within clinical evidence synthesis.",
+    "Use systematic evidence synthesis framework as a visible organizing logic in the main body.",
+    "Compare and synthesize evidence about colorectal cancer, incidence, inflammatory bowel disease, and meta-analysis.",
+    "Explicitly connect the discussion to evidence-based clinical decision-making.",
+    "Close by addressing limitations, and future work."
+  ],
+  "outline": {
+    "sec1": "Scope, terminology, and practice context",
+    "sec2": "Mechanistic and organizing framework",
+    "sec3": "Evidence base, methods, and measurement strategy",
+    "sec4": "Findings and cross-study synthesis",
+    "sec5": "Clinical implications and interpretive discussion",
+    "sec6": "Limitations, heterogeneity, and future research priorities"
+  },
+  "section_word_targets": {
+    "sec1": 544,
+    "sec2": 133,
+    "sec3": 162,
+    "sec4": 173,
+    "sec5": 140,
+    "sec6": 1145
+  },
+  "session_name": "metabench_pmc12855103",
+  "reference": {
+    "task_id": "med_pmc12855103",
+    "paper_type": "medical_review",
+    "topic": "Association between statin use and the risk of colorectal cancer in patients with inflammatory bowel disease",
+    "domain": "clinical evidence synthesis",
+    "language": "English",
+    "constraints": {
+      "required_length_words": 2297,
+      "body_target_words": 2297,
+      "total_target_words": 4584,
+      "expected_sections": 6,
+      "must_include": [
+        "scope",
+        "systematic evidence synthesis framework",
+        "clinical evidence synthesis",
+        "Association between statin use and the risk of colorectal cancer in patients with inflammatory bowel disease",
+        "colorectal cancer",
+        "incidence",
+        "inflammatory bowel disease",
+        "meta-analysis",
+        "evidence-based clinical decision-making",
+        "limitations",
+        "future work",
+        "IBD",
+        "CRC",
+        "RR",
+        "CI"
+      ],
+      "section_word_targets": {
+        "sec1": 544,
+        "sec2": 133,
+        "sec3": 162,
+        "sec4": 173,
+        "sec5": 140,
+        "sec6": 1145
+      },
+      "section_roles": {
+        "sec1": "introduction",
+        "sec2": "evidence_synthesis",
+        "sec3": "evidence_synthesis",
+        "sec4": "evidence_synthesis",
+        "sec5": "discussion",
+        "sec6": "limitations_gaps"
+      },
+      "required_sections": [
+        "introduction",
+        "main_body",
+        "limitations_gaps"
+      ],
+      "periodic_requirements": [
+        "The main body should include explicit comparison or synthesis at regular intervals.",
+        "The second half should address limitations, evidence gaps, or future work."
+      ],
+      "section_prior_scheme": "real_article_six_slot_aligned",
+      "section_budget_trace": {
+        "source": "real_article_six_slot_alignment",
+        "source_article_path": "external:medical_reviews_300_ready/PMC12855103.md",
+        "raw_article_section_count": 4,
+        "raw_article_outline": {
+          "sec1": "Introduction",
+          "sec2": "Methods",
+          "sec3": "Discussion",
+          "sec4": "Conclusions"
+        },
+        "raw_article_section_word_targets": {
+          "sec1": 490,
+          "sec2": 80,
+          "sec3": 1280,
+          "sec4": 77
+        },
+        "six_slot_order": [
+          "scope_context",
+          "framework_mechanism",
+          "evidence_methods",
+          "findings_synthesis",
+          "implications_discussion",
+          "limitations_future"
+        ],
+        "six_slot_outline": {
+          "sec1": "Scope, terminology, and practice context",
+          "sec2": "Mechanistic and organizing framework",
+          "sec3": "Evidence base, methods, and measurement strategy",
+          "sec4": "Findings and cross-study synthesis",
+          "sec5": "Clinical implications and interpretive discussion",
+          "sec6": "Limitations, heterogeneity, and future research priorities"
+        },
+        "raw_six_slot_word_targets": {
+          "sec1": 490.0,
+          "sec2": 88.6302,
+          "sec3": 113.3246,
+          "sec4": 122.583,
+          "sec5": 82.4621,
+          "sec6": 1030.0
+        },
+        "actual_section_word_targets": {
+          "sec1": 456.8002,
+          "sec2": 111.357,
+          "sec3": 136.0745,
+          "sec4": 145.3141,
+          "sec5": 117.2415,
+          "sec6": 960.2126
+        },
+        "slot_prior_floor_factor": 0.35,
+        "scaled_to_body_target_words": 2297
+      },
+      "six_slot_prior_version": "52bb45a3787b"
+    },
+    "outline": {
+      "sec1": "Scope, terminology, and practice context",
+      "sec2": "Mechanistic and organizing framework",
+      "sec3": "Evidence base, methods, and measurement strategy",
+      "sec4": "Findings and cross-study synthesis",
+      "sec5": "Clinical implications and interpretive discussion",
+      "sec6": "Limitations, heterogeneity, and future research priorities"
+    },
+    "proxy_questions": [
+      {
+        "qid": "q_scope",
+        "question": "Does the article define the scope, boundaries, and key terminology for Association between statin use and the risk of colorectal cancer in patients with inflammatory bowel disease within clinical evidence synthesis?",
+        "required_points": [
+          "defines the scope of Association between statin use and the risk of colorectal cancer in patients with inflammatory bowel disease",
+          "states discussion boundaries or terminology",
+          "situates the topic within clinical evidence synthesis"
+        ]
+      },
+      {
+        "qid": "q_organizer",
+        "question": "Does the article organize the discussion around a systematic evidence synthesis framework?",
+        "required_points": [
+          "uses systematic evidence synthesis framework as an organizing axis",
+          "separates or compares major categories rather than listing facts only"
+        ]
+      },
+      {
+        "qid": "q_evidence",
+        "question": "Does the article compare and synthesize evidence about colorectal cancer, incidence, inflammatory bowel disease, and meta-analysis for Association between statin use and the risk of colorectal cancer in patients with inflammatory bowel disease?",
+        "required_points": [
+          "discusses colorectal cancer",
+          "discusses incidence",
+          "discusses inflammatory bowel disease",
+          "discusses meta-analysis",
+          "compares or synthesizes evidence rather than only mentioning isolated facts"
+        ]
+      },
+      {
+        "qid": "q_context",
+        "question": "Does the article connect Association between statin use and the risk of colorectal cancer in patients with inflammatory bowel disease to the evidence-based clinical decision-making context?",
+        "required_points": [
+          "explicitly discusses evidence-based clinical decision-making",
+          "connects the topic to practical decisions, workflows, or constraints"
+        ]
+      },
+      {
+        "qid": "q_closing",
+        "question": "Does the article close by addressing limitations, and future work for Association between statin use and the risk of colorectal cancer in patients with inflammatory bowel disease?",
+        "required_points": [
+          "discusses limitations",
+          "discusses future work",
+          "identifies uncertainty, open questions, or next steps"
+        ]
+      }
+    ]
+  },
+  "corpus_dir": "./data_sample/med_papers_review_augmented_strict"
+}

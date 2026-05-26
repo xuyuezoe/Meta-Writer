@@ -174,7 +174,7 @@ class SectionPlanner:
             "1. Keep the local plan strictly inside this section's responsibility; do not plan material that belongs to later sections.\n"
             "2. If there is a main conflict, this section may advance it but must not fully resolve it unless the outline explicitly marks this section as the ending.\n"
             "3. Do not repeat content that has already been handled in completed sections.\n"
-            "4. The success_criteria must include an explicit word count requirement matching the word count target above.\n\n"
+            "4. The success_criteria must include an approximate word count requirement based on the target above, treating it as a budget rather than an exact cutoff.\n\n"
             "Output format (strict JSON):\n"
             "{\n"
             "  \"local_goal\": \"...\",\n"

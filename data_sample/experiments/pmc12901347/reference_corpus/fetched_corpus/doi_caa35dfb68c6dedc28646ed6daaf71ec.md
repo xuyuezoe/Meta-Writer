@@ -1,0 +1,20 @@
+---
+paper_id: "doi_caa35dfb68c6dedc28646ed6daaf71ec"
+doi: "10.1016/j.jneb.2011.01.006"
+source: "europepmc"
+title: "Meshing with MeSH."
+authors:
+- "Chapman-Novakofski K."
+subject_areas: []
+abstract: ""
+---
+
+# Meshing with MeSH.
+
+## Abstract
+
+Abstract unavailable.
+
+## Full Text
+
+Skip to Main Content Skip to Main Menu Submit Log in Register Skip menu Articles Publish Topics Multimedia About Contact Subscribe Direct Link Advanced search FROM JNEBVolume 43, Issue 2P75March-April, 2011 Download Full Issue Meshing with MeSH Karen Chapman-Novakofski, PhD, RD, LDN Article Info Get Access Cite Share Set Alert Get Rights Reprints Previous article Next article Show Outline What is the last thing most authors do when submitting a manuscript? Deciding what the key words are. It may be bothersome. Key words may seem worthless and a waste of your time. But the Medical Subject Headings (MeSH) or key words are the descriptors that all PubMed searchers will be using to find your article – or not. The MeSH is developed by the National Library of Medicine and includes a hierarchical structure for very broad to very specific headings. To give your article the largest audience when research is being searched, choose the broadest terms that apply. To assure your article reaches its niche, choose the most specific term. Not sure which terms are correct or the best choice? Visit the MeSH Web site at http://www.nlm.nih.gov/mesh/MBrowser.html. Get full text access Log in, subscribe or purchase for full access. Get Access References 1. Cohen, N. ∙ Carbone, E.T. ∙ Beffa-Negrini, P.A. The design, implementation, and evaluation of online credit nutrition courses: a systematic review J Nutr Educ Behav. 2011; 43:76-86 Full Text Full Text (PDF) Scopus (31) PubMed Google Scholar 2. Chang, M.-W. ∙ Nitzke, S. ∙ Brown, R. ... Predictors of low-income, obese mothers’ use of healthful weight management behaviors J Nutr Educ Behav. 2011; 43:87-95 Full Text Full Text (PDF) Scopus (5) PubMed Google Scholar Article metrics 6 Citations 7 Captures View details opens in a new tab Related Articles We haven't found any related articles. View full text Access for Developing Countries ARTICLES & ISSUES Articles In Press Current Issue List of Issues Supplements FOR AUTHORS Author Guidelines Submit Your Manuscript Statistical Methods Guidelines for Authors of Educational Material Reviews Permission to Reuse About Open Access Researcher Academy FOR REVIEWERS General Guidelines Methods Paper Guidelines Qualitative Guidelines Quantitative Guidelines Questionnaire Methods Guidelines Statistical Methods Guidelines Systematic Review Guidelines Perspective Guidelines GEM Reviewing Guidelines JOURNAL INFO About the Journal Policies Disclosures About Open Access Abstracting/Indexing Impact/Metrics Awards Contact Information Editorial Staff and Board Info for Advertisers Member Access Instructions New Content Alerts Pricing Reprints Sponsored Supplements Statistical Reviewers Media Reviewer Appreciation NEW RESOURCES New Resources for Nutrition Educators Submit New Resources for Review Guidelines for Writing Reviews of New Resources for Nutrition Educators PODCAST/WEBINARS New Resources Podcasts Press Release & Other Podcasts Webinars Collections SNEB Visit SNEB Join SNEB Member Access Instructions Society News FOLLOW US Twitter Facebook YouTube Spotify Linkedin RSS Feeds The content on this site is intended for healthcare professionals. All content on this site: Copyright © 2026 Elsevier Inc., its licensors, and contributors. All rights are reserved, including those for text and data mining, AI training, and similar technologies. For all open access content, the relevant licensing terms apply. Privacy Policy Cookie settings Terms and Conditions Accessibility Help & Contact Responsible AI We use cookies that are necessary to make our site work. We may also use additional cookies to analyze, improve, and personalize our content and your digital experience. You can manage your cookie preferences using theCookie settings link. For more information, see ourCookie Policy Cookie settings Accept only necessary cookies Accept all cookies

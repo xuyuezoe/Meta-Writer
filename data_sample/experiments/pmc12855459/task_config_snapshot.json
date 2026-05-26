@@ -1,0 +1,194 @@
+{
+  "task_name": "metabench_pmc12855459",
+  "source_article_path": "external:medical_reviews_300_ready/PMC12855459.md",
+  "task": "Write an approximately 2269-word medical review article in English on The effects of virtual reality-based interventions on cognitive function, depressive symptoms, and daily functioning in older adults with mild cognitive impairment: a systematic review and meta-analysis of randomized controlled trials within clinical evidence synthesis. Keep the piece as a long-form scholarly review rather than a case report, a popular-science summary, or an outline. Open by defining the scope, discussion boundaries, and terminology, while keeping evidence-based clinical decision-making as an explicit practice context. Organize the main body around a systematic evidence synthesis framework and keep evidence-based clinical decision-making on the main line of discussion. Compare and synthesize the literature around virtual reality, mild cognitive impairment, exergaming, and cognition. Develop at least 6 natural sections and close with limitations, and future work.",
+  "constraints": [
+    "Write the article in English.",
+    "Target body length is about 2269 words overall, excluding the final references list.",
+    "Develop approximately 6 major sections following the outline.",
+    "Keep the discussion centered on The effects of virtual reality-based interventions on cognitive function, depressive symptoms, and daily functioning in older adults with mild cognitive impairment: a systematic review and meta-analysis of randomized controlled trials within clinical evidence synthesis.",
+    "Use systematic evidence synthesis framework as a visible organizing logic in the main body.",
+    "Compare and synthesize evidence about virtual reality, mild cognitive impairment, exergaming, and cognition.",
+    "Explicitly connect the discussion to evidence-based clinical decision-making.",
+    "Close by addressing limitations, and future work."
+  ],
+  "outline": {
+    "sec1": "Scope, terminology, and practice context",
+    "sec2": "Mechanistic and organizing framework",
+    "sec3": "Evidence base, methods, and measurement strategy",
+    "sec4": "Findings and cross-study synthesis",
+    "sec5": "Clinical implications and interpretive discussion",
+    "sec6": "Limitations, heterogeneity, and future research priorities"
+  },
+  "section_word_targets": {
+    "sec1": 547,
+    "sec2": 277,
+    "sec3": 334,
+    "sec4": 355,
+    "sec5": 284,
+    "sec6": 472
+  },
+  "session_name": "metabench_pmc12855459",
+  "reference": {
+    "task_id": "med_pmc12855459",
+    "paper_type": "medical_review",
+    "topic": "The effects of virtual reality-based interventions on cognitive function, depressive symptoms, and daily functioning in older adults with mild cognitive impairment: a systematic review and meta-analysis of randomized controlled trials",
+    "domain": "clinical evidence synthesis",
+    "language": "English",
+    "constraints": {
+      "required_length_words": 2269,
+      "body_target_words": 2269,
+      "total_target_words": 4884,
+      "expected_sections": 6,
+      "must_include": [
+        "scope",
+        "systematic evidence synthesis framework",
+        "clinical evidence synthesis",
+        "The effects of virtual reality-based interventions on cognitive function, depressive symptoms, and daily functioning in older adults with mild cognitive impairment: a systematic review and meta-analysis of randomized controlled trials",
+        "virtual reality",
+        "mild cognitive impairment",
+        "exergaming",
+        "cognition",
+        "evidence-based clinical decision-making",
+        "limitations",
+        "future work",
+        "VR",
+        "MCI",
+        "GRADE",
+        "SMD"
+      ],
+      "section_word_targets": {
+        "sec1": 547,
+        "sec2": 277,
+        "sec3": 334,
+        "sec4": 355,
+        "sec5": 284,
+        "sec6": 472
+      },
+      "section_roles": {
+        "sec1": "introduction",
+        "sec2": "evidence_synthesis",
+        "sec3": "evidence_synthesis",
+        "sec4": "evidence_synthesis",
+        "sec5": "discussion",
+        "sec6": "limitations_gaps"
+      },
+      "required_sections": [
+        "introduction",
+        "main_body",
+        "limitations_gaps"
+      ],
+      "periodic_requirements": [
+        "The main body should include explicit comparison or synthesis at regular intervals.",
+        "The second half should address limitations, evidence gaps, or future work."
+      ],
+      "section_prior_scheme": "real_article_six_slot_aligned",
+      "section_budget_trace": {
+        "source": "real_article_six_slot_alignment",
+        "source_article_path": "external:medical_reviews_300_ready/PMC12855459.md",
+        "raw_article_section_count": 3,
+        "raw_article_outline": {
+          "sec1": "Introduction",
+          "sec2": "Discussion",
+          "sec3": "Conclusion"
+        },
+        "raw_article_section_word_targets": {
+          "sec1": 465,
+          "sec2": 1311,
+          "sec3": 151
+        },
+        "six_slot_order": [
+          "scope_context",
+          "framework_mechanism",
+          "evidence_methods",
+          "findings_synthesis",
+          "implications_discussion",
+          "limitations_future"
+        ],
+        "six_slot_outline": {
+          "sec1": "Scope, terminology, and practice context",
+          "sec2": "Mechanistic and organizing framework",
+          "sec3": "Evidence base, methods, and measurement strategy",
+          "sec4": "Findings and cross-study synthesis",
+          "sec5": "Clinical implications and interpretive discussion",
+          "sec6": "Limitations, heterogeneity, and future research priorities"
+        },
+        "raw_six_slot_word_targets": {
+          "sec1": 465.0,
+          "sec2": 235.0502,
+          "sec3": 283.5994,
+          "sec4": 301.4564,
+          "sec5": 240.894,
+          "sec6": 401.0
+        },
+        "actual_section_word_targets": {
+          "sec1": 465.0,
+          "sec2": 235.0502,
+          "sec3": 283.5994,
+          "sec4": 301.4564,
+          "sec5": 240.894,
+          "sec6": 401.0
+        },
+        "slot_prior_floor_factor": 0.35,
+        "scaled_to_body_target_words": 2269
+      },
+      "six_slot_prior_version": "52bb45a3787b"
+    },
+    "outline": {
+      "sec1": "Scope, terminology, and practice context",
+      "sec2": "Mechanistic and organizing framework",
+      "sec3": "Evidence base, methods, and measurement strategy",
+      "sec4": "Findings and cross-study synthesis",
+      "sec5": "Clinical implications and interpretive discussion",
+      "sec6": "Limitations, heterogeneity, and future research priorities"
+    },
+    "proxy_questions": [
+      {
+        "qid": "q_scope",
+        "question": "Does the article define the scope, boundaries, and key terminology for The effects of virtual reality-based interventions on cognitive function, depressive symptoms, and daily functioning in older adults with mild cognitive impairment: a systematic review and meta-analysis of randomized controlled trials within clinical evidence synthesis?",
+        "required_points": [
+          "defines the scope of The effects of virtual reality-based interventions on cognitive function, depressive symptoms, and daily functioning in older adults with mild cognitive impairment: a systematic review and meta-analysis of randomized controlled trials",
+          "states discussion boundaries or terminology",
+          "situates the topic within clinical evidence synthesis"
+        ]
+      },
+      {
+        "qid": "q_organizer",
+        "question": "Does the article organize the discussion around a systematic evidence synthesis framework?",
+        "required_points": [
+          "uses systematic evidence synthesis framework as an organizing axis",
+          "separates or compares major categories rather than listing facts only"
+        ]
+      },
+      {
+        "qid": "q_evidence",
+        "question": "Does the article compare and synthesize evidence about virtual reality, mild cognitive impairment, exergaming, and cognition for The effects of virtual reality-based interventions on cognitive function, depressive symptoms, and daily functioning in older adults with mild cognitive impairment: a systematic review and meta-analysis of randomized controlled trials?",
+        "required_points": [
+          "discusses virtual reality",
+          "discusses mild cognitive impairment",
+          "discusses exergaming",
+          "discusses cognition",
+          "compares or synthesizes evidence rather than only mentioning isolated facts"
+        ]
+      },
+      {
+        "qid": "q_context",
+        "question": "Does the article connect The effects of virtual reality-based interventions on cognitive function, depressive symptoms, and daily functioning in older adults with mild cognitive impairment: a systematic review and meta-analysis of randomized controlled trials to the evidence-based clinical decision-making context?",
+        "required_points": [
+          "explicitly discusses evidence-based clinical decision-making",
+          "connects the topic to practical decisions, workflows, or constraints"
+        ]
+      },
+      {
+        "qid": "q_closing",
+        "question": "Does the article close by addressing limitations, and future work for The effects of virtual reality-based interventions on cognitive function, depressive symptoms, and daily functioning in older adults with mild cognitive impairment: a systematic review and meta-analysis of randomized controlled trials?",
+        "required_points": [
+          "discusses limitations",
+          "discusses future work",
+          "identifies uncertainty, open questions, or next steps"
+        ]
+      }
+    ]
+  },
+  "corpus_dir": "./data_sample/med_papers_review_augmented_strict"
+}

@@ -602,6 +602,7 @@ class SectionDistributionResult:
     source: str
     scheme: str = "seven_section"
     reason: str = ""
+    prior_metadata: dict[str, object] | None = None
 
     def to_dict(self) -> dict[str, object]:
         output: dict[str, object] = {
@@ -618,6 +619,8 @@ class SectionDistributionResult:
         }
         if self.reason:
             output["reason"] = self.reason
+        if self.prior_metadata:
+            output["prior_metadata"] = self.prior_metadata
         return output
 
 
@@ -1442,11 +1445,14 @@ def _extract_outline_items(
 
 @lru_cache(maxsize=1)
 def _load_six_slot_section_distribution_thresholds() -> dict[str, dict[str, float]] | None:
-    from .six_slot_priors import SIX_SLOT_ORDER, SIX_SLOT_PRIORS_PATH
+    from .six_slot_priors import (
+        SIX_SLOT_ORDER,
+        load_six_slot_citation_prior_payload,
+    )
 
-    if not SIX_SLOT_PRIORS_PATH.exists():
+    payload = load_six_slot_citation_prior_payload()
+    if payload is None:
         return None
-    payload = json.loads(SIX_SLOT_PRIORS_PATH.read_text(encoding="utf-8"))
     raw_stats = payload.get("slot_stats")
     raw_mean_shares = payload.get("normalized_mean_shares")
     if not isinstance(raw_stats, Mapping) or not isinstance(raw_mean_shares, Mapping):
@@ -1472,6 +1478,25 @@ def _load_six_slot_section_distribution_thresholds() -> dict[str, dict[str, floa
             "weight": round(float(raw_weight), 6),
         }
     return thresholds
+
+
+@lru_cache(maxsize=1)
+def _load_six_slot_section_distribution_metadata() -> dict[str, object] | None:
+    from .six_slot_priors import load_six_slot_citation_prior_metadata
+
+    prior_metadata = load_six_slot_citation_prior_metadata()
+    thresholds = _load_six_slot_section_distribution_thresholds()
+    if prior_metadata is None or thresholds is None:
+        return None
+    return {
+        "prior_version": prior_metadata.get("prior_version"),
+        "source_corpus_dir": prior_metadata.get("source_corpus_dir"),
+        "article_count": prior_metadata.get("article_count"),
+        "mapped_article_count": prior_metadata.get("mapped_article_count"),
+        "slot_order": prior_metadata.get("slot_order"),
+        "threshold_source": "data_sample/six_slot_citation_priors.json",
+        "threshold_method": "soft=(p25-0.25*IQR, p75+0.25*IQR), hard=(p25-1.5*IQR, p75+1.5*IQR)",
+    }
 
 
 def _resolve_six_slot_section_mapping(
@@ -1882,6 +1907,7 @@ def _score_section_distribution_from_counts(
     source: str,
     scheme: str,
     min_citations: int,
+    prior_metadata: dict[str, object] | None = None,
 ) -> SectionDistributionResult:
     counted_keys = [
         section_key
@@ -1911,6 +1937,7 @@ def _score_section_distribution_from_counts(
             source=source,
             scheme=scheme,
             reason="low_citation_count",
+            prior_metadata=prior_metadata,
         )
 
     raw_shares = {
@@ -1942,6 +1969,7 @@ def _score_section_distribution_from_counts(
         thresholds=thresholds,
         source=source,
         scheme=scheme,
+        prior_metadata=prior_metadata,
     )
 
 
@@ -1963,6 +1991,7 @@ def score_section_distribution(
     six_slot_layout = _resolve_six_slot_section_mapping(reference, chunk_map)
     if six_slot_layout is not None:
         slot_order, slot_mapping, six_slot_thresholds = six_slot_layout
+        prior_metadata = _load_six_slot_section_distribution_metadata()
         if citation_manifest:
             manifest_counts = _citation_counts_from_manifest_by_keys(
                 citation_manifest,
@@ -1978,6 +2007,7 @@ def score_section_distribution(
                     source="citation_manifest",
                     scheme="six_slot_task",
                     min_citations=min_citations,
+                    prior_metadata=prior_metadata,
                 )
 
             text_counts = _citation_counts_from_six_slot_text(
@@ -1991,6 +2021,7 @@ def score_section_distribution(
                     source="text_regex_manifest_unmapped",
                     scheme="six_slot_task",
                     min_citations=min_citations,
+                    prior_metadata=prior_metadata,
                 )
         else:
             text_counts = _citation_counts_from_six_slot_text(
@@ -2004,6 +2035,7 @@ def score_section_distribution(
                     source="text_regex",
                     scheme="six_slot_task",
                     min_citations=min_citations,
+                    prior_metadata=prior_metadata,
                 )
 
     if citation_manifest:

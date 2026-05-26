@@ -9,7 +9,12 @@ from dataclasses import dataclass
 from typing import Mapping, Sequence
 
 from .citation import CitationChunk, classify_chunk_roles
-from .six_slot_priors import SIX_SLOT_ORDER, classify_outline_to_six_slots, load_six_slot_priors
+from .six_slot_priors import (
+    SIX_SLOT_ORDER,
+    classify_outline_to_six_slots,
+    load_six_slot_prior_metadata,
+    load_six_slot_priors,
+)
 
 
 SECTION_SHARE_PRIORS: dict[str, float] = {
@@ -66,12 +71,15 @@ class SectionBudget:
     role_adjusted_shares: dict[str, float]
     seed: str
     relative_jitter: float
+    section_prior_scheme: str
+    six_slot_prior_version: str | None = None
 
     def to_reference_payload(self) -> dict[str, object]:
-        return {
+        payload = {
             "body_target_words": self.body_target_words,
             "section_word_targets": dict(self.section_word_targets),
             "section_roles": dict(self.section_roles),
+            "section_prior_scheme": self.section_prior_scheme,
             "section_budget_trace": {
                 "seed": self.seed,
                 "relative_jitter": self.relative_jitter,
@@ -80,6 +88,9 @@ class SectionBudget:
                 "role_adjusted_shares": dict(self.role_adjusted_shares),
             },
         }
+        if self.six_slot_prior_version:
+            payload["six_slot_prior_version"] = self.six_slot_prior_version
+        return payload
 
 
 def _stable_seed_int(seed: str) -> int:
@@ -243,10 +254,11 @@ def _blend_with_uniform_section_prior(
 
 def _per_section_share_from_six_slot_priors(
     outline_items: Sequence[tuple[str, str]],
-) -> dict[str, float] | None:
+) -> tuple[dict[str, float], str | None] | None:
     slot_priors = load_six_slot_priors()
     if slot_priors is None:
         return None
+    prior_metadata = load_six_slot_prior_metadata()
     slot_by_section = classify_outline_to_six_slots(outline_items)
     if not slot_by_section:
         return None
@@ -264,10 +276,13 @@ def _per_section_share_from_six_slot_priors(
     total = sum(shares.values())
     if total <= 0:
         return None
-    return {
-        section_id: shares[section_id] / total
-        for section_id, _title in outline_items
-    }
+    return (
+        {
+            section_id: shares[section_id] / total
+            for section_id, _title in outline_items
+        },
+        None if prior_metadata is None else str(prior_metadata.get("prior_version") or ""),
+    )
 
 
 def build_section_budget(
@@ -287,8 +302,9 @@ def build_section_budget(
         raise ValueError("outline must not be empty")
 
     section_roles = _classify_outline_roles(outline_items)
-    per_section_share = _per_section_share_from_six_slot_priors(outline_items)
-    if per_section_share is None:
+    six_slot_prior_version: str | None = None
+    per_section_share_payload = _per_section_share_from_six_slot_priors(outline_items)
+    if per_section_share_payload is None:
         role_to_sections: dict[str, list[str]] = {}
         for section_id, _title in outline_items:
             role = section_roles.get(section_id, DEFAULT_ROLE_FOR_OUTLINE)
@@ -309,10 +325,13 @@ def build_section_budget(
                 per_section_share[section_id] = split_share
 
         per_section_share = _blend_with_uniform_section_prior(per_section_share)
+        section_prior_scheme = "role_prior_blended"
     else:
+        per_section_share, six_slot_prior_version = per_section_share_payload
         base_shares = {}
         jitter_factors = {}
         adjusted_role_shares = {}
+        section_prior_scheme = "six_slot_empirical"
 
     section_word_targets = _round_targets_from_shares(
         total_words=body_target_words,
@@ -328,4 +347,6 @@ def build_section_budget(
         role_adjusted_shares={key: round(value, 6) for key, value in adjusted_role_shares.items()},
         seed=task_id,
         relative_jitter=relative_jitter,
+        section_prior_scheme=section_prior_scheme,
+        six_slot_prior_version=six_slot_prior_version,
     )

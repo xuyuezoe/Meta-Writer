@@ -42,6 +42,8 @@ class MainCliTests(unittest.TestCase):
         args = self._make_args(all_tasks=True)
         resolved = main._resolve_requested_task_names(args)
         self.assertEqual(resolved, main.META_BENCH_TASK_NAMES)
+        self.assertNotIn("metabench_sample", resolved)
+        self.assertTrue(all(task_name.startswith("metabench_pmc") for task_name in resolved))
 
     def test_build_batch_summary(self) -> None:
         summary = main._build_batch_summary(
