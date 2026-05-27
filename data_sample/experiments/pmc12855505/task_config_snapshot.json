@@ -1,10 +1,9 @@
 {
   "task_name": "metabench_pmc12855505",
-  "source_article_path": "external:medical_reviews_300_ready/PMC12855505.md",
-  "task": "Write an approximately 2889-word medical review article in English on Does early pregnancy exposure to macrolide antibiotics lead to major birth defects? A systematic review and meta-analysis within clinical evidence synthesis. Keep the piece as a long-form scholarly review rather than a case report, a popular-science summary, or an outline. Open by defining the scope, discussion boundaries, and terminology, while keeping evidence-based clinical decision-making as an explicit practice context. Organize the main body around a systematic evidence synthesis framework and keep evidence-based clinical decision-making on the main line of discussion. Compare and synthesize the literature around Does early pregnancy exposure to macrolide antibiotics lead to major birth defects? A systematic review and meta-analysis. Develop at least 6 natural sections and close with limitations, and future work.",
+  "task": "Write an approximately 7700-word medical review article in English on Does early pregnancy exposure to macrolide antibiotics lead to major birth defects? A systematic review and meta-analysis within clinical evidence synthesis. Keep the piece as a long-form scholarly review rather than a case report, a popular-science summary, or an outline. Open by defining the scope, discussion boundaries, and terminology, while keeping evidence-based clinical decision-making as an explicit practice context. Organize the main body around a systematic evidence synthesis framework and keep evidence-based clinical decision-making on the main line of discussion. Compare and synthesize the literature around Does early pregnancy exposure to macrolide antibiotics lead to major birth defects? A systematic review and meta-analysis. Develop at least 6 natural sections and close with limitations, and future work.",
   "constraints": [
     "Write the article in English.",
-    "Target body length is about 2889 words overall, excluding the final references list.",
+    "Target body length is about 7700 words overall, excluding the final references list.",
     "Develop approximately 6 major sections following the outline.",
     "Keep the discussion centered on Does early pregnancy exposure to macrolide antibiotics lead to major birth defects? A systematic review and meta-analysis within clinical evidence synthesis.",
     "Use systematic evidence synthesis framework as a visible organizing logic in the main body.",
@@ -21,12 +20,12 @@
     "sec6": "Limitations, heterogeneity, and future research priorities"
   },
   "section_word_targets": {
-    "sec1": 486,
-    "sec2": 148,
-    "sec3": 181,
-    "sec4": 194,
-    "sec5": 156,
-    "sec6": 1724
+    "sec1": 805,
+    "sec2": 1364,
+    "sec3": 1666,
+    "sec4": 1780,
+    "sec5": 1436,
+    "sec6": 649
   },
   "session_name": "metabench_pmc12855505",
   "reference": {
@@ -36,9 +35,9 @@
     "domain": "clinical evidence synthesis",
     "language": "English",
     "constraints": {
-      "required_length_words": 2889,
-      "body_target_words": 2889,
-      "total_target_words": 4685,
+      "required_length_words": 7700,
+      "body_target_words": 7700,
+      "total_target_words": 9496,
       "expected_sections": 6,
       "must_include": [
         "scope",
@@ -53,12 +52,12 @@
         "CI"
       ],
       "section_word_targets": {
-        "sec1": 486,
-        "sec2": 148,
-        "sec3": 181,
-        "sec4": 194,
-        "sec5": 156,
-        "sec6": 1724
+        "sec1": 805,
+        "sec2": 1364,
+        "sec3": 1666,
+        "sec4": 1780,
+        "sec5": 1436,
+        "sec6": 649
       },
       "section_roles": {
         "sec1": "introduction",
@@ -77,57 +76,7 @@
         "The main body should include explicit comparison or synthesis at regular intervals.",
         "The second half should address limitations, evidence gaps, or future work."
       ],
-      "section_prior_scheme": "real_article_six_slot_aligned",
-      "section_budget_trace": {
-        "source": "real_article_six_slot_alignment",
-        "source_article_path": "external:medical_reviews_300_ready/PMC12855505.md",
-        "raw_article_section_count": 3,
-        "raw_article_outline": {
-          "sec1": "Introduction",
-          "sec2": "Discussion",
-          "sec3": "Conclusion"
-        },
-        "raw_article_section_word_targets": {
-          "sec1": 511,
-          "sec2": 1919,
-          "sec3": 86
-        },
-        "six_slot_order": [
-          "scope_context",
-          "framework_mechanism",
-          "evidence_methods",
-          "findings_synthesis",
-          "implications_discussion",
-          "limitations_future"
-        ],
-        "six_slot_outline": {
-          "sec1": "Scope, terminology, and practice context",
-          "sec2": "Mechanistic and organizing framework",
-          "sec3": "Evidence base, methods, and measurement strategy",
-          "sec4": "Findings and cross-study synthesis",
-          "sec5": "Clinical implications and interpretive discussion",
-          "sec6": "Limitations, heterogeneity, and future research priorities"
-        },
-        "raw_six_slot_word_targets": {
-          "sec1": 511.0,
-          "sec2": 25.7419,
-          "sec3": 66.3871,
-          "sec4": 66.3871,
-          "sec5": 33.4839,
-          "sec6": 1813.0
-        },
-        "actual_section_word_targets": {
-          "sec1": 423.1616,
-          "sec2": 129.1522,
-          "sec3": 157.8196,
-          "sec4": 168.5356,
-          "sec5": 135.977,
-          "sec6": 1501.354
-        },
-        "slot_prior_floor_factor": 0.35,
-        "scaled_to_body_target_words": 2889
-      },
-      "six_slot_prior_version": "52bb45a3787b"
+      "section_prior_scheme": "six_slot_empirical"
     },
     "outline": {
       "sec1": "Scope, terminology, and practice context",

@@ -1,10 +1,9 @@
 {
   "task_name": "metabench_pmc12864541",
-  "source_article_path": "external:medical_reviews_300_ready/PMC12864541.md",
-  "task": "Write an approximately 3849-word medical review article in English on Hoffman’s Exercise for Breastfeeding Support Among Postnatal Mothers With Nipple Defects: A Scoping Review and Exploratory Meta‐Analysis within clinical evidence synthesis. Keep the piece as a long-form scholarly review rather than a case report, a popular-science summary, or an outline. Open by defining the scope, discussion boundaries, and terminology, while keeping evidence-based clinical decision-making as an explicit practice context. Organize the main body around a mechanism and evidence framework and keep evidence-based clinical decision-making on the main line of discussion. Compare and synthesize the literature around 2. Current Evidence, 4. Results—Primary Outcome, 5. Results—Secondary Outcome, and 6. Mechanism of Action. Develop at least 6 natural sections and close with limitations, and future work.",
+  "task": "Write an approximately 7600-word medical review article in English on Hoffman’s Exercise for Breastfeeding Support Among Postnatal Mothers With Nipple Defects: A Scoping Review and Exploratory Meta‐Analysis within clinical evidence synthesis. Keep the piece as a long-form scholarly review rather than a case report, a popular-science summary, or an outline. Open by defining the scope, discussion boundaries, and terminology, while keeping evidence-based clinical decision-making as an explicit practice context. Organize the main body around a mechanism and evidence framework and keep evidence-based clinical decision-making on the main line of discussion. Compare and synthesize the literature around 2. Current Evidence, 4. Results—Primary Outcome, 5. Results—Secondary Outcome, and 6. Mechanism of Action. Develop at least 6 natural sections and close with limitations, and future work.",
   "constraints": [
     "Write the article in English.",
-    "Target body length is about 3849 words overall, excluding the final references list.",
+    "Target body length is about 7600 words overall, excluding the final references list.",
     "Develop approximately 6 major sections following the outline.",
     "Keep the discussion centered on Hoffman’s Exercise for Breastfeeding Support Among Postnatal Mothers With Nipple Defects: A Scoping Review and Exploratory Meta‐Analysis within clinical evidence synthesis.",
     "Use mechanism and evidence framework as a visible organizing logic in the main body.",
@@ -21,12 +20,12 @@
     "sec6": "Limitations, heterogeneity, and future research priorities"
   },
   "section_word_targets": {
-    "sec1": 295,
-    "sec2": 353,
-    "sec3": 445,
-    "sec4": 438,
-    "sec5": 344,
-    "sec6": 1974
+    "sec1": 795,
+    "sec2": 1346,
+    "sec3": 1645,
+    "sec4": 1756,
+    "sec5": 1417,
+    "sec6": 641
   },
   "session_name": "metabench_pmc12864541",
   "reference": {
@@ -36,9 +35,9 @@
     "domain": "clinical evidence synthesis",
     "language": "English",
     "constraints": {
-      "required_length_words": 3849,
-      "body_target_words": 3849,
-      "total_target_words": 5377,
+      "required_length_words": 7600,
+      "body_target_words": 7600,
+      "total_target_words": 9128,
       "expected_sections": 6,
       "must_include": [
         "scope",
@@ -54,12 +53,12 @@
         "future work"
       ],
       "section_word_targets": {
-        "sec1": 295,
-        "sec2": 353,
-        "sec3": 445,
-        "sec4": 438,
-        "sec5": 344,
-        "sec6": 1974
+        "sec1": 795,
+        "sec2": 1346,
+        "sec3": 1645,
+        "sec4": 1756,
+        "sec5": 1417,
+        "sec6": 641
       },
       "section_roles": {
         "sec1": "introduction",
@@ -78,71 +77,7 @@
         "The main body should include explicit comparison or synthesis at regular intervals.",
         "The second half should address limitations, evidence gaps, or future work."
       ],
-      "section_prior_scheme": "real_article_six_slot_aligned",
-      "section_budget_trace": {
-        "source": "real_article_six_slot_alignment",
-        "source_article_path": "external:medical_reviews_300_ready/PMC12864541.md",
-        "raw_article_section_count": 10,
-        "raw_article_outline": {
-          "sec1": "1. Introduction",
-          "sec2": "2. Current Evidence",
-          "sec3": "3. Methods",
-          "sec4": "4. Results—Primary Outcome",
-          "sec5": "5. Results—Secondary Outcome",
-          "sec6": "6. Mechanism of Action",
-          "sec7": "7. Clinical Interpretation of the Findings",
-          "sec8": "8. Recommendations for Future Studies",
-          "sec9": "9. Recommended Sample Size for Future Studies",
-          "sec10": "10. Conclusions"
-        },
-        "raw_article_section_word_targets": {
-          "sec1": 264,
-          "sec2": 293,
-          "sec3": 906,
-          "sec4": 398,
-          "sec5": 235,
-          "sec6": 380,
-          "sec7": 542,
-          "sec8": 89,
-          "sec9": 255,
-          "sec10": 78
-        },
-        "six_slot_order": [
-          "scope_context",
-          "framework_mechanism",
-          "evidence_methods",
-          "findings_synthesis",
-          "implications_discussion",
-          "limitations_future"
-        ],
-        "six_slot_outline": {
-          "sec1": "Scope, terminology, and practice context",
-          "sec2": "Mechanistic and organizing framework",
-          "sec3": "Evidence base, methods, and measurement strategy",
-          "sec4": "Findings and cross-study synthesis",
-          "sec5": "Clinical implications and interpretive discussion",
-          "sec6": "Limitations, heterogeneity, and future research priorities"
-        },
-        "raw_six_slot_word_targets": {
-          "sec1": 264.0,
-          "sec2": 315.9843,
-          "sec3": 397.592,
-          "sec4": 391.0606,
-          "sec5": 307.3631,
-          "sec6": 1764.0
-        },
-        "actual_section_word_targets": {
-          "sec1": 264.0,
-          "sec2": 315.9843,
-          "sec3": 397.592,
-          "sec4": 391.0606,
-          "sec5": 307.3631,
-          "sec6": 1764.0
-        },
-        "slot_prior_floor_factor": 0.35,
-        "scaled_to_body_target_words": 3849
-      },
-      "six_slot_prior_version": "52bb45a3787b"
+      "section_prior_scheme": "six_slot_empirical"
     },
     "outline": {
       "sec1": "Scope, terminology, and practice context",

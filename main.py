@@ -16,7 +16,13 @@ from dotenv import load_dotenv
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from examples.tasks import META_BENCH_TASK_NAMES, TASK_ID_REGISTRY, TASK_REGISTRY
+from examples.tasks import (
+    META_BENCH_ALL_TASK_NAMES,
+    META_BENCH_TASK_NAMES,
+    META_BENCH_TASK_TIERS,
+    TASK_ID_REGISTRY,
+    TASK_REGISTRY,
+)
 from meta_bench import META_BENCH_METRIC_ORDER, evaluate_meta_bench
 
 
@@ -38,7 +44,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--all",
         action="store_true",
-        help="Run all registered MetaBench tasks in batch mode.",
+        help="Run the default MetaBench benchmark tier in batch mode.",
     )
     parser.add_argument(
         "--list-tasks",
@@ -101,20 +107,24 @@ def _print_available_tasks() -> None:
     regular_tasks = [
         task_name
         for task_name in sorted(TASK_REGISTRY.keys())
-        if task_name not in META_BENCH_TASK_NAMES
+        if task_name not in META_BENCH_ALL_TASK_NAMES
     ]
 
     print("Available regular tasks:")
     for task_name in regular_tasks:
         print(f"  - {task_name}")
 
-    print("\nAvailable MetaBench tasks:")
-    for task_name in META_BENCH_TASK_NAMES:
+    print("\nAvailable MetaBench benchmark tasks:")
+    for task_name in META_BENCH_TASK_TIERS["benchmark"]:
         task_id = _task_id_for_name(task_name)
         if task_id is None:
             print(f"  - {task_name}")
         else:
             print(f"  - {task_name} (task_id: {task_id})")
+
+    print("\nAvailable MetaBench task tiers:")
+    for tier_name, task_names in META_BENCH_TASK_TIERS.items():
+        print(f"  - {tier_name}: {len(task_names)} task(s)")
 
 
 def _load_runtime_settings() -> dict[str, str | None]:

@@ -6,6 +6,7 @@ import unittest
 from pathlib import Path
 
 import main
+from examples.tasks import META_BENCH_TASK_TIERS, TASK_REGISTRY
 
 
 class MainCliTests(unittest.TestCase):
@@ -42,8 +43,24 @@ class MainCliTests(unittest.TestCase):
         args = self._make_args(all_tasks=True)
         resolved = main._resolve_requested_task_names(args)
         self.assertEqual(resolved, main.META_BENCH_TASK_NAMES)
-        self.assertNotIn("metabench_sample", resolved)
-        self.assertTrue(all(task_name.startswith("metabench_pmc") for task_name in resolved))
+
+    def test_default_meta_bench_tasks_are_medium_or_long_reviews(self) -> None:
+        self.assertEqual(len(META_BENCH_TASK_TIERS["benchmark"]), 26)
+        self.assertEqual(len(META_BENCH_TASK_TIERS["medium"]), 8)
+        self.assertEqual(len(META_BENCH_TASK_TIERS["long"]), 18)
+        self.assertEqual(len(META_BENCH_TASK_TIERS["all"]), 26)
+
+        for task_name in main.META_BENCH_TASK_NAMES:
+            config = TASK_REGISTRY[task_name]()
+            constraints = config["reference"]["constraints"]
+            self.assertGreaterEqual(constraints["body_target_words"], 3500)
+            self.assertNotIn("length_mode", constraints)
+            self.assertNotIn("section_budget_trace", constraints)
+
+        for task_name in META_BENCH_TASK_TIERS["long"]:
+            config = TASK_REGISTRY[task_name]()
+            constraints = config["reference"]["constraints"]
+            self.assertGreaterEqual(constraints["body_target_words"], 5000)
 
     def test_build_batch_summary(self) -> None:
         summary = main._build_batch_summary(

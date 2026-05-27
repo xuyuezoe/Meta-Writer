@@ -50,68 +50,7 @@ def get_task_config() -> Dict[str, object]:
 
     reference = config["reference"]
     constraints = reference["constraints"]
-    constraints["section_word_targets"] = {
-        "sec1": 647,
-        "sec2": 690,
-        "sec3": 803,
-        "sec4": 856,
-        "sec5": 688,
-        "sec6": 1666
-}
-    constraints["section_budget_trace"] = {
-        "source": "real_article_six_slot_alignment",
-        "source_article_path": "external:medical_reviews_300_ready/PMC12883763.md",
-        "raw_article_section_count": 5,
-        "raw_article_outline": {
-                "sec1": "Introduction",
-                "sec2": "Methods",
-                "sec3": "Results",
-                "sec4": "Discussion",
-                "sec5": "Conclusion"
-        },
-        "raw_article_section_word_targets": {
-                "sec1": 600,
-                "sec2": 275,
-                "sec3": 1978,
-                "sec4": 1730,
-                "sec5": 382
-        },
-        "six_slot_order": [
-                "scope_context",
-                "framework_mechanism",
-                "evidence_methods",
-                "findings_synthesis",
-                "implications_discussion",
-                "limitations_future"
-        ],
-        "six_slot_outline": {
-                "sec1": "Scope, terminology, and practice context",
-                "sec2": "Mechanistic and organizing framework",
-                "sec3": "Evidence base, methods, and measurement strategy",
-                "sec4": "Findings and cross-study synthesis",
-                "sec5": "Clinical implications and interpretive discussion",
-                "sec6": "Limitations, heterogeneity, and future research priorities"
-        },
-        "raw_six_slot_word_targets": {
-                "sec1": 600.0,
-                "sec2": 640.7312,
-                "sec3": 744.748,
-                "sec4": 794.5956,
-                "sec5": 638.9252,
-                "sec6": 1546.0
-        },
-        "actual_section_word_targets": {
-                "sec1": 600.0,
-                "sec2": 640.7312,
-                "sec3": 744.748,
-                "sec4": 794.5956,
-                "sec5": 638.9252,
-                "sec6": 1546.0
-        },
-        "slot_prior_floor_factor": 0.35,
-        "scaled_to_body_target_words": 5350
-}
-    constraints["section_prior_scheme"] = "real_article_six_slot_aligned"
-    constraints["six_slot_prior_version"] = '52bb45a3787b'
+    for key in ('section_budget_trace', 'six_slot_prior_version'):
+        constraints.pop(key, None)
 
     return config

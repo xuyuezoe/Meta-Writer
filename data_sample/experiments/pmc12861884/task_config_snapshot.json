@@ -1,10 +1,9 @@
 {
   "task_name": "metabench_pmc12861884",
-  "source_article_path": "external:medical_reviews_300_ready/PMC12861884.md",
-  "task": "Write an approximately 1737-word medical review article in English on Association between prediabetes and the risk of atrial fibrillation within clinical evidence synthesis. Keep the piece as a long-form scholarly review rather than a case report, a popular-science summary, or an outline. Open by defining the scope, discussion boundaries, and terminology, while keeping evidence-based clinical decision-making as an explicit practice context. Organize the main body around a systematic evidence synthesis framework and keep evidence-based clinical decision-making on the main line of discussion. Compare and synthesize the literature around atrial fibrillation, meta-analysis, prediabetes, and risk factors. Develop at least 6 natural sections and close with limitations, and future work.",
+  "task": "Write an approximately 7800-word medical review article in English on Association between prediabetes and the risk of atrial fibrillation within clinical evidence synthesis. Keep the piece as a long-form scholarly review rather than a case report, a popular-science summary, or an outline. Open by defining the scope, discussion boundaries, and terminology, while keeping evidence-based clinical decision-making as an explicit practice context. Organize the main body around a systematic evidence synthesis framework and keep evidence-based clinical decision-making on the main line of discussion. Compare and synthesize the literature around atrial fibrillation, meta-analysis, prediabetes, and risk factors. Develop at least 6 natural sections and close with limitations, and future work.",
   "constraints": [
     "Write the article in English.",
-    "Target body length is about 1737 words overall, excluding the final references list.",
+    "Target body length is about 7800 words overall, excluding the final references list.",
     "Develop approximately 6 major sections following the outline.",
     "Keep the discussion centered on Association between prediabetes and the risk of atrial fibrillation within clinical evidence synthesis.",
     "Use systematic evidence synthesis framework as a visible organizing logic in the main body.",
@@ -21,12 +20,12 @@
     "sec6": "Limitations, heterogeneity, and future research priorities"
   },
   "section_word_targets": {
-    "sec1": 620,
-    "sec2": 94,
-    "sec3": 116,
-    "sec4": 123,
-    "sec5": 100,
-    "sec6": 684
+    "sec1": 816,
+    "sec2": 1381,
+    "sec3": 1688,
+    "sec4": 1803,
+    "sec5": 1454,
+    "sec6": 658
   },
   "session_name": "metabench_pmc12861884",
   "reference": {
@@ -36,9 +35,9 @@
     "domain": "clinical evidence synthesis",
     "language": "English",
     "constraints": {
-      "required_length_words": 1737,
-      "body_target_words": 1737,
-      "total_target_words": 3753,
+      "required_length_words": 7800,
+      "body_target_words": 7800,
+      "total_target_words": 9816,
       "expected_sections": 6,
       "must_include": [
         "scope",
@@ -56,12 +55,12 @@
         "CRD420251233423"
       ],
       "section_word_targets": {
-        "sec1": 620,
-        "sec2": 94,
-        "sec3": 116,
-        "sec4": 123,
-        "sec5": 100,
-        "sec6": 684
+        "sec1": 816,
+        "sec2": 1381,
+        "sec3": 1688,
+        "sec4": 1803,
+        "sec5": 1454,
+        "sec6": 658
       },
       "section_roles": {
         "sec1": "introduction",
@@ -80,59 +79,7 @@
         "The main body should include explicit comparison or synthesis at regular intervals.",
         "The second half should address limitations, evidence gaps, or future work."
       ],
-      "section_prior_scheme": "real_article_six_slot_aligned",
-      "section_budget_trace": {
-        "source": "real_article_six_slot_alignment",
-        "source_article_path": "external:medical_reviews_300_ready/PMC12861884.md",
-        "raw_article_section_count": 4,
-        "raw_article_outline": {
-          "sec1": "Introduction",
-          "sec2": "Materials and methods",
-          "sec3": "Discussion",
-          "sec4": "Conclusion"
-        },
-        "raw_article_section_word_targets": {
-          "sec1": 573,
-          "sec2": 45,
-          "sec3": 675,
-          "sec4": 118
-        },
-        "six_slot_order": [
-          "scope_context",
-          "framework_mechanism",
-          "evidence_methods",
-          "findings_synthesis",
-          "implications_discussion",
-          "limitations_future"
-        ],
-        "six_slot_outline": {
-          "sec1": "Scope, terminology, and practice context",
-          "sec2": "Mechanistic and organizing framework",
-          "sec3": "Evidence base, methods, and measurement strategy",
-          "sec4": "Findings and cross-study synthesis",
-          "sec5": "Clinical implications and interpretive discussion",
-          "sec6": "Limitations, heterogeneity, and future research priorities"
-        },
-        "raw_six_slot_word_targets": {
-          "sec1": 573.0,
-          "sec2": 33.5515,
-          "sec3": 55.0393,
-          "sec4": 79.7019,
-          "sec5": 37.7072,
-          "sec6": 632.0
-        },
-        "actual_section_word_targets": {
-          "sec1": 503.5625,
-          "sec2": 76.8655,
-          "sec3": 93.9271,
-          "sec4": 100.3048,
-          "sec5": 80.9274,
-          "sec6": 555.4128
-        },
-        "slot_prior_floor_factor": 0.35,
-        "scaled_to_body_target_words": 1737
-      },
-      "six_slot_prior_version": "52bb45a3787b"
+      "section_prior_scheme": "six_slot_empirical"
     },
     "outline": {
       "sec1": "Scope, terminology, and practice context",

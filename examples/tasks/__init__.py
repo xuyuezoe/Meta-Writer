@@ -14,6 +14,9 @@ from .scifi_story import get_task_config as _scifi_story
 
 TaskFactory = Callable[[], dict[str, object]]
 
+REVIEW_MEDIUM_MIN_BODY_WORDS = 3500
+REVIEW_LONG_MIN_BODY_WORDS = 5000
+
 
 def _load_generated_task_exclusions() -> set[str]:
     repo_root = Path(__file__).resolve().parents[2]
@@ -78,6 +81,23 @@ def _extract_reference_task_id(task_factory: TaskFactory) -> str | None:
     return task_id or None
 
 
+def _extract_body_target_words(task_factory: TaskFactory) -> int | None:
+    config = task_factory()
+    reference = config.get("reference")
+    if not isinstance(reference, dict):
+        return None
+
+    constraints = reference.get("constraints")
+    if not isinstance(constraints, dict):
+        return None
+
+    raw_value = constraints.get("body_target_words")
+    if not isinstance(raw_value, int):
+        return None
+
+    return raw_value if raw_value > 0 else None
+
+
 TASK_ID_REGISTRY: dict[str, str] = {}
 for _task_name, _task_factory in TASK_REGISTRY.items():
     _task_id = _extract_reference_task_id(_task_factory)
@@ -87,16 +107,49 @@ for _task_name, _task_factory in TASK_REGISTRY.items():
         raise ValueError(f"Duplicate task_id registered for MetaBench tasks: {_task_id}")
     TASK_ID_REGISTRY[_task_id] = _task_name
 
-# Batch/default MetaBench runs target the real-review PMC task set.
-# Keep metabench_sample registered for explicit smoke runs, but do not include it in --all.
-META_BENCH_TASK_NAMES = sorted(
+META_BENCH_ALL_TASK_NAMES = sorted(
     task_name
     for task_name in TASK_ID_REGISTRY.values()
     if task_name.startswith("metabench_pmc")
 )
 
+META_BENCH_MEDIUM_TASK_NAMES = sorted(
+    task_name
+    for task_name in META_BENCH_ALL_TASK_NAMES
+    if (
+        (body_words := _extract_body_target_words(TASK_REGISTRY[task_name])) is not None
+        and REVIEW_MEDIUM_MIN_BODY_WORDS <= body_words < REVIEW_LONG_MIN_BODY_WORDS
+    )
+)
+
+META_BENCH_LONG_TASK_NAMES = sorted(
+    task_name
+    for task_name in META_BENCH_ALL_TASK_NAMES
+    if (
+        (body_words := _extract_body_target_words(TASK_REGISTRY[task_name])) is not None
+        and body_words >= REVIEW_LONG_MIN_BODY_WORDS
+    )
+)
+
+META_BENCH_TASK_TIERS = {
+    "medium": META_BENCH_MEDIUM_TASK_NAMES,
+    "long": META_BENCH_LONG_TASK_NAMES,
+    "benchmark": sorted(META_BENCH_MEDIUM_TASK_NAMES + META_BENCH_LONG_TASK_NAMES),
+    "all": META_BENCH_ALL_TASK_NAMES,
+}
+
+# Batch/default MetaBench runs target medium and long real-review PMC tasks.
+# Keep short PMC tasks and metabench_sample registered for explicit runs.
+META_BENCH_TASK_NAMES = list(META_BENCH_TASK_TIERS["benchmark"])
+
 __all__ = [
+    "META_BENCH_ALL_TASK_NAMES",
+    "META_BENCH_LONG_TASK_NAMES",
+    "META_BENCH_MEDIUM_TASK_NAMES",
     "META_BENCH_TASK_NAMES",
+    "META_BENCH_TASK_TIERS",
+    "REVIEW_LONG_MIN_BODY_WORDS",
+    "REVIEW_MEDIUM_MIN_BODY_WORDS",
     "TASK_ID_REGISTRY",
     "TASK_REGISTRY",
 ]

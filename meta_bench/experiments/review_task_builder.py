@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
+import random
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -11,12 +13,7 @@ from typing import Any, Mapping, Sequence
 
 from examples.tasks import TaskFactory
 from meta_bench.schemas import TaskSpec
-from meta_bench.six_slot_priors import (
-    SIX_SLOT_ORDER,
-    derive_article_six_slot_word_counts,
-    load_six_slot_prior_metadata,
-    load_six_slot_priors,
-)
+from meta_bench.six_slot_priors import derive_article_six_slot_word_counts
 from meta_bench.structure import (
     ABSTRACT_HEADINGS,
     KEYWORD_HEADINGS,
@@ -30,8 +27,20 @@ from meta_bench.task_generator import build_main_task_config
 from src.references.loaders.markdown_loader import _parse_frontmatter
 
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_CORPUS_DIR = "./data_sample/med_papers_review_augmented_strict"
+EXPANDED_LENGTH_MODE = "expanded_random_long_form"
+EXPANDED_BODY_TARGET_MIN_WORDS = 3500
+EXPANDED_BODY_TARGET_MAX_WORDS = 8000
+EXPANDED_BODY_TARGET_STEP_WORDS = 100
+PUBLIC_REVIEW_CONSTRAINT_DROP_KEYS = (
+    "length_mode",
+    "source_body_target_words",
+    "source_total_target_words",
+    "sampled_body_target_words",
+    "reference_target_words",
+    "section_budget_trace",
+    "six_slot_prior_version",
+)
 SMART_APOSTROPHES = "\u2018\u2019\u2032"
 GENERIC_OUTLINE_HEADINGS = {
     "introduction",
@@ -90,7 +99,6 @@ SECTION_ID_TO_SLOT = {
     "sec5": "implications_discussion",
     "sec6": "limitations_future",
 }
-ARTICLE_SLOT_PRIOR_FLOOR_FACTOR = 0.35
 
 
 @dataclass(frozen=True)
@@ -115,14 +123,6 @@ class DerivedReviewTask:
 
 def _normalize_space(text: object) -> str:
     return re.sub(r"\s+", " ", str(text or "")).strip()
-
-
-def _portable_source_path(path: Path) -> str:
-    resolved = path.resolve()
-    try:
-        return resolved.relative_to(REPO_ROOT).as_posix()
-    except ValueError:
-        return f"external:{resolved.parent.name}/{resolved.name}"
 
 
 def _normalize_heading_key(text: str) -> str:
@@ -221,8 +221,8 @@ def _article_outline_from_body(body: str) -> dict[str, str]:
         if count_length_units(section.body) <= 0:
             continue
         outline[f"sec{len(outline) + 1}"] = _normalize_space(section.heading)
-    if len(outline) < 3:
-        raise ValueError("derived article outline must contain at least 3 content sections")
+    if len(outline) < 2:
+        raise ValueError("derived article outline must contain at least 2 content sections")
     return outline
 
 
@@ -297,37 +297,6 @@ def _article_six_slot_word_targets(body: str) -> dict[str, float]:
     return {
         section_id: float(slot_word_counts[slot])
         for section_id, slot in SECTION_ID_TO_SLOT.items()
-    }
-
-
-def _apply_six_slot_prior_floor(
-    actual_targets: Mapping[str, float],
-) -> dict[str, float]:
-    total_words = sum(float(value) for value in actual_targets.values())
-    if total_words <= 0:
-        return {section_id: float(value) for section_id, value in actual_targets.items()}
-
-    slot_priors = load_six_slot_priors()
-    if not slot_priors:
-        return {section_id: float(value) for section_id, value in actual_targets.items()}
-
-    article_shares = {
-        section_id: float(actual_targets[section_id]) / total_words
-        for section_id in actual_targets
-    }
-    lifted_shares = {}
-    for section_id in actual_targets:
-        slot = SECTION_ID_TO_SLOT[section_id]
-        prior_floor = float(slot_priors[slot]) * ARTICLE_SLOT_PRIOR_FLOOR_FACTOR
-        lifted_shares[section_id] = max(article_shares[section_id], prior_floor)
-
-    lifted_total = sum(lifted_shares.values())
-    if lifted_total <= 0:
-        return {section_id: float(value) for section_id, value in actual_targets.items()}
-
-    return {
-        section_id: total_words * lifted_shares[section_id] / lifted_total
-        for section_id in actual_targets
     }
 
 
@@ -490,6 +459,50 @@ def _article_word_targets(
     return total_words, body_words
 
 
+def _stable_seed_int(seed: str) -> int:
+    digest = hashlib.sha256(seed.encode("utf-8")).digest()
+    return int.from_bytes(digest[:8], "big", signed=False)
+
+
+def _expanded_body_target_profile(
+    *,
+    task_id: str,
+    source_body_words: int,
+) -> dict[str, int | str]:
+    if EXPANDED_BODY_TARGET_MIN_WORDS <= 0:
+        raise ValueError("expanded body target minimum must be positive")
+    if EXPANDED_BODY_TARGET_MAX_WORDS < EXPANDED_BODY_TARGET_MIN_WORDS:
+        raise ValueError("expanded body target maximum must be >= minimum")
+    if EXPANDED_BODY_TARGET_STEP_WORDS <= 0:
+        raise ValueError("expanded body target step must be positive")
+
+    seed = f"{task_id}:{EXPANDED_LENGTH_MODE}"
+    rng = random.Random(_stable_seed_int(seed))
+    bucket_count = (
+        (EXPANDED_BODY_TARGET_MAX_WORDS - EXPANDED_BODY_TARGET_MIN_WORDS)
+        // EXPANDED_BODY_TARGET_STEP_WORDS
+    )
+    sampled_body_target_words = (
+        EXPANDED_BODY_TARGET_MIN_WORDS
+        + rng.randrange(bucket_count + 1) * EXPANDED_BODY_TARGET_STEP_WORDS
+    )
+    runtime_body_target_words = max(int(source_body_words), sampled_body_target_words)
+    return {
+        "length_mode": EXPANDED_LENGTH_MODE,
+        "length_seed": seed,
+        "expanded_body_target_min_words": EXPANDED_BODY_TARGET_MIN_WORDS,
+        "expanded_body_target_max_words": EXPANDED_BODY_TARGET_MAX_WORDS,
+        "expanded_body_target_step_words": EXPANDED_BODY_TARGET_STEP_WORDS,
+        "sampled_body_target_words": sampled_body_target_words,
+        "runtime_body_target_words": runtime_body_target_words,
+    }
+
+
+def _clean_public_review_constraints(constraints: dict[str, Any]) -> None:
+    for key in PUBLIC_REVIEW_CONSTRAINT_DROP_KEYS:
+        constraints.pop(key, None)
+
+
 def derive_review_task_from_article(
     *,
     article_path: Path,
@@ -507,11 +520,8 @@ def derive_review_task_from_article(
     abstract = _normalize_space(frontmatter.get("abstract") or "")
     keywords = _frontmatter_keywords(frontmatter.get("keywords"))
     raw_outline = _article_outline_from_body(body)
-    raw_actual_section_word_targets = _article_raw_section_word_targets(body, outline=raw_outline)
     outline = _build_canonical_six_slot_outline()
-    raw_six_slot_word_targets = _article_six_slot_word_targets(body)
-    actual_section_word_targets = _apply_six_slot_prior_floor(raw_six_slot_word_targets)
-    total_words, body_words = _article_word_targets(frontmatter, body)
+    source_total_words, source_body_words = _article_word_targets(frontmatter, body)
     article_summary = None
     if summary_csv_path is not None:
         article_summary = _read_article_summary_row(
@@ -519,15 +529,20 @@ def derive_review_task_from_article(
             paper_id=paper_id,
         )
     if article_summary is not None:
-        body_words = int(article_summary["body_target_words"])
-        total_words = int(article_summary["total_target_words"])
-    section_word_targets = _scale_section_targets(
-        actual_section_word_targets,
-        total_words=body_words,
+        source_body_words = int(article_summary["body_target_words"])
+        source_total_words = int(article_summary["total_target_words"])
+
+    task_id = f"med_{paper_id.lower()}"
+    length_profile = _expanded_body_target_profile(
+        task_id=task_id,
+        source_body_words=int(source_body_words),
     )
+    reference_target_words = max(int(source_total_words) - int(source_body_words), 0)
+    body_words = int(length_profile["runtime_body_target_words"])
+    total_words = body_words + reference_target_words
 
     spec = TaskSpec(
-        task_id=f"med_{paper_id.lower()}",
+        task_id=task_id,
         topic=_derive_topic(title),
         domain=_derive_domain(title, abstract, keywords),
         paper_type="medical_review",
@@ -557,35 +572,12 @@ def derive_review_task_from_article(
     constraints = reference.get("constraints")
     if not isinstance(constraints, dict):
         raise ValueError("generated task config is missing constraints payload")
-    constraints["section_word_targets"] = dict(section_word_targets)
-    prior_metadata = load_six_slot_prior_metadata()
-    constraints["section_budget_trace"] = {
-        "source": "real_article_six_slot_alignment",
-        "source_article_path": _portable_source_path(article_path),
-        "raw_article_section_count": len(raw_outline),
-        "raw_article_outline": dict(raw_outline),
-        "raw_article_section_word_targets": dict(raw_actual_section_word_targets),
-        "six_slot_order": list(SIX_SLOT_ORDER),
-        "six_slot_outline": dict(outline),
-        "raw_six_slot_word_targets": {
-            section_id: round(float(value), 4)
-            for section_id, value in raw_six_slot_word_targets.items()
-        },
-        "actual_section_word_targets": {
-            section_id: round(float(value), 4)
-            for section_id, value in actual_section_word_targets.items()
-        },
-        "slot_prior_floor_factor": ARTICLE_SLOT_PRIOR_FLOOR_FACTOR,
-        "scaled_to_body_target_words": int(body_words),
-    }
-    constraints["section_prior_scheme"] = "real_article_six_slot_aligned"
-    constraints["six_slot_prior_version"] = (
-        None if prior_metadata is None else str(prior_metadata.get("prior_version") or "")
-    )
+    section_word_targets = dict(constraints["section_word_targets"])
+    _clean_public_review_constraints(constraints)
 
     return DerivedReviewTask(
         paper_id=paper_id,
-        source_article_path=_portable_source_path(article_path),
+        source_article_path=str(article_path.resolve()),
         spec=spec,
         outline=dict(outline),
         section_word_targets=dict(section_word_targets),
@@ -606,7 +598,6 @@ def build_task_snapshot_from_article(
     )
     snapshot = {
         "task_name": derived.task_name,
-        "source_article_path": derived.source_article_path,
         "task": derived.config.get("task"),
         "constraints": derived.config.get("constraints"),
         "outline": derived.config.get("outline"),
@@ -624,15 +615,7 @@ def render_task_module(derived: DerivedReviewTask) -> str:
     focus_points_repr = json.dumps(list(derived.spec.focus_points), ensure_ascii=False, indent=8)
     extra_must_include_repr = json.dumps(list(derived.spec.extra_must_include), ensure_ascii=False, indent=8)
     outline_repr = json.dumps(derived.outline, ensure_ascii=False, indent=4)
-    section_word_targets_repr = json.dumps(derived.section_word_targets, ensure_ascii=False, indent=8)
-    reference = derived.config.get("reference")
-    reference_constraints = reference.get("constraints", {}) if isinstance(reference, dict) else {}
-    section_budget_trace_repr = json.dumps(
-        reference_constraints.get("section_budget_trace", {}),
-        ensure_ascii=False,
-        indent=8,
-    )
-    six_slot_prior_version_repr = repr(reference_constraints.get("six_slot_prior_version"))
+    runtime_drop_keys_repr = repr(("section_budget_trace", "six_slot_prior_version"))
 
     return (
         f'"""MetaBench task derived from review article {derived.paper_id}."""\n\n'
@@ -662,10 +645,8 @@ def render_task_module(derived: DerivedReviewTask) -> str:
         "    )\n\n"
         '    reference = config["reference"]\n'
         '    constraints = reference["constraints"]\n'
-        f"    constraints[\"section_word_targets\"] = {section_word_targets_repr}\n"
-        f"    constraints[\"section_budget_trace\"] = {section_budget_trace_repr}\n"
-        '    constraints["section_prior_scheme"] = "real_article_six_slot_aligned"\n'
-        f"    constraints[\"six_slot_prior_version\"] = {six_slot_prior_version_repr}\n\n"
+        f"    for key in {runtime_drop_keys_repr}:\n"
+        "        constraints.pop(key, None)\n\n"
         "    return config\n"
     )
 

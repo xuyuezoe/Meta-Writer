@@ -69,13 +69,20 @@ class ReviewTaskBuilderTests(unittest.TestCase):
         reference_constraints = derived.config["reference"]["constraints"]
         self.assertEqual(
             reference_constraints["section_prior_scheme"],
-            "real_article_six_slot_aligned",
+            "six_slot_empirical",
         )
-        self.assertTrue(reference_constraints["six_slot_prior_version"])
-        trace = reference_constraints["section_budget_trace"]
-        self.assertEqual(trace["source"], "real_article_six_slot_alignment")
-        self.assertEqual(trace["raw_article_section_count"], 4)
-        self.assertEqual(trace["scaled_to_body_target_words"], derived.spec.body_target_words)
+        self.assertNotIn("six_slot_prior_version", reference_constraints)
+        self.assertNotIn("section_budget_trace", reference_constraints)
+        self.assertGreaterEqual(derived.spec.body_target_words, 3500)
+        self.assertLessEqual(derived.spec.body_target_words, 8000)
+        self.assertEqual(derived.spec.body_target_words % 100, 0)
+        self.assertEqual(derived.spec.target_words, derived.spec.body_target_words + 1075)
+        self.assertNotIn("length_mode", reference_constraints)
+        self.assertNotIn("source_body_target_words", reference_constraints)
+        self.assertNotIn("source_total_target_words", reference_constraints)
+        self.assertNotIn("sampled_body_target_words", reference_constraints)
+        self.assertNotIn("reference_target_words", reference_constraints)
+        self.assertEqual(reference_constraints["body_target_words"], derived.spec.body_target_words)
 
     def test_real_review_builder_filters_correction_note_as_non_body(self):
         article_path = self._write_article(
@@ -105,8 +112,11 @@ class ReviewTaskBuilderTests(unittest.TestCase):
         )
         self.addCleanup(article_path.unlink)
 
-        with self.assertRaisesRegex(ValueError, "at least 3 content sections"):
-            derive_review_task_from_article(article_path=article_path)
+        derived = derive_review_task_from_article(article_path=article_path)
+
+        self.assertEqual(derived.spec.expected_sections, 6)
+        self.assertEqual(list(derived.outline.keys()), [f"sec{i}" for i in range(1, 7)])
+        self.assertNotIn("section_budget_trace", derived.config["reference"]["constraints"])
 
 
 if __name__ == "__main__":
