@@ -26,5 +26,5 @@ def get_task_config() -> Dict[str, object]:
     return build_main_task_config(
         spec,
         session_name="metabench_sample_med_s001",
-        corpus_dir="./data_sample/med_papers",
+        corpus_dir="./data_sample/med_papers_review_augmented_strict",
     )

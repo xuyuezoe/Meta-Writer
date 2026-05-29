@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 sys.modules.setdefault("openai", types.ModuleType("openai"))
 
+from src.core.ablation import AblationConfig
 from src.core.decision import Decision
 from src.core.ledger import CommitmentType, ConstraintType, LedgerEntry
 from src.core.plan import PlanState
@@ -74,6 +75,8 @@ class OrchestratorDslRelationTests(unittest.TestCase):
 
     def test_on_section_success_processes_relations_once_after_all_entries_added(self) -> None:
         orchestrator = SelfCorrectingOrchestrator.__new__(SelfCorrectingOrchestrator)
+        # 该测试绕过 __init__，需显式注入消融配置；完整系统下行为与改造前一致
+        orchestrator.ablation = AblationConfig.full()
         orchestrator.logger = logging.getLogger("test.orchestrator.dsl")
         orchestrator.dtg = SimpleNamespace(add_decision=lambda decision: None)
         orchestrator.correction_log = SimpleNamespace(add_success=lambda section_id, attempts: None)

@@ -23,7 +23,9 @@ from rich.panel import Panel
 from .agents.generator import Generator
 from .agents.section_planner import SectionPlanner
 from .algorithms.mrsd import MRSD
+from .core.ablation import AblationConfig
 from .core.decision import Decision
+from .core.diagnosis import DecodingConfig, DiagnosisResult, ErrorSource, ErrorTier
 from .core.meta_state import MetaState
 from .core.plan import PlanState, SectionIntent
 from .core.state import GenerationState
@@ -77,7 +79,8 @@ class SelfCorrectingOrchestrator:
         memory_path: str = "./sessions",
         session_name: str = "session",
         output_dir: str = "./outputs",
-        corpus_dir: str = "./data_sample/med_papers",
+        corpus_dir: str = "./data_sample/med_papers_review_augmented_strict",
+        ablation: Optional[AblationConfig] = None,
     ):
         """
         初始化自我修正协调器
@@ -92,10 +95,17 @@ class SelfCorrectingOrchestrator:
             session_name: 会话名称
             output_dir: 输出目录（运行日志和相关工件的统一落盘位置）
             corpus_dir: 论文数据集目录（Markdown paper corpus）
+            ablation: 消融配置；为 None 时默认完整系统（Full），即所有机制启用。
+                      该参数是消融实验的唯一总开关，由 experiments 执行层注入。
+
+        关键实现细节：
+            ablation 默认 AblationConfig.full()，保证未启用消融时系统行为与
+            改造前逐字节一致。各消融分支均在对应挂钩点以 self.ablation.* 显式判断。
         """
         self.llm_client       = llm_client
+        self.ablation         = ablation if ablation is not None else AblationConfig.full()
         self.dtg              = DTGStore(memory_path, session_name=session_name)
-        self.meta_state       = MetaState()
+        self.meta_state       = MetaState(no_metastate=self.ablation.no_metastate)
         self.console          = Console()
         self.logger           = logging.getLogger(__name__)
         self.run_logger       = RunLogger(output_dir=output_dir, session_name=session_name)
@@ -333,22 +343,42 @@ class SelfCorrectingOrchestrator:
                         current_idx += 1
                         break
 
+                    # 消融分支（A0 No Correction）：移除全部在线修正机制。
+                    # 验证失败时不诊断、不修复，直接接受当前内容并前进（单次生成基线）。
+                    if self.ablation.no_correction:
+                        self._accept_uncorrected_section(
+                            section_id=section_id,
+                            content=content,
+                            decision=decision,
+                            state=state,
+                            generated_content=generated_content,
+                            report=report,
+                        )
+                        consecutive_failures_this_section = 0
+                        current_idx += 1
+                        break
+
                     # 验证失败：MRSD 诊断
                     last_failure_reason = "validator_unknown"
                     consecutive_failures_this_section += 1
-                    diagnosis = self.mrsd.diagnose(
-                        report=report,
-                        current_section_id=section_id,
-                        section_queue=section_queue,
-                        contamination_risk_score=self.meta_state.contamination_risk_score,
-                        consecutive_failures_this_section=consecutive_failures_this_section,
-                        low_trust_dsl_ref_ratio=self._compute_low_trust_ratio(section_id),
-                        last_purge_succeeded=last_purge_succeeded,
-                        intent_from_trusted_dsl=(
-                            section_intent.dsl_trust_at_generation > 0.6
-                        ),
-                        recent_section_failure_tiers=[],
-                    )
+                    # 消融分支（A2 No MRSD）：跳过最小责任归因，固定走 local_rewrite，
+                    # 模拟"无诊断的盲目重试"（预期：高约束任务 CVR 大幅上升）。
+                    if self.ablation.no_mrsd:
+                        diagnosis = self._fixed_local_rewrite_diagnosis()
+                    else:
+                        diagnosis = self.mrsd.diagnose(
+                            report=report,
+                            current_section_id=section_id,
+                            section_queue=section_queue,
+                            contamination_risk_score=self.meta_state.contamination_risk_score,
+                            consecutive_failures_this_section=consecutive_failures_this_section,
+                            low_trust_dsl_ref_ratio=self._compute_low_trust_ratio(section_id),
+                            last_purge_succeeded=last_purge_succeeded,
+                            intent_from_trusted_dsl=(
+                                section_intent.dsl_trust_at_generation > 0.6
+                            ),
+                            recent_section_failure_tiers=[],
+                        )
 
                     # 记录诊断事件
                     diag_event_id = self.metric_collector.record_diagnosis(
@@ -566,7 +596,13 @@ class SelfCorrectingOrchestrator:
                         length_retry_hint = None
 
                     # 执行修复
-                    if not _citation_only_failure and diagnosis.repair_scope == "partial_rollback":
+                    # 消融分支（A7 No Memory Purge）：禁用三层修复中的 memory_purge，
+                    # 将其强制降级为 partial_rollback（预期：低信任任务失败率上升）。
+                    effective_scope = diagnosis.repair_scope
+                    if self.ablation.no_memory_purge and effective_scope == "memory_purge":
+                        effective_scope = "partial_rollback"
+
+                    if not _citation_only_failure and effective_scope == "partial_rollback":
                         # 回退策略：需要 MetaState 门控
                         if (
                             not self.meta_state.gate_action("allow_rollback")
@@ -616,7 +652,7 @@ class SelfCorrectingOrchestrator:
                             self.logger.warning("回退执行失败，降级为 local_rewrite")
                             continue
 
-                    elif not _citation_only_failure and diagnosis.repair_scope == "memory_purge":
+                    elif not _citation_only_failure and effective_scope == "memory_purge":
                         # 精确记忆清除
                         purged = self.dsl.purge_contaminated_entries(
                             contaminated_section=section_id,
@@ -754,6 +790,23 @@ class SelfCorrectingOrchestrator:
         返回值：
             SectionIntent：生成的局部计划
         """
+        # 消融分支（A4 No SectionPlanner）：跳过分节意图规划，返回最简 SectionIntent。
+        # 最简意图仅含通用目标，无 coverage/commitments/scope 约束，且 word_target=None，
+        # 使生成失去局部规划引导（预期：length_score 与 completion_rate 下降，长任务尤甚）。
+        if self.ablation.no_planner:
+            return SectionIntent.create(
+                section_id=section_id,
+                local_goal=f"Write the section titled: {section_title}",
+                scope_boundary="",
+                coverage_requirements=[],
+                commitments_to_maintain=[],
+                risks_to_avoid=[],
+                success_criteria=["The content addresses the section title."],
+                source_dsl_entry_ids=[],
+                dsl_trust_at_generation=self.dsl.compute_memory_trust_level(),
+                word_target=None,
+            )
+
         memory_trust = self.dsl.compute_memory_trust_level()
         low_trust_ids = self.dsl.get_low_trust_entry_ids(threshold=0.5)
         dsl_entry_ids = [e.entry_id for e in self.dsl.get_active_entries()]
@@ -829,6 +882,14 @@ class SelfCorrectingOrchestrator:
             section_queue: 全局节列表
             current_idx: 当前节序号（0-based）
         """
+        # 消融分支（A1 No DSL）：移除话语状态账本，注入恒为空。
+        # 生成时不再获得任何跨节承诺约束（预期：长任务实体一致性 ECS 下降）。
+        if self.ablation.no_dsl:
+            state.dsl_injection = ""
+            if getattr(self, "run_logger", None) is not None:
+                self.run_logger.log_dsl_injection(section_id, [])
+            return
+
         injectable = self.dsl.get_injectable_entries(
             target_section_idx=current_idx,
             total_sections=len(section_queue),
@@ -859,6 +920,85 @@ class SelfCorrectingOrchestrator:
         """
         if state.dsl_injection:
             state.dsl_injection = "[Important] Strictly follow the DSL state constraints below:\n" + state.dsl_injection
+
+    # ------------------------------------------------------------------
+    # 消融辅助
+    # ------------------------------------------------------------------
+
+    def _fixed_local_rewrite_diagnosis(self) -> DiagnosisResult:
+        """
+        构造固定的 local_rewrite 诊断结果（A2 No MRSD 专用）
+
+        功能：
+            在跳过 MRSD 归因时，返回一个固定指向 local_rewrite 的诊断对象，
+            使主循环走"无诊断的盲目本地重写"路径，而非任何回退或清除操作。
+
+        返回值：
+            DiagnosisResult：error_tier=REALIZATION、error_source=AMBIGUOUS、
+                repair_scope="local_rewrite"、无回退目标、置信度 0、
+                解码配置取 REALIZATION 档（高温重写，不强化注入、不重规划）。
+
+        关键实现细节：
+            REALIZATION 档 decoding_config 的 trigger_section_intent_revision=False、
+            strengthen_dsl_injection=False，确保 A2 路径不混入规划修订或注入强化，
+            从而干净地隔离"无诊断"这一单一变量。
+        """
+        return DiagnosisResult(
+            error_tier=ErrorTier.REALIZATION,
+            error_source=ErrorSource.AMBIGUOUS,
+            repair_scope="local_rewrite",
+            target_section=None,
+            causal_subgraph=[],
+            confidence=0.0,
+            decoding_config=DecodingConfig.for_tier(ErrorTier.REALIZATION),
+            evidence=["ablation_no_mrsd: diagnosis bypassed, fixed local_rewrite"],
+        )
+
+    def _accept_uncorrected_section(
+        self,
+        section_id: str,
+        content: Optional[str],
+        decision: Optional[Decision],
+        state: GenerationState,
+        generated_content: Dict[str, str],
+        report: Optional[Any],
+    ) -> None:
+        """
+        接受未经修正的章节内容（A0 No Correction 专用）
+
+        功能：
+            在移除全部在线修正机制时，验证失败后不重试、不诊断、不修复，
+            直接接受当前已生成内容并登记，使系统退化为"单次生成"基线。
+
+        参数：
+            section_id:        当前节 ID
+            content:           已生成内容（可能为 None，作降级强制转换）
+            decision:          对应决策（可能为 None）
+            state:             生成状态
+            generated_content: 已生成内容字典
+            report:            验证报告（用于记录失败项，可能为 None）
+
+        关键实现细节：
+            与 degraded_acceptance 路径一致地登记内容与状态，但语义不同：
+            A0 是"设计上不修正"，而 degraded 是"修正预算耗尽后兜底"。
+            此处不提取 DSL 承诺、不触发任何修复，保证基线纯净。
+        """
+        accepted_content = self._coerce_degraded_section_content(content)
+        generated_content[section_id] = accepted_content
+        state.generated_sections.append(section_id)
+        state.section_snippets[section_id] = accepted_content[:300]
+        state.section_summaries[section_id] = accepted_content[:500]
+        state.update_progress()
+        if decision is not None:
+            self.dtg.add_decision(decision)
+
+        failures = report.failures if report is not None else []
+        self.correction_log.add_failure(section_id, failures)
+        self.metric_collector.record_section_first_pass(section_id, passed_on_first_try=False)
+        self.logger.info(
+            "ablation_no_correction: section=%s 接受未修正内容（单次生成基线）",
+            section_id,
+        )
 
     # ------------------------------------------------------------------
     # 成功处理
@@ -908,28 +1048,35 @@ class SelfCorrectingOrchestrator:
         self.correction_log.add_success(section_id, attempt + 1)
 
         # 提取承诺并写入 DSL
+        # 消融分支（A1 No DSL）：跳过承诺提取，不积累任何跨节话语记忆。
         new_entries: List[Any] = []
-        try:
-            new_entries = self.commitment_extractor.extract(
-                section_content=content,
-                section_id=section_id,
-                decision_id=decision.decision_id,
-                existing_summary="; ".join(state.section_summaries.get(sid, "")[:100] for sid in state.generated_sections[-3:-1]),
-            )
-            for entry in new_entries:
-                # Phase 3 DSL 溯源：记录产生此条目的 DTG 决策节点
-                entry.source_node = decision.decision_id
-                self.dsl.add_entry(entry)
-        except Exception as e:
-            self.logger.warning("承诺提取失败（跳过）：%s", e)
+        if not self.ablation.no_dsl:
+            try:
+                new_entries = self.commitment_extractor.extract(
+                    section_content=content,
+                    section_id=section_id,
+                    decision_id=decision.decision_id,
+                    existing_summary="; ".join(state.section_summaries.get(sid, "")[:100] for sid in state.generated_sections[-3:-1]),
+                )
+                for entry in new_entries:
+                    # Phase 3 DSL 溯源：记录产生此条目的 DTG 决策节点
+                    entry.source_node = decision.decision_id
+                    self.dsl.add_entry(entry)
+            except Exception as e:
+                self.logger.warning("承诺提取失败（跳过）：%s", e)
 
-        relation_stats = self.dsl.process_pending_relations(
-            section_id=section_id,
-            max_pairs=self.DSL_RELATION_MAX_PAIRS_PER_SECTION,
-            batch_size=self.DSL_RELATION_BATCH_SIZE,
-            confidence_threshold=self.DSL_RELATION_MIN_CONFIDENCE,
-        )
-        self._log_dsl_relation_stats(section_id, len(new_entries), relation_stats)
+        # 消融分支（A1 No DSL / A6 No DSL Relations）：跳过 DSL 关系层处理。
+        # A1 无条目可关联；A6 显式关闭关系判定（预期：长任务承诺冲突增多）。
+        if self.ablation.no_dsl or self.ablation.no_dsl_relations:
+            relation_stats: Dict[str, Any] = {}
+        else:
+            relation_stats = self.dsl.process_pending_relations(
+                section_id=section_id,
+                max_pairs=self.DSL_RELATION_MAX_PAIRS_PER_SECTION,
+                batch_size=self.DSL_RELATION_BATCH_SIZE,
+                confidence_threshold=self.DSL_RELATION_MIN_CONFIDENCE,
+            )
+            self._log_dsl_relation_stats(section_id, len(new_entries), relation_stats)
 
         # 更新 DSL 稳定性
         self.dsl.update_entry_stability(section_id, state.generated_sections)

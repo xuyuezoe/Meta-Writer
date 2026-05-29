@@ -100,9 +100,9 @@ class TaskGeneratorTests(unittest.TestCase):
         self.assertEqual(sum(reference_constraints["section_word_targets"].values()), 4200)
 
     def test_build_main_task_config_accepts_optional_corpus_dir(self):
-        config = build_main_task_config(self.spec, corpus_dir="./data_sample/med_papers")
+        config = build_main_task_config(self.spec, corpus_dir="./data_sample/med_papers_review_augmented_strict")
 
-        self.assertEqual(config["corpus_dir"], "./data_sample/med_papers")
+        self.assertEqual(config["corpus_dir"], "./data_sample/med_papers_review_augmented_strict")
 
     def test_body_target_words_override_changes_prompt_and_section_budgets(self):
         spec = TaskSpec(

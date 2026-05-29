@@ -61,6 +61,10 @@ class MetaState:
 
     validator_score_history: List[float] = field(default_factory=list)
 
+    # 消融开关（A3 No MetaState）：为 True 时 gate_action 无条件放行所有动作，
+    # 使元认知门控退化为"静态全放行"，用于验证门控对效率/误干预的贡献。
+    no_metastate: bool = False
+
     def gate_action(self, action: str) -> bool:
         """
         元认知行为门控接口
@@ -91,7 +95,15 @@ class MetaState:
             "strengthen_dsl_injection"：
                 memory_trust_level < 0.5 时返回 True
                 或 contamination_risk_score > 0.6 时返回 True
+
+        消融分支（A3 No MetaState）：
+            no_metastate 为 True 时，门控退化为无条件放行（恒返回 True），
+            模拟"无元认知门控"的系统，用于隔离门控机制的贡献。
         """
+        # 第零阶段：消融门控（A3）。置于最前以彻底短路所有门控逻辑。
+        if self.no_metastate:
+            return True
+
         if action == "trust_validator_major":
             return self.validator_stability_estimate >= 0.5
 

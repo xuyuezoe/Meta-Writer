@@ -1,0 +1,11 @@
+{
+  "_comment": "surveyforge 接入配置（已接入真实 repo + 医学语料重建库 + MiniMax 端点）。",
+  "system": "surveyforge",
+  "repo_url": "https://github.com/Alpha-Innovator/SurveyForge",
+  "repo_path": "/home/user/baselines/surveyforge/code",
+  "python_executable": "/home/user/miniconda3/envs/surveyforge/bin/python",
+  "bridge_script": "/home/user/baselines/surveyforge/code/metawriter_bridge.py",
+  "extra_args": [],
+  "timeout_seconds": 7200,
+  "env_file": ""
+}

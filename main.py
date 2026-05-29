@@ -56,12 +56,55 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="Print the full generated text in the terminal.",
     )
+    # ── 实验模式参数（委托 experiments 执行层）─────────────────────────────
+    # 触发条件：提供 --ablation / --model / --baseline 任一即进入实验模式，
+    # 产物写入 experiments_out/，与默认 outputs/ 隔离。
+    parser.add_argument(
+        "--ablation",
+        type=str,
+        default=None,
+        help="Experiment mode: run MetaWriter with an ablation preset (e.g. full, a1_no_dsl). Requires --task-id.",
+    )
+    parser.add_argument(
+        "--model",
+        type=str,
+        default=None,
+        help="Experiment mode: backbone model alias (minimax/gpt-4o/claude-sonnet/deepseek-v3/qwen2.5-72b).",
+    )
+    parser.add_argument(
+        "--baseline",
+        type=str,
+        default=None,
+        help="Experiment mode: run a comparison system (direct-llm/autosurvey/lira/surveyforge/paperorchestra). Requires --task-id.",
+    )
+    parser.add_argument(
+        "--run-id",
+        type=str,
+        default="r1",
+        help="Experiment mode: repeat-run identifier (e.g. r1/r2/r3).",
+    )
+    parser.add_argument(
+        "--exp-root",
+        type=str,
+        default="./experiments_out/runs",
+        help="Experiment mode: root directory for run artifacts.",
+    )
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Experiment mode: re-run even if a summary already exists (disable resume).",
+    )
     args = parser.parse_args()
 
     if args.all and (args.task_name or args.task_id):
         parser.error("--all cannot be combined with --task/--task-name or --task-id")
     if args.task_name and args.task_id:
         parser.error("--task/--task-name cannot be combined with --task-id")
+
+    if (args.ablation or args.baseline) and not args.task_id:
+        parser.error("--ablation/--baseline require --task-id")
+    if args.ablation and args.baseline:
+        parser.error("--ablation and --baseline cannot be combined (choose MetaWriter or a baseline)")
 
     return args
 
@@ -436,7 +479,7 @@ def _run_single_task(
         base_url=runtime_settings["base_url"],
     )
     corpus_dir_value = config.get("corpus_dir")
-    corpus_dir = str(corpus_dir_value) if isinstance(corpus_dir_value, str) else "./data_sample/med_papers"
+    corpus_dir = str(corpus_dir_value) if isinstance(corpus_dir_value, str) else "./data_sample/med_papers_review_augmented_strict"
     orchestrator = SelfCorrectingOrchestrator(
         client,
         memory_path=str(memory_dir),
@@ -625,11 +668,97 @@ def _build_batch_summary(results: list[dict[str, object]]) -> dict[str, object]:
     }
 
 
+def _is_experiment_mode(args: argparse.Namespace) -> bool:
+    """是否进入实验模式（提供消融/模型/对比系统任一即触发）"""
+    return bool(args.ablation or args.baseline or args.model)
+
+
+def _run_experiment_mode(args: argparse.Namespace) -> None:
+    """
+    实验模式分派：委托 experiments 执行层运行单次 MetaWriter/对比系统任务
+
+    功能：
+        - --baseline 给定：运行对比系统（Direct-LLM 需骨干模型解析）。
+        - 否则：运行 MetaWriter（消融预设默认 full）。
+        骨干模型别名默认 "minimax"，从 baseline_env / 环境变量解析真实模型与密钥。
+
+    参数：
+        args: 已解析的命令行参数（保证含 task_id）
+
+    关键实现细节：
+        延迟导入 experiments，避免默认路径加载实验依赖。
+    """
+    from experiments.config.ablation import from_preset
+    from experiments.config.backbone import get_backbone
+    from experiments.runners import run_baseline_task, run_metawriter_task
+
+    # 载入配置来源（不覆盖已存在的环境变量，命令行环境优先）：
+    #   1. 项目根 .env（legacy 三元组 API_KEY/MODEL/BASE_URL，供 "default" 骨干别名）
+    #   2. baseline_env.env（五骨干模型的 *_MODEL/*_BASE_URL/*_API_KEY）
+    load_dotenv(override=False)
+    baseline_env_file = Path("experiments/baselines/envs/baseline_env.env")
+    if baseline_env_file.exists():
+        load_dotenv(dotenv_path=str(baseline_env_file), override=False)
+
+    model_alias = args.model or "minimax"
+
+    if args.baseline:
+        system_name = args.baseline.strip().lower()
+        resolved = None
+        if system_name == "direct-llm":
+            resolved = get_backbone(model_alias).resolve()
+        summary = run_baseline_task(
+            task_id=args.task_id,
+            system_name=system_name,
+            model_label=model_alias,
+            resolved_backbone=resolved,
+            run_id=args.run_id,
+            root_dir=args.exp_root,
+            overwrite=bool(args.overwrite),
+        )
+    else:
+        ablation = from_preset(args.ablation) if args.ablation else from_preset("full")
+        resolved = get_backbone(model_alias).resolve()
+        summary = run_metawriter_task(
+            task_id=args.task_id,
+            ablation=ablation,
+            resolved_backbone=resolved,
+            run_id=args.run_id,
+            root_dir=args.exp_root,
+            overwrite=bool(args.overwrite),
+        )
+
+    print("=" * 60)
+    print("Experiment run complete")
+    print("=" * 60)
+    print(f"  task_id:   {summary.get('task_id')}")
+    print(f"  method:    {summary.get('method')}")
+    print(f"  model:     {summary.get('model')}")
+    print(f"  run_id:    {summary.get('run_id')}")
+    print(f"  status:    {summary.get('status')}")
+    print(f"  words:     {summary.get('word_count')}")
+    scores = summary.get("meta_bench_scores", {})
+    if isinstance(scores, dict) and scores:
+        print("  MetaBench scores:")
+        for metric_name, value in scores.items():
+            print(f"    {metric_name}: {value}")
+    prefix = summary.get("provenance", {}).get("run_prefix", "")
+    print(f"\n  bundle: {args.exp_root}/{prefix}/")
+
+
 def main() -> None:
     args = _parse_args()
 
     if args.list_tasks:
         _print_available_tasks()
+        return
+
+    if _is_experiment_mode(args):
+        try:
+            _run_experiment_mode(args)
+        except Exception as exc:
+            print(f"Experiment run failed: {exc}")
+            print(traceback.format_exc())
         return
 
     try:

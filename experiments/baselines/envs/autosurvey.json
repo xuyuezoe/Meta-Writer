@@ -1,0 +1,11 @@
+{
+  "_comment": "autosurvey 接入配置（已接入真实 repo + 医学语料重建库）。",
+  "system": "autosurvey",
+  "repo_url": "https://github.com/AutoSurveys/AutoSurvey",
+  "repo_path": "/home/user/baselines/autosurvey",
+  "python_executable": "/home/user/miniconda3/envs/autosurvey/bin/python",
+  "bridge_script": "/home/user/baselines/autosurvey/metawriter_bridge.py",
+  "extra_args": [],
+  "timeout_seconds": 5400,
+  "env_file": ""
+}
