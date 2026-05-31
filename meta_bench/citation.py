@@ -29,14 +29,18 @@ BODY_SIGNAL_WORD_LIMIT = 220
 BODY_SIGNAL_SENTENCE_LIMIT = 3
 MIN_CITATIONS_FOR_DISTRIBUTION = 5
 CITATION_COUNT_THRESHOLDS = {
-    "soft_lower": 15.925081813247026,
-    "soft_upper": 75.58272083125884,
-    "hard_lower": 8.16321376261669,
-    "hard_upper": 206.2037978301487,
+    # Calibrated from medical_reviews_300_ready/article_summary.csv using
+    # whole-body citation density: body citation events per 1,000 body words.
+    "soft_lower": 15.047717849932427,
+    "soft_upper": 71.44435519935337,
+    "hard_lower": 5.141388174807198,
+    "hard_upper": 144.21855146124523,
 }
 SOURCE_BALANCE_THRESHOLDS = {
+    # Calibrated from the same 300-review corpus using the runtime metric:
+    # max citations to a single source divided by total body citation events.
     "soft_upper": 0.22767379679144395,
-    "hard_upper": 0.8672361000585664,
+    "hard_upper": 0.7058823529411765,
 }
 
 SEVEN_SECTION_KEYS = [
