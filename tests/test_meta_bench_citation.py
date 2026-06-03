@@ -576,13 +576,14 @@ class SourceBalanceScoreTests(unittest.TestCase):
                 {"citation_id": "C3", "source_id": "S3"},
                 {"citation_id": "C4", "source_id": "S4"},
                 {"citation_id": "C5", "source_id": "S5"},
+                {"citation_id": "C6", "source_id": "S6"},
             ],
         )
 
         self.assertEqual(result.source, "citation_manifest")
         self.assertEqual(result.score, 1.0)
         self.assertEqual(result.penalty, 0.0)
-        self.assertEqual(result.max_single_source_share, 0.2)
+        self.assertEqual(result.max_single_source_share, 0.1667)
 
     def test_source_balance_penalizes_high_share(self):
         result = score_source_balance(

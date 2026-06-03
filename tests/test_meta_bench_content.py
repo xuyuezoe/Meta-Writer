@@ -78,8 +78,43 @@ class ProxyHitRateTests(unittest.TestCase):
         self.assertEqual(result.score, 0.5)
         self.assertEqual(result.answered_count, 1)
         self.assertEqual(result.question_total, 2)
+        self.assertEqual(result.covered_point_count, 1)
+        self.assertEqual(result.required_point_total, 2)
         self.assertEqual(result.decisions[0].covered_points, ["scope defined"])
         self.assertEqual(result.decisions[1].missing_points, ["gaps discussed"])
+
+    def test_score_proxy_hit_rate_uses_required_point_coverage(self):
+        class IncompleteProxyJudge:
+            def judge_proxy_question(self, *, final_text, question):
+                return ProxyQuestionDecision(
+                    qid=question.qid,
+                    question=question.question,
+                    answered=True,
+                    covered_points=["scope"],
+                    missing_points=["limitations"],
+                    rationale="partially covered",
+                )
+
+        questions = [
+            ProxyQuestionSpec(
+                "q1",
+                "Does it cover scope and limitations?",
+                ["scope", "limitations"],
+            ),
+        ]
+
+        result = score_proxy_hit_rate(
+            "Generated article text.",
+            questions,
+            IncompleteProxyJudge(),
+        )
+
+        self.assertEqual(result.score, 0.5)
+        self.assertEqual(result.answered_count, 0)
+        self.assertEqual(result.covered_point_count, 1)
+        self.assertEqual(result.required_point_total, 2)
+        self.assertTrue(result.decisions[0].answered)
+        self.assertEqual(result.decisions[0].missing_points, ["limitations"])
 
     def test_evaluate_content_dimension_adds_proxy_score_when_judge_is_provided(self):
         reference = {

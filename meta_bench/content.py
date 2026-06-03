@@ -61,6 +61,8 @@ class ProxyHitRateResult:
     score: float
     answered_count: int
     question_total: int
+    covered_point_count: int
+    required_point_total: int
     decisions: list[ProxyQuestionDecision]
 
     def to_dict(self) -> dict[str, object]:
@@ -68,6 +70,8 @@ class ProxyHitRateResult:
             "proxy_hit_rate": self.score,
             "answered_count": self.answered_count,
             "question_total": self.question_total,
+            "covered_point_count": self.covered_point_count,
+            "required_point_total": self.required_point_total,
             "decisions": [
                 {
                     "qid": decision.qid,
@@ -250,6 +254,11 @@ def build_proxy_question_judge_prompt(
         "You are a benchmark judge. Decide whether the generated article answers "
         "the topic-derived proxy question.\n\n"
         "Use only the generated article. Do not reward unsupported assumptions.\n"
+        "Classify every required answer point independently. Copy each required "
+        "answer point into exactly one of covered_points or missing_points. "
+        "Set answered=true only when every required answer point is directly "
+        "covered. If any required point is missing, vague, or only implied, "
+        "set answered=false.\n"
         "Return strict JSON with this schema:\n"
         '{\n'
         '  "answered": true,\n'
@@ -292,8 +301,12 @@ def parse_proxy_question_judge_response(
         qid=question.qid,
         question=question.question,
         answered=bool(parsed.get("answered", False)),
-        covered_points=[str(point) for point in covered_points],
-        missing_points=[str(point) for point in missing_points],
+        covered_points=[
+            str(point).strip() for point in covered_points if str(point).strip()
+        ],
+        missing_points=[
+            str(point).strip() for point in missing_points if str(point).strip()
+        ],
         rationale=str(parsed.get("rationale", "")),
     )
 
@@ -315,13 +328,14 @@ def score_proxy_hit_rate(
     proxy_questions: Sequence[ProxyQuestionSpec],
     judge: ProxyQuestionJudge,
 ) -> ProxyHitRateResult:
-    """Score how many topic-derived proxy questions are answered.
+    """Score how many required proxy-question points are covered.
 
     Formula:
-        proxy_hit_rate = answered_question_count / proxy_question_total
+        proxy_hit_rate = covered_required_point_count / required_point_total
 
-    The judge is responsible for deciding whether the generated article covers
-    each question's required answer points.
+    ``answered_count`` remains a whole-question diagnostic: a question is fully
+    answered only when the judge marks it answered and reports no missing
+    required points.
     """
 
     if not isinstance(final_text, str) or final_text.strip() == "":
@@ -333,12 +347,32 @@ def score_proxy_hit_rate(
         judge.judge_proxy_question(final_text=final_text, question=question)
         for question in proxy_questions
     ]
-    answered_count = sum(1 for decision in decisions if decision.answered)
-    score = answered_count / len(proxy_questions)
+    answered_count = sum(
+        1 for decision in decisions if decision.answered and not decision.missing_points
+    )
+    covered_point_count = 0
+    required_point_total = 0
+    for question, decision in zip(proxy_questions, decisions):
+        required_count = len(question.required_points)
+        if required_count == 0:
+            required_point_total += 1
+            if decision.answered and not decision.missing_points:
+                covered_point_count += 1
+            continue
+
+        required_point_total += required_count
+        covered_count = len({point.casefold() for point in decision.covered_points})
+        if covered_count == 0 and decision.answered and not decision.missing_points:
+            covered_count = required_count
+        covered_point_count += min(required_count, covered_count)
+
+    score = covered_point_count / required_point_total
     return ProxyHitRateResult(
         score=score,
         answered_count=answered_count,
         question_total=len(proxy_questions),
+        covered_point_count=covered_point_count,
+        required_point_total=required_point_total,
         decisions=decisions,
     )
 

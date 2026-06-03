@@ -39,7 +39,7 @@ CITATION_COUNT_THRESHOLDS = {
 SOURCE_BALANCE_THRESHOLDS = {
     # Calibrated from the same 300-review corpus using the runtime metric:
     # max citations to a single source divided by total body citation events.
-    "soft_upper": 0.22767379679144395,
+    "soft_upper": 0.18181818181818182,
     "hard_upper": 0.7058823529411765,
 }
 
