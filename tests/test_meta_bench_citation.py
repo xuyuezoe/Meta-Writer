@@ -6,6 +6,7 @@ from meta_bench.citation import (
     CitationChunk,
     CitationEvent,
     classify_chunk_role,
+    event_source_fidelity_penalty,
     evaluate_citation_dimension,
     infer_claim_strength,
     infer_evidence_strength,
@@ -117,6 +118,32 @@ class SourceFidelityTests(unittest.TestCase):
         self.assertEqual(infer_claim_strength(event), 4)
         self.assertEqual(infer_evidence_strength(event), 2)
 
+    def test_evidence_text_cues_raise_strength_by_one_level(self):
+        event = CitationEvent(
+            citation_id="C1",
+            chunk_id="sec1",
+            source_id="S1",
+            source_type="mechanistic",
+            claim_role="unknown",
+            claim_span="The evidence suggests a pathway.",
+            source_excerpt="A meta-analysis of randomized trials reported benefit.",
+        )
+
+        self.assertEqual(infer_evidence_strength(event), 2)
+
+    def test_one_level_strength_gap_gets_mild_penalty(self):
+        event = CitationEvent(
+            citation_id="C1",
+            chunk_id="sec1",
+            source_id="S1",
+            source_type="cohort",
+            claim_role="effect",
+            claim_span="The exposure improves outcomes.",
+            source_excerpt="",
+        )
+
+        self.assertAlmostEqual(event_source_fidelity_penalty(event), 0.2)
+
     def test_score_source_fidelity_penalizes_overclaiming(self):
         final_text = """## Introduction
 
@@ -148,8 +175,8 @@ Trials and cohorts are compared here.
         self.assertEqual(result.citation_count, 2)
         self.assertEqual(result.overclaim_count, 1)
         self.assertEqual(result.severe_overclaim_count, 1)
-        self.assertAlmostEqual(result.penalty, 0.4)
-        self.assertAlmostEqual(result.score, 0.6)
+        self.assertAlmostEqual(result.penalty, 0.45)
+        self.assertAlmostEqual(result.score, 0.55)
 
     def test_evaluate_citation_dimension_extracts_manifest_and_chunks(self):
         final_text = "Plain text fallback body."

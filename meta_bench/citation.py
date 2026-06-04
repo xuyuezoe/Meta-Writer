@@ -1251,11 +1251,12 @@ def infer_evidence_strength(event: CitationEvent) -> int:
 
     if event.evidence_strength is not None:
         return int(_clamp(event.evidence_strength, 0, 4))
-    strength = SOURCE_TYPE_STRENGTH.get(event.source_type, 1)
+    base_strength = SOURCE_TYPE_STRENGTH.get(event.source_type, 1)
+    strength = base_strength
     evidence_text = event.source_excerpt
     for cue, cue_strength in EVIDENCE_TEXT_CUES:
         if _contains_term(evidence_text, cue):
-            strength = max(strength, cue_strength)
+            strength = max(strength, min(cue_strength, base_strength + 1))
     return int(_clamp(strength, 0, 4))
 
 
@@ -1268,16 +1269,20 @@ def event_source_fidelity_penalty(event: CitationEvent) -> float:
     claim_strength = infer_claim_strength(event)
     evidence_strength = infer_evidence_strength(event)
     delta = claim_strength - evidence_strength
-    if delta <= 1:
+    if delta <= 0:
         return 0.0
+    if delta == 1:
+        return 0.2
     if delta == 2:
-        return 0.4
-    return 0.8
+        return 0.55
+    return 0.9
 
 
 def _event_rationale(delta: int, penalty: float) -> str:
     if penalty <= 0:
-        return "claim strength is within one level of evidence strength"
+        return "claim strength does not exceed evidence strength"
+    if delta == 1:
+        return "claim is one level stronger than the cited evidence"
     if delta == 2:
         return "claim is two levels stronger than the cited evidence"
     return "claim is at least three levels stronger than the cited evidence"
