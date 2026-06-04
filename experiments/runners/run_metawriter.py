@@ -108,7 +108,15 @@ def run_metawriter_task(
     llm_stats = client.get_statistics()
 
     run_status = "completed" if correction_stats.get("total_failures", 0) == 0 else "degraded"
-    evaluation = evaluate_if_possible(final_text, reference, run_status=run_status)
+    # 注入运行时引用证据（chunk_map / citation_manifest），使引用维度指标
+    # （source_fidelity / citation_count / source_balance）可被正确评分，
+    # 与默认模式（main.py）的评估口径一致，保证跨模式对比公平。
+    runtime_reference = reference
+    if isinstance(reference, dict):
+        runtime_reference = dict(reference)
+        runtime_reference["chunk_map"] = list(orchestrator.last_chunk_map)
+        runtime_reference["citation_manifest"] = list(orchestrator.last_citation_manifest)
+    evaluation = evaluate_if_possible(final_text, runtime_reference, run_status=run_status)
     meta_bench_scores = extract_ordered_metric_scores(evaluation)
 
     summary: Dict[str, Any] = {

@@ -80,3 +80,21 @@ dsl_change.md
 .pytest_cache/
 .coverage
 htmlcov/
+
+# ===========================================
+# 内部讨论 / 计划 / 分析文档目录（不上传）
+# 含 bench指标.md、metabench_evaluation.md 及各类 *_PLAN / research / review 文档
+# ===========================================
+docs/
+
+# ===========================================
+# Claude 项目记忆 / 会话记忆（不上传）
+# ===========================================
+memory/
+
+# ===========================================
+# 对比系统（baseline）内容（不上传）：
+# 外部系统适配器框架 + envs 配置 + baseline 专属分析脚本
+# ===========================================
+experiments/baselines/
+experiments/analysis/baseline_source_fidelity.py

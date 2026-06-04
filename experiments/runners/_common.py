@@ -83,23 +83,32 @@ def evaluate_if_possible(
     参数：
         final_text: 生成的最终文本
         reference:  MetaBench reference（缺失则不评估）
-        run_status: 运行状态；非 "completed" 时跳过正式评分（避免降级内容污染评分）
+        run_status: 运行状态（"completed" / "degraded"）。不再用于阻断评分——
+                    降级运行同样评分，仅通过 generation_degraded 标记，
+                    使消融实验在含降级章节时仍能产出连续指标供统计检验。
 
     返回值：
-        Optional[Dict]：评估结果；无 reference 时返回 None；降级时返回 skipped 标记。
+        Optional[Dict]：评估结果（始终含真实 metric_scores）；无 reference 时返回 None。
+            附加正交字段：generation_degraded（被评估文本是否含降级章节）、
+            run_status（原始运行状态），与评估自身 status（"completed"）相互独立。
+
+    设计动机（第一性原理）：
+        "评估是否完成"与"被评估文本是否降级"是两个正交事实。旧实现把后者
+        当作前者的闸门——只要有 1 节降级就丢弃全部指标，使消融实验无法量化
+        "关闭某机制后差了多少"。此处解耦二者：始终评分 + 显式标记降级，
+        下游可凭 generation_degraded / status 字段按需筛选。
     """
     if not isinstance(reference, Mapping):
         return None
 
     from meta_bench import evaluate_meta_bench
 
-    if run_status != "completed":
-        return {
-            "status": "skipped",
-            "reason": "generation_degraded",
-            "details": {"run_status": run_status},
-        }
-    return evaluate_meta_bench(final_text, dict(reference))
+    evaluation = evaluate_meta_bench(final_text, dict(reference))
+    # 正交标记：评估自身 status 恒为 "completed"；generation_degraded 单独
+    # 表达"被评估文本含彻底失败/降级章节"，二者独立，互不覆盖。
+    evaluation["generation_degraded"] = run_status != "completed"
+    evaluation["run_status"] = run_status
+    return evaluation
 
 
 def extract_ordered_metric_scores(

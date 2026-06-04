@@ -547,16 +547,19 @@ def _run_single_task(
         citation_manifest_file = output_dir / f"{session_name}_citation_manifest.json"
         _write_json(citation_manifest_file, citation_manifest)
 
-        if run_status == "completed":
-            meta_bench_evaluation = evaluate_meta_bench(final_text, runtime_reference)
-        else:
-            meta_bench_evaluation = {
-                "status": "skipped",
-                "reason": "generation_degraded",
-                "details": {
-                    "total_failures": correction_stats["total_failures"],
-                    "message": "One or more sections failed generation, so degraded sections are excluded from formal MetaBench scoring.",
-                },
+        # 方案一：降级运行同样评分，仅显式标记，不再跳过正式评分，
+        # 与实验执行层 evaluate_if_possible 保持一致，避免含降级节即丢失全部指标。
+        meta_bench_evaluation = evaluate_meta_bench(final_text, runtime_reference)
+        meta_bench_evaluation["generation_degraded"] = run_status != "completed"
+        meta_bench_evaluation["run_status"] = run_status
+        if run_status != "completed":
+            meta_bench_evaluation["degraded_details"] = {
+                "total_failures": correction_stats["total_failures"],
+                "message": (
+                    "One or more sections were accepted in a degraded state; "
+                    "scores include degraded content and must be read together "
+                    "with the generation_degraded flag."
+                ),
             }
         meta_bench_eval_file = output_dir / f"{session_name}_meta_bench_eval.json"
         _write_json(meta_bench_eval_file, meta_bench_evaluation)

@@ -156,6 +156,10 @@ def generate_proxy_questions(spec: TaskSpec) -> list[ProxyQuestionSpec]:
 
     focus_text = _join_human(spec.focus_points) or "the main evidence base"
     closing_text = _join_human(spec.closing_requirements) or "limitations and future work"
+    article_specific_points = [
+        f"covers article-specific detail: {item}"
+        for item in _clean_items(spec.extra_must_include)[:4]
+    ]
 
     return [
         ProxyQuestionSpec(
@@ -188,6 +192,7 @@ def generate_proxy_questions(spec: TaskSpec) -> list[ProxyQuestionSpec]:
             ),
             required_points=[
                 *(f"discusses {point}" for point in spec.focus_points),
+                *article_specific_points,
                 "compares or synthesizes evidence rather than only mentioning isolated facts",
             ],
         ),
