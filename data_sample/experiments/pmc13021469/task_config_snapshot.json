@@ -1,0 +1,147 @@
+{
+  "task_name": "metabench_pmc13021469",
+  "task": "Write an approximately 6238-word medical review article in English on Metabolic-associated steatotic liver disease in children and adolescents: a scoping review and narrative synthesis of epidemiology, risk factors, and screening approaches with emerging implications for sub-Saharan Africa within clinical evidence synthesis. Keep the piece as a long-form scholarly review rather than a case report, a popular-science summary, or an outline. Open by defining the scope, discussion boundaries, and terminology, while keeping evidence-based clinical decision-making as an explicit practice context. Organize the main body around a evidence comparison framework and keep evidence-based clinical decision-making on the main line of discussion. Compare and synthesize the literature around Associated Data, Metabolic-associated steatotic liver disease in children and adolescents, a scoping review and narrative synthesis of epidemiology, risk factors, and screening approaches with emerging implications, and sub-Saharan Africa. Develop at least 6 natural sections and close with limitations, and future work.",
+  "constraints": [
+    "Write the article in English.",
+    "Target body length is about 6238 words overall, excluding the final references list.",
+    "Develop approximately 6 major sections following the outline.",
+    "Keep the discussion centered on Metabolic-associated steatotic liver disease in children and adolescents: a scoping review and narrative synthesis of epidemiology, risk factors, and screening approaches with emerging implications for sub-Saharan Africa within clinical evidence synthesis.",
+    "Use evidence comparison framework as a visible organizing logic in the main body.",
+    "Compare and synthesize evidence about Associated Data, Metabolic-associated steatotic liver disease in children and adolescents, a scoping review and narrative synthesis of epidemiology, risk factors, and screening approaches with emerging implications, and sub-Saharan Africa.",
+    "Explicitly connect the discussion to evidence-based clinical decision-making.",
+    "Close by addressing limitations, and future work."
+  ],
+  "outline": {
+    "sec1": "Scope, terminology, and practice context",
+    "sec2": "Mechanistic and organizing framework",
+    "sec3": "Evidence base, methods, and measurement strategy",
+    "sec4": "Findings and cross-study synthesis",
+    "sec5": "Clinical implications and interpretive discussion",
+    "sec6": "Limitations, heterogeneity, and future research priorities"
+  },
+  "section_word_targets": {
+    "sec1": 652,
+    "sec2": 1105,
+    "sec3": 1350,
+    "sec4": 1442,
+    "sec5": 1163,
+    "sec6": 526
+  },
+  "session_name": "metabench_pmc13021469",
+  "reference": {
+    "task_id": "med_pmc13021469",
+    "paper_type": "medical_review",
+    "topic": "Metabolic-associated steatotic liver disease in children and adolescents: a scoping review and narrative synthesis of epidemiology, risk factors, and screening approaches with emerging implications for sub-Saharan Africa",
+    "domain": "clinical evidence synthesis",
+    "language": "English",
+    "constraints": {
+      "required_length_words": 6238,
+      "body_target_words": 6238,
+      "total_target_words": 9191,
+      "expected_sections": 6,
+      "must_include": [
+        "scope",
+        "evidence comparison framework",
+        "clinical evidence synthesis",
+        "Metabolic-associated steatotic liver disease in children and adolescents: a scoping review and narrative synthesis of epidemiology, risk factors, and screening approaches with emerging implications for sub-Saharan Africa",
+        "Associated Data",
+        "Metabolic-associated steatotic liver disease in children and adolescents",
+        "a scoping review and narrative synthesis of epidemiology, risk factors, and screening approaches with emerging implications",
+        "sub-Saharan Africa",
+        "evidence-based clinical decision-making",
+        "limitations",
+        "future work",
+        "MASLD",
+        "SSA",
+        "PRISMA-",
+        "JBI"
+      ],
+      "section_word_targets": {
+        "sec1": 652,
+        "sec2": 1105,
+        "sec3": 1350,
+        "sec4": 1442,
+        "sec5": 1163,
+        "sec6": 526
+      },
+      "section_roles": {
+        "sec1": "introduction",
+        "sec2": "evidence_synthesis",
+        "sec3": "evidence_synthesis",
+        "sec4": "evidence_synthesis",
+        "sec5": "discussion",
+        "sec6": "limitations_gaps"
+      },
+      "required_sections": [
+        "introduction",
+        "main_body",
+        "limitations_gaps"
+      ],
+      "periodic_requirements": [
+        "The main body should include explicit comparison or synthesis at regular intervals.",
+        "The second half should address limitations, evidence gaps, or future work."
+      ],
+      "section_prior_scheme": "six_slot_empirical"
+    },
+    "outline": {
+      "sec1": "Scope, terminology, and practice context",
+      "sec2": "Mechanistic and organizing framework",
+      "sec3": "Evidence base, methods, and measurement strategy",
+      "sec4": "Findings and cross-study synthesis",
+      "sec5": "Clinical implications and interpretive discussion",
+      "sec6": "Limitations, heterogeneity, and future research priorities"
+    },
+    "proxy_questions": [
+      {
+        "qid": "q_scope",
+        "question": "Does the article define the scope, boundaries, and key terminology for Metabolic-associated steatotic liver disease in children and adolescents: a scoping review and narrative synthesis of epidemiology, risk factors, and screening approaches with emerging implications for sub-Saharan Africa within clinical evidence synthesis?",
+        "required_points": [
+          "defines the scope of Metabolic-associated steatotic liver disease in children and adolescents: a scoping review and narrative synthesis of epidemiology, risk factors, and screening approaches with emerging implications for sub-Saharan Africa",
+          "states discussion boundaries or terminology",
+          "situates the topic within clinical evidence synthesis"
+        ]
+      },
+      {
+        "qid": "q_organizer",
+        "question": "Does the article organize the discussion around a evidence comparison framework?",
+        "required_points": [
+          "uses evidence comparison framework as an organizing axis",
+          "separates or compares major categories rather than listing facts only"
+        ]
+      },
+      {
+        "qid": "q_evidence",
+        "question": "Does the article compare and synthesize evidence about Associated Data, Metabolic-associated steatotic liver disease in children and adolescents, a scoping review and narrative synthesis of epidemiology, risk factors, and screening approaches with emerging implications, and sub-Saharan Africa for Metabolic-associated steatotic liver disease in children and adolescents: a scoping review and narrative synthesis of epidemiology, risk factors, and screening approaches with emerging implications for sub-Saharan Africa?",
+        "required_points": [
+          "discusses Associated Data",
+          "discusses Metabolic-associated steatotic liver disease in children and adolescents",
+          "discusses a scoping review and narrative synthesis of epidemiology, risk factors, and screening approaches with emerging implications",
+          "discusses sub-Saharan Africa",
+          "covers article-specific detail: MASLD",
+          "covers article-specific detail: SSA",
+          "covers article-specific detail: PRISMA-",
+          "covers article-specific detail: JBI",
+          "compares or synthesizes evidence rather than only mentioning isolated facts"
+        ]
+      },
+      {
+        "qid": "q_context",
+        "question": "Does the article connect Metabolic-associated steatotic liver disease in children and adolescents: a scoping review and narrative synthesis of epidemiology, risk factors, and screening approaches with emerging implications for sub-Saharan Africa to the evidence-based clinical decision-making context?",
+        "required_points": [
+          "explicitly discusses evidence-based clinical decision-making",
+          "connects the topic to practical decisions, workflows, or constraints"
+        ]
+      },
+      {
+        "qid": "q_closing",
+        "question": "Does the article close by addressing limitations, and future work for Metabolic-associated steatotic liver disease in children and adolescents: a scoping review and narrative synthesis of epidemiology, risk factors, and screening approaches with emerging implications for sub-Saharan Africa?",
+        "required_points": [
+          "discusses limitations",
+          "discusses future work",
+          "identifies uncertainty, open questions, or next steps"
+        ]
+      }
+    ]
+  },
+  "corpus_dir": "./data_sample/med_papers_review_augmented_strict"
+}

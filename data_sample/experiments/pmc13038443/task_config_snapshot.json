@@ -1,0 +1,147 @@
+{
+  "task_name": "metabench_pmc13038443",
+  "task": "Write an approximately 6400-word medical review article in English on Effects of digitalized Tai Chi intervention on muscle function and physical performance in older adults within biomedical evidence synthesis. Keep the piece as a long-form scholarly review rather than a case report, a popular-science summary, or an outline. Open by defining the scope, discussion boundaries, and terminology, while keeping evidence-based clinical decision-making as an explicit practice context. Organize the main body around a systematic evidence synthesis framework and keep evidence-based clinical decision-making on the main line of discussion. Compare and synthesize the literature around digitalized, meta-analysis, muscle function, and older adults. Develop at least 6 natural sections and close with limitations, and future work.",
+  "constraints": [
+    "Write the article in English.",
+    "Target body length is about 6400 words overall, excluding the final references list.",
+    "Develop approximately 6 major sections following the outline.",
+    "Keep the discussion centered on Effects of digitalized Tai Chi intervention on muscle function and physical performance in older adults within biomedical evidence synthesis.",
+    "Use systematic evidence synthesis framework as a visible organizing logic in the main body.",
+    "Compare and synthesize evidence about digitalized, meta-analysis, muscle function, and older adults.",
+    "Explicitly connect the discussion to evidence-based clinical decision-making.",
+    "Close by addressing limitations, and future work."
+  ],
+  "outline": {
+    "sec1": "Scope, terminology, and practice context",
+    "sec2": "Mechanistic and organizing framework",
+    "sec3": "Evidence base, methods, and measurement strategy",
+    "sec4": "Findings and cross-study synthesis",
+    "sec5": "Clinical implications and interpretive discussion",
+    "sec6": "Limitations, heterogeneity, and future research priorities"
+  },
+  "section_word_targets": {
+    "sec1": 669,
+    "sec2": 1134,
+    "sec3": 1385,
+    "sec4": 1479,
+    "sec5": 1193,
+    "sec6": 540
+  },
+  "session_name": "metabench_pmc13038443",
+  "reference": {
+    "task_id": "med_pmc13038443",
+    "paper_type": "medical_review",
+    "topic": "Effects of digitalized Tai Chi intervention on muscle function and physical performance in older adults",
+    "domain": "biomedical evidence synthesis",
+    "language": "English",
+    "constraints": {
+      "required_length_words": 6400,
+      "body_target_words": 6400,
+      "total_target_words": 8284,
+      "expected_sections": 6,
+      "must_include": [
+        "scope",
+        "systematic evidence synthesis framework",
+        "biomedical evidence synthesis",
+        "Effects of digitalized Tai Chi intervention on muscle function and physical performance in older adults",
+        "digitalized",
+        "meta-analysis",
+        "muscle function",
+        "older adults",
+        "evidence-based clinical decision-making",
+        "limitations",
+        "future work",
+        "CNKI",
+        "GRADE",
+        "SMD",
+        "CI"
+      ],
+      "section_word_targets": {
+        "sec1": 669,
+        "sec2": 1134,
+        "sec3": 1385,
+        "sec4": 1479,
+        "sec5": 1193,
+        "sec6": 540
+      },
+      "section_roles": {
+        "sec1": "introduction",
+        "sec2": "evidence_synthesis",
+        "sec3": "evidence_synthesis",
+        "sec4": "evidence_synthesis",
+        "sec5": "discussion",
+        "sec6": "limitations_gaps"
+      },
+      "required_sections": [
+        "introduction",
+        "main_body",
+        "limitations_gaps"
+      ],
+      "periodic_requirements": [
+        "The main body should include explicit comparison or synthesis at regular intervals.",
+        "The second half should address limitations, evidence gaps, or future work."
+      ],
+      "section_prior_scheme": "six_slot_empirical"
+    },
+    "outline": {
+      "sec1": "Scope, terminology, and practice context",
+      "sec2": "Mechanistic and organizing framework",
+      "sec3": "Evidence base, methods, and measurement strategy",
+      "sec4": "Findings and cross-study synthesis",
+      "sec5": "Clinical implications and interpretive discussion",
+      "sec6": "Limitations, heterogeneity, and future research priorities"
+    },
+    "proxy_questions": [
+      {
+        "qid": "q_scope",
+        "question": "Does the article define the scope, boundaries, and key terminology for Effects of digitalized Tai Chi intervention on muscle function and physical performance in older adults within biomedical evidence synthesis?",
+        "required_points": [
+          "defines the scope of Effects of digitalized Tai Chi intervention on muscle function and physical performance in older adults",
+          "states discussion boundaries or terminology",
+          "situates the topic within biomedical evidence synthesis"
+        ]
+      },
+      {
+        "qid": "q_organizer",
+        "question": "Does the article organize the discussion around a systematic evidence synthesis framework?",
+        "required_points": [
+          "uses systematic evidence synthesis framework as an organizing axis",
+          "separates or compares major categories rather than listing facts only"
+        ]
+      },
+      {
+        "qid": "q_evidence",
+        "question": "Does the article compare and synthesize evidence about digitalized, meta-analysis, muscle function, and older adults for Effects of digitalized Tai Chi intervention on muscle function and physical performance in older adults?",
+        "required_points": [
+          "discusses digitalized",
+          "discusses meta-analysis",
+          "discusses muscle function",
+          "discusses older adults",
+          "covers article-specific detail: CNKI",
+          "covers article-specific detail: GRADE",
+          "covers article-specific detail: SMD",
+          "covers article-specific detail: CI",
+          "compares or synthesizes evidence rather than only mentioning isolated facts"
+        ]
+      },
+      {
+        "qid": "q_context",
+        "question": "Does the article connect Effects of digitalized Tai Chi intervention on muscle function and physical performance in older adults to the evidence-based clinical decision-making context?",
+        "required_points": [
+          "explicitly discusses evidence-based clinical decision-making",
+          "connects the topic to practical decisions, workflows, or constraints"
+        ]
+      },
+      {
+        "qid": "q_closing",
+        "question": "Does the article close by addressing limitations, and future work for Effects of digitalized Tai Chi intervention on muscle function and physical performance in older adults?",
+        "required_points": [
+          "discusses limitations",
+          "discusses future work",
+          "identifies uncertainty, open questions, or next steps"
+        ]
+      }
+    ]
+  },
+  "corpus_dir": "./data_sample/med_papers_review_augmented_strict"
+}
