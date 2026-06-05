@@ -22,7 +22,7 @@ def get_task_config() -> Dict[str, object]:
 
     spec = TaskSpec(
         task_id="med_pmc12971458",
-        topic="Systematic review and meta\u2212analysis of PET\u2212based prognostic metrics in CAR\u2212T treatment of DLBCL",
+        topic="Systematic review and meta-analysis of PET-based prognostic metrics in CAR-T treatment of DLBCL",
         domain="clinical evidence synthesis",
         target_words=7888,
         body_target_words=4000,
@@ -30,7 +30,7 @@ def get_task_config() -> Dict[str, object]:
         practice_context="evidence-based clinical decision-making",
         organizer="systematic evidence synthesis framework",
         focus_points=[
-                "Systematic review and meta\u2212analysis of PET\u2212based prognostic metrics in CAR\u2212T treatment of DLBCL",
+                "Systematic review and meta-analysis of PET-based prognostic metrics in CAR-T treatment of DLBCL",
         ],
         extra_must_include=[
                 "PET",

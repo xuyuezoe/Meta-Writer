@@ -30,7 +30,7 @@ def get_task_config() -> Dict[str, object]:
         practice_context="evidence-based clinical decision-making",
         organizer="systematic evidence synthesis framework",
         focus_points=[
-                "Conclusions\u200b",
+                "Conclusions",
                 "The efficacy and safety of disitamab vedotin plus immunotherapy in locally advanced or metastatic solid tumors",
         ],
         extra_must_include=[

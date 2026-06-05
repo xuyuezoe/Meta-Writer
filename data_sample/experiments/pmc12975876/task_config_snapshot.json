@@ -1,13 +1,13 @@
 {
   "task_name": "metabench_pmc12975876",
-  "task": "Write an approximately 6300-word medical review article in English on The efficacy and safety of disitamab vedotin plus immunotherapy in locally advanced or metastatic solid tumors within clinical evidence synthesis. Keep the piece as a long-form scholarly review rather than a case report, a popular-science summary, or an outline. Open by defining the scope, discussion boundaries, and terminology, while keeping evidence-based clinical decision-making as an explicit practice context. Organize the main body around a systematic evidence synthesis framework and keep evidence-based clinical decision-making on the main line of discussion. Compare and synthesize the literature around Conclusions​, and The efficacy and safety of disitamab vedotin plus immunotherapy in locally advanced or metastatic solid tumors. Develop at least 6 natural sections and close with limitations, and future work.",
+  "task": "Write an approximately 6300-word medical review article in English on The efficacy and safety of disitamab vedotin plus immunotherapy in locally advanced or metastatic solid tumors within clinical evidence synthesis. Keep the piece as a long-form scholarly review rather than a case report, a popular-science summary, or an outline. Open by defining the scope, discussion boundaries, and terminology, while keeping evidence-based clinical decision-making as an explicit practice context. Organize the main body around a systematic evidence synthesis framework and keep evidence-based clinical decision-making on the main line of discussion. Compare and synthesize the literature around Conclusions, and The efficacy and safety of disitamab vedotin plus immunotherapy in locally advanced or metastatic solid tumors. Develop at least 6 natural sections and close with limitations, and future work.",
   "constraints": [
     "Write the article in English.",
     "Target body length is about 6300 words overall, excluding the final references list.",
     "Develop approximately 6 major sections following the outline.",
     "Keep the discussion centered on The efficacy and safety of disitamab vedotin plus immunotherapy in locally advanced or metastatic solid tumors within clinical evidence synthesis.",
     "Use systematic evidence synthesis framework as a visible organizing logic in the main body.",
-    "Compare and synthesize evidence about Conclusions​, and The efficacy and safety of disitamab vedotin plus immunotherapy in locally advanced or metastatic solid tumors.",
+    "Compare and synthesize evidence about Conclusions, and The efficacy and safety of disitamab vedotin plus immunotherapy in locally advanced or metastatic solid tumors.",
     "Explicitly connect the discussion to evidence-based clinical decision-making.",
     "Close by addressing limitations, and future work."
   ],
@@ -44,7 +44,7 @@
         "systematic evidence synthesis framework",
         "clinical evidence synthesis",
         "The efficacy and safety of disitamab vedotin plus immunotherapy in locally advanced or metastatic solid tumors",
-        "Conclusions​",
+        "Conclusions",
         "evidence-based clinical decision-making",
         "limitations",
         "future work",
@@ -108,9 +108,9 @@
       },
       {
         "qid": "q_evidence",
-        "question": "Does the article compare and synthesize evidence about Conclusions​, and The efficacy and safety of disitamab vedotin plus immunotherapy in locally advanced or metastatic solid tumors for The efficacy and safety of disitamab vedotin plus immunotherapy in locally advanced or metastatic solid tumors?",
+        "question": "Does the article compare and synthesize evidence about Conclusions, and The efficacy and safety of disitamab vedotin plus immunotherapy in locally advanced or metastatic solid tumors for The efficacy and safety of disitamab vedotin plus immunotherapy in locally advanced or metastatic solid tumors?",
         "required_points": [
-          "discusses Conclusions​",
+          "discusses Conclusions",
           "discusses The efficacy and safety of disitamab vedotin plus immunotherapy in locally advanced or metastatic solid tumors",
           "covers article-specific detail: DV",
           "covers article-specific detail: HER2",

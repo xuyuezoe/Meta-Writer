@@ -1,13 +1,13 @@
 {
   "task_name": "metabench_pmc12971458",
-  "task": "Write an approximately 4000-word medical review article in English on Systematic review and meta−analysis of PET−based prognostic metrics in CAR−T treatment of DLBCL within clinical evidence synthesis. Keep the piece as a long-form scholarly review rather than a case report, a popular-science summary, or an outline. Open by defining the scope, discussion boundaries, and terminology, while keeping evidence-based clinical decision-making as an explicit practice context. Organize the main body around a systematic evidence synthesis framework and keep evidence-based clinical decision-making on the main line of discussion. Compare and synthesize the literature around Systematic review and meta−analysis of PET−based prognostic metrics in CAR−T treatment of DLBCL. Develop at least 6 natural sections and close with limitations, and future work.",
+  "task": "Write an approximately 4000-word medical review article in English on Systematic review and meta-analysis of PET-based prognostic metrics in CAR-T treatment of DLBCL within clinical evidence synthesis. Keep the piece as a long-form scholarly review rather than a case report, a popular-science summary, or an outline. Open by defining the scope, discussion boundaries, and terminology, while keeping evidence-based clinical decision-making as an explicit practice context. Organize the main body around a systematic evidence synthesis framework and keep evidence-based clinical decision-making on the main line of discussion. Compare and synthesize the literature around Systematic review and meta-analysis of PET-based prognostic metrics in CAR-T treatment of DLBCL. Develop at least 6 natural sections and close with limitations, and future work.",
   "constraints": [
     "Write the article in English.",
     "Target body length is about 4000 words overall, excluding the final references list.",
     "Develop approximately 6 major sections following the outline.",
-    "Keep the discussion centered on Systematic review and meta−analysis of PET−based prognostic metrics in CAR−T treatment of DLBCL within clinical evidence synthesis.",
+    "Keep the discussion centered on Systematic review and meta-analysis of PET-based prognostic metrics in CAR-T treatment of DLBCL within clinical evidence synthesis.",
     "Use systematic evidence synthesis framework as a visible organizing logic in the main body.",
-    "Compare and synthesize evidence about Systematic review and meta−analysis of PET−based prognostic metrics in CAR−T treatment of DLBCL.",
+    "Compare and synthesize evidence about Systematic review and meta-analysis of PET-based prognostic metrics in CAR-T treatment of DLBCL.",
     "Explicitly connect the discussion to evidence-based clinical decision-making.",
     "Close by addressing limitations, and future work."
   ],
@@ -31,7 +31,7 @@
   "reference": {
     "task_id": "med_pmc12971458",
     "paper_type": "medical_review",
-    "topic": "Systematic review and meta−analysis of PET−based prognostic metrics in CAR−T treatment of DLBCL",
+    "topic": "Systematic review and meta-analysis of PET-based prognostic metrics in CAR-T treatment of DLBCL",
     "domain": "clinical evidence synthesis",
     "language": "English",
     "constraints": {
@@ -43,7 +43,7 @@
         "scope",
         "systematic evidence synthesis framework",
         "clinical evidence synthesis",
-        "Systematic review and meta−analysis of PET−based prognostic metrics in CAR−T treatment of DLBCL",
+        "Systematic review and meta-analysis of PET-based prognostic metrics in CAR-T treatment of DLBCL",
         "evidence-based clinical decision-making",
         "limitations",
         "future work",
@@ -90,9 +90,9 @@
     "proxy_questions": [
       {
         "qid": "q_scope",
-        "question": "Does the article define the scope, boundaries, and key terminology for Systematic review and meta−analysis of PET−based prognostic metrics in CAR−T treatment of DLBCL within clinical evidence synthesis?",
+        "question": "Does the article define the scope, boundaries, and key terminology for Systematic review and meta-analysis of PET-based prognostic metrics in CAR-T treatment of DLBCL within clinical evidence synthesis?",
         "required_points": [
-          "defines the scope of Systematic review and meta−analysis of PET−based prognostic metrics in CAR−T treatment of DLBCL",
+          "defines the scope of Systematic review and meta-analysis of PET-based prognostic metrics in CAR-T treatment of DLBCL",
           "states discussion boundaries or terminology",
           "situates the topic within clinical evidence synthesis"
         ]
@@ -107,9 +107,9 @@
       },
       {
         "qid": "q_evidence",
-        "question": "Does the article compare and synthesize evidence about Systematic review and meta−analysis of PET−based prognostic metrics in CAR−T treatment of DLBCL for Systematic review and meta−analysis of PET−based prognostic metrics in CAR−T treatment of DLBCL?",
+        "question": "Does the article compare and synthesize evidence about Systematic review and meta-analysis of PET-based prognostic metrics in CAR-T treatment of DLBCL for Systematic review and meta-analysis of PET-based prognostic metrics in CAR-T treatment of DLBCL?",
         "required_points": [
-          "discusses Systematic review and meta−analysis of PET−based prognostic metrics in CAR−T treatment of DLBCL",
+          "discusses Systematic review and meta-analysis of PET-based prognostic metrics in CAR-T treatment of DLBCL",
           "covers article-specific detail: PET",
           "covers article-specific detail: CAR",
           "covers article-specific detail: DLBCL",
@@ -119,7 +119,7 @@
       },
       {
         "qid": "q_context",
-        "question": "Does the article connect Systematic review and meta−analysis of PET−based prognostic metrics in CAR−T treatment of DLBCL to the evidence-based clinical decision-making context?",
+        "question": "Does the article connect Systematic review and meta-analysis of PET-based prognostic metrics in CAR-T treatment of DLBCL to the evidence-based clinical decision-making context?",
         "required_points": [
           "explicitly discusses evidence-based clinical decision-making",
           "connects the topic to practical decisions, workflows, or constraints"
@@ -127,7 +127,7 @@
       },
       {
         "qid": "q_closing",
-        "question": "Does the article close by addressing limitations, and future work for Systematic review and meta−analysis of PET−based prognostic metrics in CAR−T treatment of DLBCL?",
+        "question": "Does the article close by addressing limitations, and future work for Systematic review and meta-analysis of PET-based prognostic metrics in CAR-T treatment of DLBCL?",
         "required_points": [
           "discusses limitations",
           "discusses future work",
