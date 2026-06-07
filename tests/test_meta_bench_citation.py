@@ -481,6 +481,12 @@ class CitationCountScoreTests(unittest.TestCase):
             CITATION_COUNT_THRESHOLDS["soft_upper"],
         )
 
+    def test_citation_count_thresholds_use_central_empirical_band(self):
+        self.assertAlmostEqual(CITATION_COUNT_THRESHOLDS["soft_lower"], 21.780305082175012)
+        self.assertAlmostEqual(CITATION_COUNT_THRESHOLDS["soft_upper"], 53.88519249312971)
+        self.assertAlmostEqual(CITATION_COUNT_THRESHOLDS["hard_lower"], 15.047717849932427)
+        self.assertAlmostEqual(CITATION_COUNT_THRESHOLDS["hard_upper"], 71.44435519935337)
+
     def test_citation_count_gives_full_score_inside_threshold_band(self):
         final_text = (
             "# Test review\n\n"
@@ -593,6 +599,10 @@ class SourceBalanceScoreTests(unittest.TestCase):
             SOURCE_BALANCE_THRESHOLDS["hard_upper"],
         )
         self.assertLessEqual(SOURCE_BALANCE_THRESHOLDS["hard_upper"], 1.0)
+
+    def test_source_balance_thresholds_use_high_percentile_bounds(self):
+        self.assertAlmostEqual(SOURCE_BALANCE_THRESHOLDS["soft_upper"], 0.18181818181818182)
+        self.assertAlmostEqual(SOURCE_BALANCE_THRESHOLDS["hard_upper"], 0.32347248576850013)
 
     def test_source_balance_full_score_for_even_mix(self):
         result = score_source_balance(

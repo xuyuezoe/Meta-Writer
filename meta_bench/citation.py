@@ -31,16 +31,18 @@ MIN_CITATIONS_FOR_DISTRIBUTION = 5
 CITATION_COUNT_THRESHOLDS = {
     # Calibrated from medical_reviews_300_ready/article_summary.csv using
     # whole-body citation density: body citation events per 1,000 body words.
-    "soft_lower": 15.047717849932427,
-    "soft_upper": 71.44435519935337,
-    "hard_lower": 5.141388174807198,
-    "hard_upper": 144.21855146124523,
+    # Full-score band uses the central 70% (p15-p85); the linear penalty
+    # band uses the wider p5-p95 interval.
+    "soft_lower": 21.780305082175012,
+    "soft_upper": 53.88519249312971,
+    "hard_lower": 15.047717849932427,
+    "hard_upper": 71.44435519935337,
 }
 SOURCE_BALANCE_THRESHOLDS = {
     # Calibrated from the same 300-review corpus using the runtime metric:
     # max citations to a single source divided by total body citation events.
     "soft_upper": 0.18181818181818182,
-    "hard_upper": 0.7058823529411765,
+    "hard_upper": 0.32347248576850013,
 }
 
 SEVEN_SECTION_KEYS = [
