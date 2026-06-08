@@ -31,16 +31,18 @@ MIN_CITATIONS_FOR_DISTRIBUTION = 5
 CITATION_COUNT_THRESHOLDS = {
     # Calibrated from medical_reviews_300_ready/article_summary.csv using
     # whole-body citation density: body citation events per 1,000 body words.
-    "soft_lower": 15.047717849932427,
-    "soft_upper": 71.44435519935337,
-    "hard_lower": 5.141388174807198,
-    "hard_upper": 144.21855146124523,
+    # Full-score band uses the central 70% (p15-p85); the linear penalty
+    # band uses the wider p5-p95 interval.
+    "soft_lower": 21.780305082175012,
+    "soft_upper": 53.88519249312971,
+    "hard_lower": 15.047717849932427,
+    "hard_upper": 71.44435519935337,
 }
 SOURCE_BALANCE_THRESHOLDS = {
     # Calibrated from the same 300-review corpus using the runtime metric:
     # max citations to a single source divided by total body citation events.
     "soft_upper": 0.18181818181818182,
-    "hard_upper": 0.7058823529411765,
+    "hard_upper": 0.32347248576850013,
 }
 
 SEVEN_SECTION_KEYS = [
@@ -1251,11 +1253,12 @@ def infer_evidence_strength(event: CitationEvent) -> int:
 
     if event.evidence_strength is not None:
         return int(_clamp(event.evidence_strength, 0, 4))
-    strength = SOURCE_TYPE_STRENGTH.get(event.source_type, 1)
+    base_strength = SOURCE_TYPE_STRENGTH.get(event.source_type, 1)
+    strength = base_strength
     evidence_text = event.source_excerpt
     for cue, cue_strength in EVIDENCE_TEXT_CUES:
         if _contains_term(evidence_text, cue):
-            strength = max(strength, cue_strength)
+            strength = max(strength, min(cue_strength, base_strength + 1))
     return int(_clamp(strength, 0, 4))
 
 
@@ -1268,16 +1271,20 @@ def event_source_fidelity_penalty(event: CitationEvent) -> float:
     claim_strength = infer_claim_strength(event)
     evidence_strength = infer_evidence_strength(event)
     delta = claim_strength - evidence_strength
-    if delta <= 1:
+    if delta <= 0:
         return 0.0
+    if delta == 1:
+        return 0.2
     if delta == 2:
-        return 0.4
-    return 0.8
+        return 0.55
+    return 0.9
 
 
 def _event_rationale(delta: int, penalty: float) -> str:
     if penalty <= 0:
-        return "claim strength is within one level of evidence strength"
+        return "claim strength does not exceed evidence strength"
+    if delta == 1:
+        return "claim is one level stronger than the cited evidence"
     if delta == 2:
         return "claim is two levels stronger than the cited evidence"
     return "claim is at least three levels stronger than the cited evidence"

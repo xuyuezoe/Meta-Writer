@@ -1,0 +1,144 @@
+{
+  "task_name": "metabench_pmc12971670",
+  "task": "Write an approximately 8000-word medical review article in English on Evolving epidemiology and improving safety of rechallenge in immune checkpoint inhibitor-associated acute kidney injury: an updated meta-analysis within clinical evidence synthesis. Keep the piece as a long-form scholarly review rather than a case report, a popular-science summary, or an outline. Open by defining the scope, discussion boundaries, and terminology, while keeping evidence-based clinical decision-making as an explicit practice context. Organize the main body around a systematic evidence synthesis framework and keep evidence-based clinical decision-making on the main line of discussion. Compare and synthesize the literature around Limitations, Evolving epidemiology and improving safety of rechallenge in immune checkpoint inhibitor-associated acute kidney injury, and an updated meta-analysis. Develop at least 6 natural sections and close with limitations, and future work.",
+  "constraints": [
+    "Write the article in English.",
+    "Target body length is about 8000 words overall, excluding the final references list.",
+    "Develop approximately 6 major sections following the outline.",
+    "Keep the discussion centered on Evolving epidemiology and improving safety of rechallenge in immune checkpoint inhibitor-associated acute kidney injury: an updated meta-analysis within clinical evidence synthesis.",
+    "Use systematic evidence synthesis framework as a visible organizing logic in the main body.",
+    "Compare and synthesize evidence about Limitations, Evolving epidemiology and improving safety of rechallenge in immune checkpoint inhibitor-associated acute kidney injury, and an updated meta-analysis.",
+    "Explicitly connect the discussion to evidence-based clinical decision-making.",
+    "Close by addressing limitations, and future work."
+  ],
+  "outline": {
+    "sec1": "Scope, terminology, and practice context",
+    "sec2": "Mechanistic and organizing framework",
+    "sec3": "Evidence base, methods, and measurement strategy",
+    "sec4": "Findings and cross-study synthesis",
+    "sec5": "Clinical implications and interpretive discussion",
+    "sec6": "Limitations, heterogeneity, and future research priorities"
+  },
+  "section_word_targets": {
+    "sec1": 837,
+    "sec2": 1417,
+    "sec3": 1731,
+    "sec4": 1849,
+    "sec5": 1492,
+    "sec6": 674
+  },
+  "session_name": "metabench_pmc12971670",
+  "reference": {
+    "task_id": "med_pmc12971670",
+    "paper_type": "medical_review",
+    "topic": "Evolving epidemiology and improving safety of rechallenge in immune checkpoint inhibitor-associated acute kidney injury: an updated meta-analysis",
+    "domain": "clinical evidence synthesis",
+    "language": "English",
+    "constraints": {
+      "required_length_words": 8000,
+      "body_target_words": 8000,
+      "total_target_words": 10137,
+      "expected_sections": 6,
+      "must_include": [
+        "scope",
+        "systematic evidence synthesis framework",
+        "clinical evidence synthesis",
+        "Evolving epidemiology and improving safety of rechallenge in immune checkpoint inhibitor-associated acute kidney injury: an updated meta-analysis",
+        "Limitations",
+        "Evolving epidemiology and improving safety of rechallenge in immune checkpoint inhibitor-associated acute kidney injury",
+        "an updated meta-analysis",
+        "evidence-based clinical decision-making",
+        "future work",
+        "AKI",
+        "ICI-AKI",
+        "ICI",
+        "PRISMA"
+      ],
+      "section_word_targets": {
+        "sec1": 837,
+        "sec2": 1417,
+        "sec3": 1731,
+        "sec4": 1849,
+        "sec5": 1492,
+        "sec6": 674
+      },
+      "section_roles": {
+        "sec1": "introduction",
+        "sec2": "evidence_synthesis",
+        "sec3": "evidence_synthesis",
+        "sec4": "evidence_synthesis",
+        "sec5": "discussion",
+        "sec6": "limitations_gaps"
+      },
+      "required_sections": [
+        "introduction",
+        "main_body",
+        "limitations_gaps"
+      ],
+      "periodic_requirements": [
+        "The main body should include explicit comparison or synthesis at regular intervals.",
+        "The second half should address limitations, evidence gaps, or future work."
+      ],
+      "section_prior_scheme": "six_slot_empirical"
+    },
+    "outline": {
+      "sec1": "Scope, terminology, and practice context",
+      "sec2": "Mechanistic and organizing framework",
+      "sec3": "Evidence base, methods, and measurement strategy",
+      "sec4": "Findings and cross-study synthesis",
+      "sec5": "Clinical implications and interpretive discussion",
+      "sec6": "Limitations, heterogeneity, and future research priorities"
+    },
+    "proxy_questions": [
+      {
+        "qid": "q_scope",
+        "question": "Does the article define the scope, boundaries, and key terminology for Evolving epidemiology and improving safety of rechallenge in immune checkpoint inhibitor-associated acute kidney injury: an updated meta-analysis within clinical evidence synthesis?",
+        "required_points": [
+          "defines the scope of Evolving epidemiology and improving safety of rechallenge in immune checkpoint inhibitor-associated acute kidney injury: an updated meta-analysis",
+          "states discussion boundaries or terminology",
+          "situates the topic within clinical evidence synthesis"
+        ]
+      },
+      {
+        "qid": "q_organizer",
+        "question": "Does the article organize the discussion around a systematic evidence synthesis framework?",
+        "required_points": [
+          "uses systematic evidence synthesis framework as an organizing axis",
+          "separates or compares major categories rather than listing facts only"
+        ]
+      },
+      {
+        "qid": "q_evidence",
+        "question": "Does the article compare and synthesize evidence about Limitations, Evolving epidemiology and improving safety of rechallenge in immune checkpoint inhibitor-associated acute kidney injury, and an updated meta-analysis for Evolving epidemiology and improving safety of rechallenge in immune checkpoint inhibitor-associated acute kidney injury: an updated meta-analysis?",
+        "required_points": [
+          "discusses Limitations",
+          "discusses Evolving epidemiology and improving safety of rechallenge in immune checkpoint inhibitor-associated acute kidney injury",
+          "discusses an updated meta-analysis",
+          "covers article-specific detail: AKI",
+          "covers article-specific detail: ICI-AKI",
+          "covers article-specific detail: ICI",
+          "covers article-specific detail: PRISMA",
+          "compares or synthesizes evidence rather than only mentioning isolated facts"
+        ]
+      },
+      {
+        "qid": "q_context",
+        "question": "Does the article connect Evolving epidemiology and improving safety of rechallenge in immune checkpoint inhibitor-associated acute kidney injury: an updated meta-analysis to the evidence-based clinical decision-making context?",
+        "required_points": [
+          "explicitly discusses evidence-based clinical decision-making",
+          "connects the topic to practical decisions, workflows, or constraints"
+        ]
+      },
+      {
+        "qid": "q_closing",
+        "question": "Does the article close by addressing limitations, and future work for Evolving epidemiology and improving safety of rechallenge in immune checkpoint inhibitor-associated acute kidney injury: an updated meta-analysis?",
+        "required_points": [
+          "discusses limitations",
+          "discusses future work",
+          "identifies uncertainty, open questions, or next steps"
+        ]
+      }
+    ]
+  },
+  "corpus_dir": "./data_sample/med_papers_review_augmented_strict"
+}
