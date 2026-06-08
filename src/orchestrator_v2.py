@@ -1860,7 +1860,7 @@ Annotated text:"""
         for source_type, terms in source_type_terms:
             if any(term in text for term in terms):
                 return source_type
-        return "observational"
+        return "unknown"
 
     def _assemble_text(
         self,

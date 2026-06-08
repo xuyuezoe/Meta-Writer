@@ -1,0 +1,145 @@
+{
+  "task_name": "metabench_pmc13066237",
+  "task": "Write an approximately 4600-word medical review article in English on Clinicopathological and molecular characteristics associated with pathological complete response in neoadjuvant immunotherapy for breast cancer within clinical evidence synthesis. Keep the piece as a long-form scholarly review rather than a case report, a popular-science summary, or an outline. Open by defining the scope, discussion boundaries, and terminology, while keeping evidence-based clinical decision-making as an explicit practice context. Organize the main body around a evidence comparison framework and keep evidence-based clinical decision-making on the main line of discussion. Compare and synthesize the literature around Method, Clinicopathological and molecular characteristics associated with pathological complete response in neoadjuvant immunotherapy, and breast cancer. Develop at least 6 natural sections and close with limitations, and future work.",
+  "constraints": [
+    "Write the article in English.",
+    "Target body length is about 4600 words overall, excluding the final references list.",
+    "Develop approximately 6 major sections following the outline.",
+    "Keep the discussion centered on Clinicopathological and molecular characteristics associated with pathological complete response in neoadjuvant immunotherapy for breast cancer within clinical evidence synthesis.",
+    "Use evidence comparison framework as a visible organizing logic in the main body.",
+    "Compare and synthesize evidence about Method, Clinicopathological and molecular characteristics associated with pathological complete response in neoadjuvant immunotherapy, and breast cancer.",
+    "Explicitly connect the discussion to evidence-based clinical decision-making.",
+    "Close by addressing limitations, and future work."
+  ],
+  "outline": {
+    "sec1": "Scope, terminology, and practice context",
+    "sec2": "Mechanistic and organizing framework",
+    "sec3": "Evidence base, methods, and measurement strategy",
+    "sec4": "Findings and cross-study synthesis",
+    "sec5": "Clinical implications and interpretive discussion",
+    "sec6": "Limitations, heterogeneity, and future research priorities"
+  },
+  "section_word_targets": {
+    "sec1": 481,
+    "sec2": 815,
+    "sec3": 995,
+    "sec4": 1063,
+    "sec5": 858,
+    "sec6": 388
+  },
+  "session_name": "metabench_pmc13066237",
+  "reference": {
+    "task_id": "med_pmc13066237",
+    "paper_type": "medical_review",
+    "topic": "Clinicopathological and molecular characteristics associated with pathological complete response in neoadjuvant immunotherapy for breast cancer",
+    "domain": "clinical evidence synthesis",
+    "language": "English",
+    "constraints": {
+      "required_length_words": 4600,
+      "body_target_words": 4600,
+      "total_target_words": 6762,
+      "expected_sections": 6,
+      "must_include": [
+        "scope",
+        "evidence comparison framework",
+        "clinical evidence synthesis",
+        "Clinicopathological and molecular characteristics associated with pathological complete response in neoadjuvant immunotherapy for breast cancer",
+        "Method",
+        "Clinicopathological and molecular characteristics associated with pathological complete response in neoadjuvant immunotherapy",
+        "breast cancer",
+        "evidence-based clinical decision-making",
+        "limitations",
+        "future work",
+        "ICI",
+        "EMBASE",
+        "MEDLINE",
+        "ICI-"
+      ],
+      "section_word_targets": {
+        "sec1": 481,
+        "sec2": 815,
+        "sec3": 995,
+        "sec4": 1063,
+        "sec5": 858,
+        "sec6": 388
+      },
+      "section_roles": {
+        "sec1": "introduction",
+        "sec2": "evidence_synthesis",
+        "sec3": "evidence_synthesis",
+        "sec4": "evidence_synthesis",
+        "sec5": "discussion",
+        "sec6": "limitations_gaps"
+      },
+      "required_sections": [
+        "introduction",
+        "main_body",
+        "limitations_gaps"
+      ],
+      "periodic_requirements": [
+        "The main body should include explicit comparison or synthesis at regular intervals.",
+        "The second half should address limitations, evidence gaps, or future work."
+      ],
+      "section_prior_scheme": "six_slot_empirical"
+    },
+    "outline": {
+      "sec1": "Scope, terminology, and practice context",
+      "sec2": "Mechanistic and organizing framework",
+      "sec3": "Evidence base, methods, and measurement strategy",
+      "sec4": "Findings and cross-study synthesis",
+      "sec5": "Clinical implications and interpretive discussion",
+      "sec6": "Limitations, heterogeneity, and future research priorities"
+    },
+    "proxy_questions": [
+      {
+        "qid": "q_scope",
+        "question": "Does the article define the scope, boundaries, and key terminology for Clinicopathological and molecular characteristics associated with pathological complete response in neoadjuvant immunotherapy for breast cancer within clinical evidence synthesis?",
+        "required_points": [
+          "defines the scope of Clinicopathological and molecular characteristics associated with pathological complete response in neoadjuvant immunotherapy for breast cancer",
+          "states discussion boundaries or terminology",
+          "situates the topic within clinical evidence synthesis"
+        ]
+      },
+      {
+        "qid": "q_organizer",
+        "question": "Does the article organize the discussion around a evidence comparison framework?",
+        "required_points": [
+          "uses evidence comparison framework as an organizing axis",
+          "separates or compares major categories rather than listing facts only"
+        ]
+      },
+      {
+        "qid": "q_evidence",
+        "question": "Does the article compare and synthesize evidence about Method, Clinicopathological and molecular characteristics associated with pathological complete response in neoadjuvant immunotherapy, and breast cancer for Clinicopathological and molecular characteristics associated with pathological complete response in neoadjuvant immunotherapy for breast cancer?",
+        "required_points": [
+          "discusses Method",
+          "discusses Clinicopathological and molecular characteristics associated with pathological complete response in neoadjuvant immunotherapy",
+          "discusses breast cancer",
+          "covers article-specific detail: ICI",
+          "covers article-specific detail: EMBASE",
+          "covers article-specific detail: MEDLINE",
+          "covers article-specific detail: ICI-",
+          "compares or synthesizes evidence rather than only mentioning isolated facts"
+        ]
+      },
+      {
+        "qid": "q_context",
+        "question": "Does the article connect Clinicopathological and molecular characteristics associated with pathological complete response in neoadjuvant immunotherapy for breast cancer to the evidence-based clinical decision-making context?",
+        "required_points": [
+          "explicitly discusses evidence-based clinical decision-making",
+          "connects the topic to practical decisions, workflows, or constraints"
+        ]
+      },
+      {
+        "qid": "q_closing",
+        "question": "Does the article close by addressing limitations, and future work for Clinicopathological and molecular characteristics associated with pathological complete response in neoadjuvant immunotherapy for breast cancer?",
+        "required_points": [
+          "discusses limitations",
+          "discusses future work",
+          "identifies uncertainty, open questions, or next steps"
+        ]
+      }
+    ]
+  },
+  "corpus_dir": "./data_sample/med_papers_review_augmented_strict"
+}

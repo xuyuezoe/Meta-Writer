@@ -6,6 +6,7 @@ from meta_bench.citation import (
     CitationChunk,
     CitationEvent,
     classify_chunk_role,
+    event_source_fidelity_penalty,
     evaluate_citation_dimension,
     infer_claim_strength,
     infer_evidence_strength,
@@ -117,6 +118,32 @@ class SourceFidelityTests(unittest.TestCase):
         self.assertEqual(infer_claim_strength(event), 4)
         self.assertEqual(infer_evidence_strength(event), 2)
 
+    def test_evidence_text_cues_raise_strength_by_one_level(self):
+        event = CitationEvent(
+            citation_id="C1",
+            chunk_id="sec1",
+            source_id="S1",
+            source_type="mechanistic",
+            claim_role="unknown",
+            claim_span="The evidence suggests a pathway.",
+            source_excerpt="A meta-analysis of randomized trials reported benefit.",
+        )
+
+        self.assertEqual(infer_evidence_strength(event), 2)
+
+    def test_one_level_strength_gap_gets_mild_penalty(self):
+        event = CitationEvent(
+            citation_id="C1",
+            chunk_id="sec1",
+            source_id="S1",
+            source_type="cohort",
+            claim_role="effect",
+            claim_span="The exposure improves outcomes.",
+            source_excerpt="",
+        )
+
+        self.assertAlmostEqual(event_source_fidelity_penalty(event), 0.2)
+
     def test_score_source_fidelity_penalizes_overclaiming(self):
         final_text = """## Introduction
 
@@ -148,8 +175,8 @@ Trials and cohorts are compared here.
         self.assertEqual(result.citation_count, 2)
         self.assertEqual(result.overclaim_count, 1)
         self.assertEqual(result.severe_overclaim_count, 1)
-        self.assertAlmostEqual(result.penalty, 0.4)
-        self.assertAlmostEqual(result.score, 0.6)
+        self.assertAlmostEqual(result.penalty, 0.45)
+        self.assertAlmostEqual(result.score, 0.55)
 
     def test_evaluate_citation_dimension_extracts_manifest_and_chunks(self):
         final_text = "Plain text fallback body."
@@ -454,6 +481,12 @@ class CitationCountScoreTests(unittest.TestCase):
             CITATION_COUNT_THRESHOLDS["soft_upper"],
         )
 
+    def test_citation_count_thresholds_use_central_empirical_band(self):
+        self.assertAlmostEqual(CITATION_COUNT_THRESHOLDS["soft_lower"], 21.780305082175012)
+        self.assertAlmostEqual(CITATION_COUNT_THRESHOLDS["soft_upper"], 53.88519249312971)
+        self.assertAlmostEqual(CITATION_COUNT_THRESHOLDS["hard_lower"], 15.047717849932427)
+        self.assertAlmostEqual(CITATION_COUNT_THRESHOLDS["hard_upper"], 71.44435519935337)
+
     def test_citation_count_gives_full_score_inside_threshold_band(self):
         final_text = (
             "# Test review\n\n"
@@ -566,6 +599,10 @@ class SourceBalanceScoreTests(unittest.TestCase):
             SOURCE_BALANCE_THRESHOLDS["hard_upper"],
         )
         self.assertLessEqual(SOURCE_BALANCE_THRESHOLDS["hard_upper"], 1.0)
+
+    def test_source_balance_thresholds_use_high_percentile_bounds(self):
+        self.assertAlmostEqual(SOURCE_BALANCE_THRESHOLDS["soft_upper"], 0.18181818181818182)
+        self.assertAlmostEqual(SOURCE_BALANCE_THRESHOLDS["hard_upper"], 0.32347248576850013)
 
     def test_source_balance_full_score_for_even_mix(self):
         result = score_source_balance(
