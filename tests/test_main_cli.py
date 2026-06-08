@@ -45,10 +45,10 @@ class MainCliTests(unittest.TestCase):
         self.assertEqual(resolved, main.META_BENCH_TASK_NAMES)
 
     def test_default_meta_bench_tasks_are_medium_or_long_reviews(self) -> None:
-        self.assertEqual(len(META_BENCH_TASK_TIERS["benchmark"]), 50)
-        self.assertEqual(len(META_BENCH_TASK_TIERS["medium"]), 16)
-        self.assertEqual(len(META_BENCH_TASK_TIERS["long"]), 34)
-        self.assertEqual(len(META_BENCH_TASK_TIERS["all"]), 50)
+        self.assertEqual(len(META_BENCH_TASK_TIERS["benchmark"]), 26)
+        self.assertEqual(len(META_BENCH_TASK_TIERS["medium"]), 8)
+        self.assertEqual(len(META_BENCH_TASK_TIERS["long"]), 18)
+        self.assertEqual(len(META_BENCH_TASK_TIERS["all"]), 26)
 
         for task_name in main.META_BENCH_TASK_NAMES:
             config = TASK_REGISTRY[task_name]()
