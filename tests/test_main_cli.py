@@ -69,11 +69,11 @@ class MainCliTests(unittest.TestCase):
                     "status": "completed",
                     "meta_bench_evaluation": {
                         "metric_scores": {
-                            "entity_consistency_score": 0.9,
-                            "proxy_hit_rate": 0.6,
-                            "length_score": 0.8,
-                            "completion_rate": 0.9,
-                            "source_fidelity": 0.7,
+                            "article_entity_recall": 0.9,
+                            "coverage_score": 0.6,
+                            "length_adherence": 0.8,
+                            "heading_soft_recall": 0.9,
+                            "citation_quality_f1": 0.7,
                             "section_distribution": 0.8,
                             "citation_count": 0.85,
                             "source_balance": 0.85,
@@ -84,11 +84,11 @@ class MainCliTests(unittest.TestCase):
                     "status": "completed",
                     "meta_bench_evaluation": {
                         "metric_scores": {
-                            "entity_consistency_score": 0.7,
-                            "proxy_hit_rate": 0.3,
-                            "length_score": 0.7,
-                            "completion_rate": 0.7,
-                            "source_fidelity": 0.5,
+                            "article_entity_recall": 0.7,
+                            "coverage_score": 0.3,
+                            "length_adherence": 0.7,
+                            "heading_soft_recall": 0.7,
+                            "citation_quality_f1": 0.5,
                             "section_distribution": 0.6,
                             "citation_count": 0.65,
                             "source_balance": 0.65,
@@ -106,11 +106,11 @@ class MainCliTests(unittest.TestCase):
         self.assertEqual(summary["success_count"], 2)
         self.assertEqual(summary["failure_count"], 1)
         self.assertEqual(
-            summary["average_metric_scores"]["entity_consistency_score"],
+            summary["average_metric_scores"]["article_entity_recall"],
             0.8,
         )
         self.assertEqual(
-            summary["average_metric_scores"]["proxy_hit_rate"],
+            summary["average_metric_scores"]["coverage_score"],
             0.45,
         )
 

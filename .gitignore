@@ -96,5 +96,7 @@ memory/
 # 对比系统（baseline）内容（不上传）：
 # 外部系统适配器框架 + envs 配置 + baseline 专属分析脚本
 # ===========================================
-experiments/baselines/
+experiments/baselines/envs/
+experiments/baselines/external_repos/
+experiments/baselines/workdirs/
 experiments/analysis/baseline_source_fidelity.py

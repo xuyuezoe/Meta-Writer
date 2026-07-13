@@ -7,6 +7,7 @@ from meta_bench.structure import (
     evaluate_structure_dimension,
     parse_content_sections,
     score_completion_rate,
+    score_heading_soft_recall,
     score_length,
 )
 
@@ -21,12 +22,12 @@ class LengthScoreTests(unittest.TestCase):
         self.assertEqual(result.response_word_count, 5)
         self.assertEqual(result.required_length_words, 10)
         self.assertEqual(result.length_ratio, 0.5)
-        self.assertAlmostEqual(result.score, 0.4)
+        self.assertAlmostEqual(result.score, 0.5)
 
-    def test_length_score_piecewise_reasonable_zone(self):
+    def test_length_score_is_threshold_free_ratio_adherence(self):
         self.assertEqual(compute_length_score_from_ratio(1.0), 1.0)
-        self.assertAlmostEqual(compute_length_score_from_ratio(1.2), 0.9)
-        self.assertAlmostEqual(compute_length_score_from_ratio(1.25), 0.875)
+        self.assertAlmostEqual(compute_length_score_from_ratio(1.2), 1 / 1.2)
+        self.assertAlmostEqual(compute_length_score_from_ratio(1.25), 0.8)
 
     def test_evaluate_structure_dimension_extracts_required_length(self):
         result = evaluate_structure_dimension(
@@ -35,9 +36,18 @@ class LengthScoreTests(unittest.TestCase):
         )
 
         self.assertEqual(result["dimension"], "structure")
-        self.assertEqual(result["scores"]["length_score"], 1.0)
-        self.assertEqual(result["scores"]["completion_rate"], 0.0)
+        self.assertEqual(result["scores"]["length_adherence"], 1.0)
+        self.assertIn("heading_soft_recall", result["scores"])
         self.assertEqual(result["diagnostics"]["length"]["length_ratio"], 1.0)
+
+    def test_heading_soft_recall_scores_semantic_outline_overlap(self):
+        result = score_heading_soft_recall(
+            predicted_headings=["Scope and terminology", "Evidence synthesis"],
+            gold_headings=["Scope and terminology", "Evidence synthesis", "Limitations"],
+        )
+
+        self.assertGreater(result.score, 0.0)
+        self.assertLessEqual(result.score, 1.0)
 
 
 class CompletionRateTests(unittest.TestCase):
@@ -186,9 +196,9 @@ Evidence from studies is compared and synthesized across groups.
             },
         )
 
-        self.assertAlmostEqual(result["scores"]["completion_rate"], 2 / 3)
+        self.assertIn("heading_soft_recall", result["scores"])
         self.assertEqual(
-            result["diagnostics"]["completion"]["expected_section_count"],
+            result["diagnostics"]["completion_legacy"]["expected_section_count"],
             3,
         )
 
@@ -220,8 +230,8 @@ Current evidence is limited by heterogeneity and future work should address the 
             },
         )
 
-        self.assertAlmostEqual(result["scores"]["completion_rate"], 1.0)
-        slots = result["diagnostics"]["completion"]["slots"]
+        self.assertIn("heading_soft_recall", result["scores"])
+        slots = result["diagnostics"]["completion_legacy"]["slots"]
         self.assertEqual(
             [slot["slot"] for slot in slots],
             ["introduction", "main_body", "limitations_gaps"],

@@ -58,7 +58,7 @@ class EntityConsistencyTests(unittest.TestCase):
         )
 
         self.assertEqual(result["dimension"], "content")
-        self.assertEqual(result["scores"]["entity_consistency_score"], 1.0)
+        self.assertEqual(result["scores"]["article_entity_recall"], 1.0)
 
     def test_empty_keywords_are_rejected(self):
         with self.assertRaises(ValueError):
@@ -135,8 +135,8 @@ class ProxyHitRateTests(unittest.TestCase):
             proxy_judge=judge,
         )
 
-        self.assertEqual(result["scores"]["entity_consistency_score"], 1.0)
-        self.assertEqual(result["scores"]["proxy_hit_rate"], 1.0)
+        self.assertEqual(result["scores"]["article_entity_recall"], 1.0)
+        self.assertEqual(result["scores"]["coverage_score"], 1.0)
 
     def test_evaluate_content_dimension_marks_proxy_unscored_without_judge(self):
         reference = {
@@ -156,16 +156,16 @@ class ProxyHitRateTests(unittest.TestCase):
             proxy_judge=None,
         )
 
-        self.assertNotIn("proxy_hit_rate", result["scores"])
+        self.assertNotIn("coverage_score", result["scores"])
         self.assertEqual(
-            result["diagnostics"]["proxy_hit_rate"]["reason"],
+            result["diagnostics"]["coverage_score"]["reason"],
             "proxy_judge_not_provided",
         )
 
     def test_llm_proxy_judge_parses_strict_json_response(self):
         judge = LLMProxyQuestionJudge(
             lambda _prompt: (
-                '{"answered": true, "covered_points": ["scope"], '
+                '{"answered": true, "coverage_score": 5, "covered_points": ["scope"], '
                 '"missing_points": [], "rationale": "covered"}'
             )
         )
@@ -177,6 +177,7 @@ class ProxyHitRateTests(unittest.TestCase):
         )
 
         self.assertTrue(decision.answered)
+        self.assertEqual(decision.coverage_score, 5)
         self.assertEqual(decision.covered_points, ["scope"])
         self.assertEqual(decision.rationale, "covered")
 

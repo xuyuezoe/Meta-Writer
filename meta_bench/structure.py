@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import re
+import math
+from collections import Counter
 from dataclasses import dataclass
-from typing import Mapping
+from typing import Callable, Mapping, Sequence
 
 
 HEADING_RE = re.compile(r"^(#{1,6})\s+(.*\S)\s*$", re.MULTILINE)
@@ -177,6 +179,7 @@ class LengthScoreResult:
 
     def to_dict(self) -> dict[str, object]:
         return {
+            "length_adherence": self.score,
             "length_score": self.score,
             "response_word_count": self.response_word_count,
             "required_length_words": self.required_length_words,
@@ -260,6 +263,33 @@ class CompletionRateResult:
         }
 
 
+@dataclass(frozen=True)
+class HeadingSoftRecallResult:
+    """LiRA-style heading soft recall over generated and gold outlines."""
+
+    score: float
+    gold_headings: list[str]
+    predicted_headings: list[str]
+    gold_cardinality: float
+    predicted_cardinality: float
+    union_cardinality: float
+    intersection_cardinality: float
+    similarity_backend: str
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "heading_soft_recall": self.score,
+            "outline_alignment_score": self.score,
+            "gold_headings": self.gold_headings,
+            "predicted_headings": self.predicted_headings,
+            "gold_cardinality": self.gold_cardinality,
+            "predicted_cardinality": self.predicted_cardinality,
+            "union_cardinality": self.union_cardinality,
+            "intersection_cardinality": self.intersection_cardinality,
+            "similarity_backend": self.similarity_backend,
+        }
+
+
 def count_length_units(text: str) -> int:
     """Count English length units.
 
@@ -277,19 +307,22 @@ def count_length_units(text: str) -> int:
 
 
 def compute_length_score_from_ratio(length_ratio: float) -> float:
-    """Map length ratio to a [0, 1] score using the existing piecewise rule."""
+    """Map length ratio to a [0, 1] threshold-free adherence score.
+
+    The new rule keeps length as a comparable metric without arbitrary bands:
+
+        min(W / B, B / W)
+
+    where W is generated body length and B is the task target.
+    """
 
     if length_ratio < 0:
         raise ValueError("length_ratio must be non-negative")
 
-    if length_ratio < 0.5:
-        score = 0.8 * length_ratio
-    elif length_ratio < 0.8:
-        score = 0.4 + (length_ratio - 0.5) * (4.0 / 3.0)
-    elif length_ratio <= 1.2:
-        score = 1.0 - abs(length_ratio - 1.0) * 0.5
+    if length_ratio == 0:
+        score = 0.0
     else:
-        score = 0.9 - (length_ratio - 1.2) * 0.5
+        score = min(length_ratio, 1.0 / length_ratio)
     return max(0.0, min(1.0, score))
 
 
@@ -312,7 +345,82 @@ def score_length(final_text: str, required_length_words: int) -> LengthScoreResu
         response_word_count=response_word_count,
         required_length_words=required_length_words,
         length_ratio=length_ratio,
-        length_within_tolerance=0.8 <= length_ratio <= 1.2,
+        length_within_tolerance=score >= 0.8,
+    )
+
+
+def _token_counter(text: str) -> Counter[str]:
+    tokens = re.findall(r"[a-z0-9]+", text.casefold())
+    return Counter(tokens)
+
+
+def _token_cosine_similarity(a: str, b: str) -> float:
+    left = _token_counter(a)
+    right = _token_counter(b)
+    if not left or not right:
+        return 0.0
+    shared = set(left) & set(right)
+    numerator = sum(left[token] * right[token] for token in shared)
+    left_norm = math.sqrt(sum(value * value for value in left.values()))
+    right_norm = math.sqrt(sum(value * value for value in right.values()))
+    if left_norm == 0 or right_norm == 0:
+        return 0.0
+    return max(0.0, min(1.0, numerator / (left_norm * right_norm)))
+
+
+def _soft_cardinality(
+    headings: Sequence[str],
+    similarity_fn: Callable[[str, str], float],
+) -> float:
+    if not headings:
+        return 0.0
+    total = 0.0
+    for heading in headings:
+        similarity_sum = sum(similarity_fn(heading, other) for other in headings)
+        if similarity_sum <= 0:
+            similarity_sum = 1.0
+        total += 1.0 / similarity_sum
+    return total
+
+
+def score_heading_soft_recall(
+    predicted_headings: Sequence[str],
+    gold_headings: Sequence[str],
+    *,
+    similarity_fn: Callable[[str, str], float] | None = None,
+    similarity_backend: str = "token_cosine",
+) -> HeadingSoftRecallResult:
+    """Compute LiRA's heading soft recall formula.
+
+    LiRA defines soft cardinality from pairwise heading similarities and scores
+    recall as card(G intersection P) / card(G).
+    """
+
+    clean_gold = [str(heading).strip() for heading in gold_headings if str(heading).strip()]
+    clean_predicted = [
+        str(heading).strip() for heading in predicted_headings if str(heading).strip()
+    ]
+    if not clean_gold:
+        raise ValueError("gold_headings must contain at least one heading")
+    sim = similarity_fn or _token_cosine_similarity
+    gold_cardinality = _soft_cardinality(clean_gold, sim)
+    predicted_cardinality = _soft_cardinality(clean_predicted, sim)
+    union_headings = list(dict.fromkeys([*clean_gold, *clean_predicted]))
+    union_cardinality = _soft_cardinality(union_headings, sim)
+    intersection_cardinality = max(
+        0.0,
+        min(gold_cardinality, gold_cardinality + predicted_cardinality - union_cardinality),
+    )
+    score = 0.0 if gold_cardinality <= 0 else intersection_cardinality / gold_cardinality
+    return HeadingSoftRecallResult(
+        score=round(max(0.0, min(1.0, score)), 4),
+        gold_headings=clean_gold,
+        predicted_headings=clean_predicted,
+        gold_cardinality=round(gold_cardinality, 4),
+        predicted_cardinality=round(predicted_cardinality, 4),
+        union_cardinality=round(union_cardinality, 4),
+        intersection_cardinality=round(intersection_cardinality, 4),
+        similarity_backend=similarity_backend,
     )
 
 
@@ -690,6 +798,39 @@ def _extract_required_completion_slots(reference: Mapping[str, object]) -> list[
     return slots
 
 
+def _extract_gold_outline_headings(reference: Mapping[str, object]) -> list[str]:
+    raw_outline = reference.get("outline")
+    if isinstance(raw_outline, Mapping):
+        headings = [str(value).strip() for value in raw_outline.values() if str(value).strip()]
+        if headings:
+            return headings
+    constraints = reference.get("constraints")
+    if isinstance(constraints, Mapping):
+        raw_sections = constraints.get("required_section_headings")
+        if isinstance(raw_sections, list):
+            headings = [str(value).strip() for value in raw_sections if str(value).strip()]
+            if headings:
+                return headings
+        raw_roles = constraints.get("section_roles")
+        if isinstance(raw_roles, Mapping):
+            headings = [str(value).strip() for value in raw_roles.values() if str(value).strip()]
+            if headings:
+                return headings
+    return _extract_required_completion_slots(reference)
+
+
+def _extract_predicted_headings(final_text: str) -> list[str]:
+    headings = [section.heading for section in parse_content_sections(final_text)]
+    if headings:
+        return headings
+    slots = classify_functional_sections(final_text)
+    return [
+        slot.heading or slot.slot.replace("_", " ")
+        for slot in slots.values()
+        if slot.filled and slot.slot not in {"title", "abstract", "keywords", "references"}
+    ]
+
+
 def evaluate_structure_dimension(
     final_text: str,
     reference: Mapping[str, object],
@@ -705,14 +846,19 @@ def evaluate_structure_dimension(
         expected_section_count=_extract_expected_section_count(reference),
         required_slots=_extract_required_completion_slots(reference),
     )
+    heading_result = score_heading_soft_recall(
+        predicted_headings=_extract_predicted_headings(final_text),
+        gold_headings=_extract_gold_outline_headings(reference),
+    )
     return {
         "dimension": "structure",
         "scores": {
-            "length_score": length_result.score,
-            "completion_rate": completion_result.score,
+            "length_adherence": length_result.score,
+            "heading_soft_recall": heading_result.score,
         },
         "diagnostics": {
             "length": length_result.to_dict(),
-            "completion": completion_result.to_dict(),
+            "heading_soft_recall": heading_result.to_dict(),
+            "completion_legacy": completion_result.to_dict(),
         },
     }

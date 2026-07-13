@@ -101,9 +101,21 @@ def evaluate_if_possible(
     if not isinstance(reference, Mapping):
         return None
 
-    from meta_bench import evaluate_meta_bench
+    from meta_bench import (
+        estimate_citation_quality_claim_count,
+        evaluate_meta_bench,
+    )
 
-    evaluation = evaluate_meta_bench(final_text, dict(reference))
+    runtime_reference = dict(reference)
+    if "citation_quality_scaling_claim_count" not in runtime_reference:
+        runtime_reference["citation_quality_scaling_claim_count"] = (
+            estimate_citation_quality_claim_count(final_text)
+        )
+        runtime_reference["citation_quality_scaling_claim_count_source"] = (
+            "article_sentences"
+        )
+
+    evaluation = evaluate_meta_bench(final_text, runtime_reference)
     # 正交标记：评估自身 status 恒为 "completed"；generation_degraded 单独
     # 表达"被评估文本含彻底失败/降级章节"，二者独立，互不覆盖。
     evaluation["generation_degraded"] = run_status != "completed"

@@ -1,7 +1,8 @@
 """Content-dimension scores for the clean MetaBench evaluator.
 
-The first content score is ``entity_consistency_score``: the fraction of
-required keywords that appear in the generated text.
+The main content scores follow LiRA-style article entity recall and
+rubric-based coverage, while preserving the older task-keyword helpers as
+compatibility wrappers.
 """
 
 from __future__ import annotations
@@ -15,21 +16,30 @@ from typing import Callable, Iterable, Literal, Mapping, Protocol, Sequence, cas
 
 @dataclass(frozen=True)
 class EntityConsistencyResult:
-    """Keyword-match result for entity consistency."""
+    """LiRA-style entity-recall result.
+
+    When a task already provides gold entities, this implements the same
+    recall formula used by LiRA's article entity recall:
+
+        recalled gold entities / total gold entities
+    """
 
     score: float
     keyword_hit_count: int
     keyword_total: int
     matched_keywords: list[str]
     missing_keywords: list[str]
+    gold_source: str = "reference.constraints.must_include"
 
     def to_dict(self) -> dict[str, object]:
         return {
+            "article_entity_recall": self.score,
             "entity_consistency_score": self.score,
             "keyword_hit_count": self.keyword_hit_count,
             "keyword_total": self.keyword_total,
             "matched_keywords": self.matched_keywords,
             "missing_keywords": self.missing_keywords,
+            "gold_source": self.gold_source,
         }
 
 
@@ -52,11 +62,12 @@ class ProxyQuestionDecision:
     covered_points: list[str]
     missing_points: list[str]
     rationale: str = ""
+    coverage_score: int | None = None
 
 
 @dataclass(frozen=True)
 class ProxyHitRateResult:
-    """Aggregated LLM-judge coverage over proxy questions."""
+    """Aggregated LiRA-style coverage over proxy questions."""
 
     score: float
     answered_count: int
@@ -64,14 +75,17 @@ class ProxyHitRateResult:
     covered_point_count: int
     required_point_total: int
     decisions: list[ProxyQuestionDecision]
+    raw_coverage_scores: list[int]
 
     def to_dict(self) -> dict[str, object]:
         return {
+            "coverage_score": self.score,
             "proxy_hit_rate": self.score,
             "answered_count": self.answered_count,
             "question_total": self.question_total,
             "covered_point_count": self.covered_point_count,
             "required_point_total": self.required_point_total,
+            "raw_coverage_scores": self.raw_coverage_scores,
             "decisions": [
                 {
                     "qid": decision.qid,
@@ -79,6 +93,7 @@ class ProxyHitRateResult:
                     "answered": decision.answered,
                     "covered_points": decision.covered_points,
                     "missing_points": decision.missing_points,
+                    "coverage_score": getattr(decision, "coverage_score", None),
                     "rationale": decision.rationale,
                 }
                 for decision in self.decisions
@@ -204,16 +219,17 @@ def keyword_in_text(text: str, keyword: str) -> bool:
 def score_entity_consistency(
     final_text: str,
     keywords: Sequence[object],
+    *,
+    gold_source: str = "reference.constraints.must_include",
 ) -> EntityConsistencyResult:
-    """Score required-keyword coverage.
+    """Score LiRA-style entity recall over provided gold entity strings.
 
     Formula:
-        entity_consistency_score = matched_keyword_count / keyword_total
+        article_entity_recall = matched_gold_entity_count / gold_entity_total
 
     Args:
         final_text: Generated answer text.
-        keywords: Required keywords or phrases. Each list item counts once,
-            matching the original benchmark behavior.
+        keywords: Gold entities/concepts. Each list item counts once.
     """
 
     if not isinstance(final_text, str) or final_text.strip() == "":
@@ -236,6 +252,7 @@ def score_entity_consistency(
         keyword_total=len(required_keywords),
         matched_keywords=matched_keywords,
         missing_keywords=missing_keywords,
+        gold_source=gold_source,
     )
 
 
@@ -251,17 +268,24 @@ def build_proxy_question_judge_prompt(
     if required_points_text == "":
         required_points_text = "- Judge from the question itself; no explicit points were provided."
     return (
-        "You are a benchmark judge. Decide whether the generated article answers "
-        "the topic-derived proxy question.\n\n"
-        "Use only the generated article. Do not reward unsupported assumptions.\n"
+        "You are a benchmark judge for long-form literature reviews. Evaluate "
+        "coverage using the LiRA-style 1-5 coverage rubric.\n\n"
+        "Use only the generated article. Do not reward unsupported assumptions. "
         "Classify every required answer point independently. Copy each required "
-        "answer point into exactly one of covered_points or missing_points. "
+        "answer point into exactly one of covered_points or missing_points.\n\n"
+        "Coverage rubric:\n"
+        "5 = comprehensively covers the key and peripheral aspects requested.\n"
+        "4 = covers most key areas, with only very minor omissions.\n"
+        "3 = generally covers the topic but misses a few important points.\n"
+        "2 = covers only part of the topic, with clear omissions.\n"
+        "1 = very limited coverage, touching only a small portion of the topic.\n\n"
         "Set answered=true only when every required answer point is directly "
         "covered. If any required point is missing, vague, or only implied, "
         "set answered=false.\n"
         "Return strict JSON with this schema:\n"
         '{\n'
         '  "answered": true,\n'
+        '  "coverage_score": 4,\n'
         '  "covered_points": ["..."],\n'
         '  "missing_points": ["..."],\n'
         '  "rationale": "short explanation"\n'
@@ -297,6 +321,15 @@ def parse_proxy_question_judge_response(
     if not isinstance(missing_points, list):
         missing_points = []
 
+    raw_coverage_score = parsed.get("coverage_score")
+    coverage_score: int | None
+    try:
+        coverage_score = int(raw_coverage_score)
+    except (TypeError, ValueError):
+        coverage_score = None
+    if coverage_score is not None:
+        coverage_score = max(1, min(5, coverage_score))
+
     return ProxyQuestionDecision(
         qid=question.qid,
         question=question.question,
@@ -308,6 +341,7 @@ def parse_proxy_question_judge_response(
             str(point).strip() for point in missing_points if str(point).strip()
         ],
         rationale=str(parsed.get("rationale", "")),
+        coverage_score=coverage_score,
     )
 
 
@@ -328,14 +362,14 @@ def score_proxy_hit_rate(
     proxy_questions: Sequence[ProxyQuestionSpec],
     judge: ProxyQuestionJudge,
 ) -> ProxyHitRateResult:
-    """Score how many required proxy-question points are covered.
+    """Score LiRA-style coverage over task proxy questions.
 
     Formula:
-        proxy_hit_rate = covered_required_point_count / required_point_total
+        coverage_score = average((raw_coverage_score - 1) / 4)
 
-    ``answered_count`` remains a whole-question diagnostic: a question is fully
-    answered only when the judge marks it answered and reports no missing
-    required points.
+    If an older judge does not return a 1-5 coverage score, the score is derived
+    from required-point coverage so compatibility tests and simple judges still
+    work.
     """
 
     if not isinstance(final_text, str) or final_text.strip() == "":
@@ -352,12 +386,16 @@ def score_proxy_hit_rate(
     )
     covered_point_count = 0
     required_point_total = 0
+    raw_coverage_scores: list[int] = []
     for question, decision in zip(proxy_questions, decisions):
         required_count = len(question.required_points)
         if required_count == 0:
             required_point_total += 1
             if decision.answered and not decision.missing_points:
                 covered_point_count += 1
+                raw_coverage_scores.append(5)
+            else:
+                raw_coverage_scores.append(1)
             continue
 
         required_point_total += required_count
@@ -365,8 +403,16 @@ def score_proxy_hit_rate(
         if covered_count == 0 and decision.answered and not decision.missing_points:
             covered_count = required_count
         covered_point_count += min(required_count, covered_count)
+        decision_coverage_score = getattr(decision, "coverage_score", None)
+        if decision_coverage_score is not None:
+            raw_coverage_scores.append(max(1, min(5, int(decision_coverage_score))))
+        else:
+            fraction = min(required_count, covered_count) / required_count
+            raw_coverage_scores.append(max(1, min(5, round(1 + 4 * fraction))))
 
-    score = covered_point_count / required_point_total
+    score = sum((raw_score - 1) / 4 for raw_score in raw_coverage_scores) / len(
+        raw_coverage_scores
+    )
     return ProxyHitRateResult(
         score=score,
         answered_count=answered_count,
@@ -374,6 +420,7 @@ def score_proxy_hit_rate(
         covered_point_count=covered_point_count,
         required_point_total=required_point_total,
         decisions=decisions,
+        raw_coverage_scores=raw_coverage_scores,
     )
 
 
@@ -385,6 +432,20 @@ def _extract_must_include(reference: Mapping[str, object]) -> list[object]:
     if not isinstance(must_include, list):
         raise TypeError("reference.constraints.must_include must be a list")
     return list(must_include)
+
+
+def _extract_gold_entities(reference: Mapping[str, object]) -> tuple[list[object], str]:
+    for key in ("gold_entities", "article_entities", "entities"):
+        raw_entities = reference.get(key)
+        if isinstance(raw_entities, list) and raw_entities:
+            return list(raw_entities), f"reference.{key}"
+    constraints = reference.get("constraints")
+    if isinstance(constraints, Mapping):
+        for key in ("gold_entities", "article_entities", "must_include"):
+            raw_entities = constraints.get(key)
+            if isinstance(raw_entities, list) and raw_entities:
+                return list(raw_entities), f"reference.constraints.{key}"
+    return _extract_must_include(reference), "reference.constraints.must_include"
 
 
 def _normalize_required_points(item: Mapping[str, object]) -> list[str]:
@@ -435,15 +496,17 @@ def evaluate_content_dimension(
 ) -> dict[str, object]:
     """Evaluate the content dimension currently implemented in ``meta_bench``."""
 
+    gold_entities, gold_source = _extract_gold_entities(reference)
     entity_result = score_entity_consistency(
         final_text=final_text,
-        keywords=_extract_must_include(reference),
+        keywords=gold_entities,
+        gold_source=gold_source,
     )
     scores: dict[str, object] = {
-        "entity_consistency_score": entity_result.score,
+        "article_entity_recall": entity_result.score,
     }
     diagnostics: dict[str, object] = {
-        "entity_consistency": entity_result.to_dict(),
+        "article_entity_recall": entity_result.to_dict(),
     }
 
     proxy_questions = _extract_proxy_questions(reference)
@@ -455,7 +518,7 @@ def evaluate_content_dimension(
             active_proxy_judge = proxy_judge
 
         if active_proxy_judge is None:
-            diagnostics["proxy_hit_rate"] = {
+            diagnostics["coverage_score"] = {
                 "status": "not_evaluated",
                 "reason": "proxy_judge_not_provided",
                 "question_total": len(proxy_questions),
@@ -466,8 +529,8 @@ def evaluate_content_dimension(
                 proxy_questions=proxy_questions,
                 judge=active_proxy_judge,
             )
-            scores["proxy_hit_rate"] = proxy_result.score
-            diagnostics["proxy_hit_rate"] = proxy_result.to_dict()
+            scores["coverage_score"] = proxy_result.score
+            diagnostics["coverage_score"] = proxy_result.to_dict()
 
     return {
         "dimension": "content",
