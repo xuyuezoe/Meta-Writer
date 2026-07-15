@@ -62,7 +62,7 @@ def test_completed_run_marked_not_degraded(monkeypatch) -> None:
     assert extract_ordered_metric_scores(evaluation)["article_entity_recall"] == 0.8
 
 
-def test_evaluate_if_possible_injects_article_sentence_scaling(monkeypatch) -> None:
+def test_evaluate_if_possible_keeps_reference_unchanged(monkeypatch) -> None:
     captured = {}
 
     def fake_evaluate(final_text, reference):
@@ -78,8 +78,8 @@ def test_evaluate_if_possible_injects_article_sentence_scaling(monkeypatch) -> N
     )
     evaluate_if_possible(final_text, {"task_id": "t1"}, run_status="completed")
 
-    assert captured["citation_quality_scaling_claim_count"] == 2
-    assert captured["citation_quality_scaling_claim_count_source"] == "article_sentences"
+    assert "citation_quality_scaling_claim_count" not in captured
+    assert "citation_quality_scaling_claim_count_source" not in captured
 
 
 def test_no_reference_returns_none(monkeypatch) -> None:

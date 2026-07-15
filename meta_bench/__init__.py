@@ -14,6 +14,8 @@ from .content import (
     score_proxy_hit_rate,
 )
 from .citation import (
+    DEFAULT_CITATION_QUALITY_SCALING_CLAIM_COUNT,
+    DEFAULT_CITATION_QUALITY_SCALING_CLAIM_COUNT_SOURCE,
     CitationChunk,
     CitationCountScoreResult,
     CitationEvent,
@@ -72,6 +74,8 @@ __all__ = [
     "CitationQualityDecision",
     "CitationQualityF1Result",
     "CitationEvent",
+    "DEFAULT_CITATION_QUALITY_SCALING_CLAIM_COUNT",
+    "DEFAULT_CITATION_QUALITY_SCALING_CLAIM_COUNT_SOURCE",
     "ChunkRoleClassification",
     "LLMCitationQualityJudge",
     "SourceFidelityResult",

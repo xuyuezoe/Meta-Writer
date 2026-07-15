@@ -34,6 +34,14 @@ MAX_CITATION_QUALITY_CHUNK_CHARS = 1200
 MAX_CITATION_QUALITY_CHUNKS_PER_SOURCE = 3
 MIN_CITATION_QUALITY_SUBCLAIM_WORDS = 6
 MIN_CITATION_QUALITY_ARTICLE_CLAIM_WORDS = 8
+# LiRA scales citation recall with the average claim count across the evaluated
+# benchmark, rather than the cited-claim count of each individual article. This
+# value is the mean article-sentence claim count from the fixed 50-task
+# MetaBench generation set used for the benchmark calibration run.
+DEFAULT_CITATION_QUALITY_SCALING_CLAIM_COUNT = 258.62
+DEFAULT_CITATION_QUALITY_SCALING_CLAIM_COUNT_SOURCE = (
+    "metabench_50task_article_sentence_mean"
+)
 CITATION_COUNT_THRESHOLDS = {
     # Calibrated from medical_reviews_300_ready/article_summary.csv using
     # whole-body citation density: body citation events per 1,000 body words.
@@ -2958,7 +2966,8 @@ def evaluate_citation_dimension(
     if active_quality_judge is not None:
         try:
             raw_scaling_claim_count = reference.get(
-                "citation_quality_scaling_claim_count"
+                "citation_quality_scaling_claim_count",
+                DEFAULT_CITATION_QUALITY_SCALING_CLAIM_COUNT,
             )
             scaling_claim_count = (
                 float(raw_scaling_claim_count)
@@ -2982,12 +2991,12 @@ def evaluate_citation_dimension(
     quality_diagnostics: dict[str, object]
     if quality_result is not None:
         quality_diagnostics = quality_result.to_dict()
-        if isinstance(reference, Mapping) and reference.get(
-            "citation_quality_scaling_claim_count_source"
-        ):
-            quality_diagnostics["scaling_claim_count_source"] = str(
-                reference.get("citation_quality_scaling_claim_count_source")
+        quality_diagnostics["scaling_claim_count_source"] = str(
+            reference.get(
+                "citation_quality_scaling_claim_count_source",
+                DEFAULT_CITATION_QUALITY_SCALING_CLAIM_COUNT_SOURCE,
             )
+        )
     else:
         quality_diagnostics = {
             "status": "not_evaluated",

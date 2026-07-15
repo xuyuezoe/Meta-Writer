@@ -565,6 +565,29 @@ Trials and cohorts are compared here.
             "article_sentences",
         )
 
+    def test_evaluate_citation_dimension_uses_benchmark_scaling_by_default(self):
+        result = evaluate_citation_dimension(
+            "Generated article text.",
+            {
+                "citation_manifest": [
+                    {
+                        "citation_id": "C1",
+                        "source_id": "S1",
+                        "claim_span": "Claim one",
+                        "source_excerpt": "Evidence for claim one.",
+                    }
+                ]
+            },
+            citation_quality_judge=StaticCitationQualityJudge({"C1": True}),
+        )
+
+        diagnostics = result["diagnostics"]["citation_quality_f1"]
+        self.assertEqual(diagnostics["scaling_claim_count"], 258.62)
+        self.assertEqual(
+            diagnostics["scaling_claim_count_source"],
+            "metabench_50task_article_sentence_mean",
+        )
+
 
 class SectionDistributionTests(unittest.TestCase):
     def test_split_into_seven_sections_uses_article_slots(self):
