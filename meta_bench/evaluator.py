@@ -4,19 +4,19 @@ from __future__ import annotations
 
 from typing import Literal, Mapping
 
-from .citation import evaluate_citation_dimension
+from .citation import CitationQualityJudge, evaluate_citation_dimension
 from .content import ProxyQuestionJudge, evaluate_content_dimension
 from .structure import evaluate_structure_dimension
 
 META_BENCH_METRIC_ORDER = [
-    "entity_consistency_score",
-    "proxy_hit_rate",
-    "length_score",
-    "completion_rate",
-    "source_fidelity",
-    "section_distribution",
+    "article_entity_recall",
+    "coverage_score",
+    "length_adherence",
+    "heading_soft_recall",
     "citation_count",
+    "section_distribution",
     "source_balance",
+    "citation_quality_f1",
 ]
 def _safe_content_evaluation(
     final_text: str,
@@ -44,7 +44,7 @@ def _safe_content_evaluation(
             proxy_judge=None,
         )
         diagnostics = result.setdefault("diagnostics", {})
-        proxy_diagnostics = diagnostics.setdefault("proxy_hit_rate", {})
+        proxy_diagnostics = diagnostics.setdefault("coverage_score", {})
         if isinstance(proxy_diagnostics, dict):
             proxy_diagnostics["status"] = "not_evaluated"
             proxy_diagnostics["reason"] = "proxy_judge_error"
@@ -57,6 +57,7 @@ def evaluate_meta_bench(
     reference: Mapping[str, object],
     *,
     proxy_judge: ProxyQuestionJudge | Literal["default"] | None = "default",
+    citation_quality_judge: CitationQualityJudge | Literal["default"] | None = "default",
 ) -> dict[str, object]:
     """Evaluate a generated article with the three-dimension MetaBench scheme."""
 
@@ -66,7 +67,11 @@ def evaluate_meta_bench(
         proxy_judge=proxy_judge,
     )
     structure_result = evaluate_structure_dimension(final_text, reference)
-    citation_result = evaluate_citation_dimension(final_text, reference)
+    citation_result = evaluate_citation_dimension(
+        final_text,
+        reference,
+        citation_quality_judge=citation_quality_judge,
+    )
 
     dimensions = {
         "content": content_result,

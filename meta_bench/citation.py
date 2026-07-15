@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import json
+import math
+import os
 import re
 from collections import Counter, defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import lru_cache
-from typing import Callable, Iterable, Mapping, Sequence, cast
+from typing import Callable, Iterable, Literal, Mapping, Protocol, Sequence, cast
 
 from .structure import count_length_units, parse_markdown_sections
 
@@ -28,6 +30,18 @@ LOW_CONFIDENCE_MARGIN = 0.15
 BODY_SIGNAL_WORD_LIMIT = 220
 BODY_SIGNAL_SENTENCE_LIMIT = 3
 MIN_CITATIONS_FOR_DISTRIBUTION = 5
+MAX_CITATION_QUALITY_CHUNK_CHARS = 1200
+MAX_CITATION_QUALITY_CHUNKS_PER_SOURCE = 3
+MIN_CITATION_QUALITY_SUBCLAIM_WORDS = 6
+MIN_CITATION_QUALITY_ARTICLE_CLAIM_WORDS = 8
+# LiRA scales citation recall with the average claim count across the evaluated
+# benchmark, rather than the cited-claim count of each individual article. This
+# value is the mean article-sentence claim count from the fixed 50-task
+# MetaBench generation set used for the benchmark calibration run.
+DEFAULT_CITATION_QUALITY_SCALING_CLAIM_COUNT = 258.62
+DEFAULT_CITATION_QUALITY_SCALING_CLAIM_COUNT_SOURCE = (
+    "metabench_50task_article_sentence_mean"
+)
 CITATION_COUNT_THRESHOLDS = {
     # Calibrated from medical_reviews_300_ready/article_summary.csv using
     # whole-body citation density: body citation events per 1,000 body words.
@@ -38,13 +52,6 @@ CITATION_COUNT_THRESHOLDS = {
     "hard_lower": 15.047717849932427,
     "hard_upper": 71.44435519935337,
 }
-SOURCE_BALANCE_THRESHOLDS = {
-    # Calibrated from the same 300-review corpus using the runtime metric:
-    # max citations to a single source divided by total body citation events.
-    "soft_upper": 0.18181818181818182,
-    "hard_upper": 0.32347248576850013,
-}
-
 SEVEN_SECTION_KEYS = [
     "title",
     "abstract",
@@ -522,6 +529,110 @@ class SourceFidelityResult:
 
 
 @dataclass(frozen=True)
+class CitationQualityDecision:
+    """Citation contribution decision for one citation event."""
+
+    citation_id: str
+    claim_key: str
+    source_id: str
+    supported: bool
+    necessary: bool
+    rationale: str = ""
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "citation_id": self.citation_id,
+            "claim_key": self.claim_key,
+            "source_id": self.source_id,
+            "supported": self.supported,
+            "necessary": self.necessary,
+            "rationale": self.rationale,
+        }
+
+
+@dataclass(frozen=True)
+class ClaimCitationQualityDecision:
+    """LiRA-style claim-level citation-quality decision."""
+
+    claim_key: str
+    claim: str
+    citation_ids: list[str]
+    source_ids: list[str]
+    supported: bool
+    necessary_citation_ids: list[str] = field(default_factory=list)
+    rationale: str = ""
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "claim_key": self.claim_key,
+            "claim": self.claim,
+            "citation_ids": self.citation_ids,
+            "source_ids": self.source_ids,
+            "supported": self.supported,
+            "supporting_citation_ids": self.necessary_citation_ids,
+            "necessary_citation_ids": self.necessary_citation_ids,
+            "rationale": self.rationale,
+        }
+
+
+@dataclass(frozen=True)
+class CitationQualityF1Result:
+    """LiRA citation quality F1 with recall scaling."""
+
+    score: float
+    precision: float
+    recall: float
+    scaled_recall: float
+    scaling: float
+    scaling_claim_count: float
+    claim_count: int
+    citation_count: int
+    supported_claim_count: int
+    necessary_citation_count: int
+    excluded_claim_count: int
+    excluded_citation_count: int
+    excluded_claims: list[dict[str, object]]
+    decisions: list[CitationQualityDecision]
+    claim_decisions: list[ClaimCitationQualityDecision] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "citation_quality_f1": self.score,
+            "precision": self.precision,
+            "recall": self.recall,
+            "scaled_recall": self.scaled_recall,
+            "scaling": self.scaling,
+            "scaling_claim_count": self.scaling_claim_count,
+            "claim_count": self.claim_count,
+            "citation_count": self.citation_count,
+            "supported_claim_count": self.supported_claim_count,
+            "supporting_citation_count": self.necessary_citation_count,
+            "necessary_citation_count": self.necessary_citation_count,
+            "excluded_claim_count": self.excluded_claim_count,
+            "excluded_citation_count": self.excluded_citation_count,
+            "excluded_claims": self.excluded_claims,
+            "claim_decisions": [
+                decision.to_dict() for decision in self.claim_decisions
+            ],
+            "decisions": [decision.to_dict() for decision in self.decisions],
+            "formula": "2 * precision * scaled_recall / (precision + scaled_recall)",
+            "scaling_formula": "1 - exp(-0.01 * scaling_claim_count)",
+        }
+
+
+class CitationQualityJudge(Protocol):
+    """Judge interface for LiRA-style claim-citation alignment."""
+
+    def judge_claim_citation_quality(
+        self,
+        *,
+        claim: str,
+        sources: Sequence[Mapping[str, str]],
+    ) -> ClaimCitationQualityDecision:
+        """Return whether a cited reference set supports one claim."""
+
+
+@dataclass(frozen=True)
 class SevenSection:
     """One section in the seven-section citation-distribution layout."""
 
@@ -575,7 +686,9 @@ class SourceBalanceResult:
     max_single_source_count: int
     max_single_source_share: float
     dominant_source_id: str
-    thresholds: dict[str, float]
+    concentration_hhi: float
+    cited_source_count: int
+    method: str
     source: str
     source_counts: dict[str, int]
 
@@ -587,7 +700,9 @@ class SourceBalanceResult:
             "max_single_source_count": self.max_single_source_count,
             "max_single_source_share": self.max_single_source_share,
             "dominant_source_id": self.dominant_source_id,
-            "thresholds": self.thresholds,
+            "concentration_hhi": self.concentration_hhi,
+            "cited_source_count": self.cited_source_count,
+            "method": self.method,
             "source": self.source,
             "source_counts": self.source_counts,
         }
@@ -1235,6 +1350,473 @@ def normalize_citation_events(raw_citations: Iterable[object]) -> list[CitationE
     return citations
 
 
+class LLMCitationQualityJudge:
+    """API-agnostic LiRA-style citation-quality judge wrapper."""
+
+    def __init__(self, complete: Callable[[str], str]):
+        self._complete = complete
+
+    def judge_claim_citation_quality(
+        self,
+        *,
+        claim: str,
+        sources: Sequence[Mapping[str, str]],
+    ) -> ClaimCitationQualityDecision:
+        prompt = build_citation_quality_judge_prompt(
+            claim=claim,
+            sources=sources,
+        )
+        raw_response = self._complete(prompt)
+        return parse_citation_quality_judge_response(
+            raw_response,
+            claim=claim,
+            sources=sources,
+        )
+
+    def judge_citation_quality(
+        self,
+        *,
+        claim: str,
+        source_excerpt: str,
+        source_id: str,
+        citation_id: str,
+    ) -> CitationQualityDecision:
+        """Backward-compatible single-citation wrapper."""
+
+        claim_decision = self.judge_claim_citation_quality(
+            claim=claim,
+            sources=[
+                {
+                    "citation_id": citation_id,
+                    "source_id": source_id,
+                    "source_excerpt": source_excerpt,
+                }
+            ],
+        )
+        necessary = citation_id in set(claim_decision.necessary_citation_ids)
+        return CitationQualityDecision(
+            citation_id=citation_id,
+            claim_key=claim_decision.claim_key,
+            source_id=source_id,
+            supported=necessary,
+            necessary=necessary,
+            rationale=claim_decision.rationale,
+        )
+
+
+def create_default_citation_quality_judge(
+    *,
+    model: str | None = None,
+    base_url: str | None = None,
+    api_key: str | None = None,
+    max_tokens: int = 4096,
+    load_env: bool = True,
+) -> LLMCitationQualityJudge:
+    """Create the default LLM judge for LiRA-style citation quality."""
+
+    if load_env:
+        from dotenv import load_dotenv
+
+        load_dotenv(override=True)
+
+    resolved_api_key = api_key or os.getenv("API_KEY")
+    if not resolved_api_key:
+        raise EnvironmentError("API_KEY is required for citation quality judging")
+
+    resolved_model = (
+        model
+        or os.getenv("META_BENCH_CITATION_QUALITY_JUDGE_MODEL")
+        or os.getenv("META_BENCH_PROXY_JUDGE_MODEL")
+        or os.getenv("MODEL")
+        or "glm-5"
+    )
+    resolved_base_url = base_url if base_url is not None else os.getenv("BASE_URL")
+
+    from src.utils.llm_client import LLMClient
+
+    client = LLMClient(
+        api_key=resolved_api_key,
+        model=resolved_model,
+        base_url=resolved_base_url,
+    )
+
+    def complete(prompt: str) -> str:
+        return client.generate(
+            prompt,
+            temperature=0.0,
+            max_tokens=max_tokens,
+            strip_think=True,
+        )
+
+    judge = LLMCitationQualityJudge(complete)
+    setattr(judge, "llm_client", client)
+    setattr(judge, "model", resolved_model)
+    return judge
+
+
+def build_citation_quality_judge_prompt(
+    *,
+    claim: str,
+    sources: Sequence[Mapping[str, str]],
+) -> str:
+    """Build a constrained LiRA-style claim-citation alignment prompt."""
+
+    source_blocks: list[str] = []
+    for index, source in enumerate(sources, start=1):
+        citation_id = str(source.get("citation_id", f"C{index:03d}"))
+        source_id = str(source.get("source_id", "unknown"))
+        source_excerpt = str(source.get("source_excerpt", ""))
+        source_blocks.append(
+            f"[{index}] citation_id: {citation_id}\n"
+            f"source_id: {source_id}\n"
+            f"excerpt:\n{source_excerpt}"
+        )
+    formatted_sources = "\n\n".join(source_blocks)
+
+    return (
+        "You are a citation-quality judge for a scientific literature review. "
+        "Decide whether the cited reference set supports the generated claim.\n\n"
+        "Use natural-language inference over only the provided excerpts. Judge "
+        "the core scientific assertion of the claim, not every rhetorical "
+        "modifier or broad framing phrase. Do not require exact wording. Mark "
+        "supported=true when the cited excerpts, considered together, provide "
+        "reasonable evidence for the central assertion that a domain expert "
+        "would accept in a review. A single excerpt does not need to support the "
+        "whole claim by itself. Mark supported=false when the evidence is "
+        "contradictory, unrelated, or misses the central assertion. Mark a "
+        "citation as supporting when it provides relevant evidence for the "
+        "claim, either alone or together with other cited excerpts. Do not "
+        "require the citation to be uniquely necessary; LiRA-style precision "
+        "counts whether cited references are related/supportive rather than "
+        "whether they are irreplaceable.\n\n"
+        "Return strict JSON with this schema:\n"
+        '{\n'
+        '  "supported": true,\n'
+        '  "supporting_citation_ids": ["C1", "C2"],\n'
+        '  "rationale": "short explanation"\n'
+        '}\n\n'
+        f"Generated claim:\n{claim}\n\n"
+        f"Cited source excerpts:\n{formatted_sources}"
+    )
+
+
+def parse_citation_quality_judge_response(
+    raw_response: str,
+    *,
+    claim: str,
+    sources: Sequence[Mapping[str, str]],
+) -> ClaimCitationQualityDecision:
+    json_text = _extract_json_object(raw_response)
+    try:
+        parsed = json.loads(json_text)
+    except json.JSONDecodeError as exc:
+        raise ValueError("citation quality judge response must be valid JSON") from exc
+    if not isinstance(parsed, dict):
+        raise ValueError("citation quality judge response must decode to an object")
+    supported = bool(parsed.get("supported", False))
+    citation_ids = [str(source.get("citation_id", "")) for source in sources]
+    citation_ids = [citation_id for citation_id in citation_ids if citation_id]
+    source_ids = [str(source.get("source_id", "")) for source in sources]
+    source_ids = [source_id for source_id in source_ids if source_id]
+    valid_citation_ids = set(citation_ids)
+    source_to_citation_ids: dict[str, list[str]] = defaultdict(list)
+    for source in sources:
+        citation_id = str(source.get("citation_id", "")).strip()
+        source_id = str(source.get("source_id", "")).strip()
+        if citation_id and source_id:
+            source_to_citation_ids[source_id].append(citation_id)
+
+    raw_necessary = (
+        parsed.get("supporting_citation_ids")
+        or parsed.get("related_citation_ids")
+        or parsed.get("necessary_citation_ids")
+        or []
+    )
+    necessary_ids: list[str] = []
+    if isinstance(raw_necessary, str):
+        raw_necessary = [raw_necessary]
+    if isinstance(raw_necessary, Sequence):
+        for raw_id in raw_necessary:
+            citation_id = str(raw_id).strip()
+            if citation_id in valid_citation_ids and citation_id not in necessary_ids:
+                necessary_ids.append(citation_id)
+
+    raw_source_ids = (
+        parsed.get("supporting_source_ids")
+        or parsed.get("related_source_ids")
+        or parsed.get("necessary_source_ids")
+        or []
+    )
+    if isinstance(raw_source_ids, str):
+        raw_source_ids = [raw_source_ids]
+    if isinstance(raw_source_ids, Sequence):
+        for raw_source_id in raw_source_ids:
+            for citation_id in source_to_citation_ids.get(str(raw_source_id).strip(), []):
+                if citation_id not in necessary_ids:
+                    necessary_ids.append(citation_id)
+
+    if (
+        supported
+        and not necessary_ids
+        and bool(parsed.get("supporting", parsed.get("necessary", supported)))
+    ):
+        necessary_ids = list(citation_ids)
+
+    return ClaimCitationQualityDecision(
+        claim_key=_claim_key(claim, citation_ids[0] if citation_ids else ""),
+        claim=claim,
+        citation_ids=citation_ids,
+        source_ids=source_ids,
+        supported=supported,
+        necessary_citation_ids=necessary_ids,
+        rationale=str(parsed.get("rationale", "")),
+    )
+
+
+def _extract_json_object(raw_response: str) -> str:
+    text = raw_response.strip()
+    fenced = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, flags=re.DOTALL)
+    if fenced:
+        return fenced.group(1).strip()
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        return text[start : end + 1]
+    return text
+
+
+def _claim_key(claim: str, citation_id: str) -> str:
+    normalized = re.sub(r"\s+", " ", claim.casefold()).strip()
+    return normalized or citation_id
+
+
+def _word_count_for_citation_quality(text: str) -> int:
+    return len(re.findall(r"[A-Za-z0-9]+", str(text or "")))
+
+
+def estimate_citation_quality_claim_count(text: str) -> int:
+    """Estimate generated-article claim count for LiRA recall scaling.
+
+    LiRA defines ``nclaims`` as the average number of claims in generated
+    articles. This lightweight estimator counts claim-like body sentences
+    rather than citation-manifest entries, which only cover cited claims.
+    """
+
+    if not isinstance(text, str) or not text.strip():
+        return 0
+
+    count = 0
+    for line in text.splitlines():
+        stripped = line.strip()
+        if (
+            not stripped
+            or stripped.startswith("#")
+            or re.fullmatch(r"\[[0-9,\- ]+\]", stripped)
+        ):
+            continue
+        normalized_line = re.sub(r"\s+", " ", stripped.casefold()).strip()
+        if normalized_line.startswith(("references", "bibliography")):
+            continue
+        for sentence in re.split(r"(?<=[.!?])\s+", stripped):
+            normalized_sentence = re.sub(
+                r"\s+", " ", sentence.casefold()
+            ).strip()
+            if not normalized_sentence:
+                continue
+            if normalized_sentence.startswith(("references", "bibliography")):
+                continue
+            if (
+                _word_count_for_citation_quality(sentence)
+                >= MIN_CITATION_QUALITY_ARTICLE_CLAIM_WORDS
+            ):
+                count += 1
+    return count
+
+
+def _split_citation_quality_claim(claim: str) -> list[str]:
+    """Split only obvious multi-claim spans into LiRA-style atomic claims."""
+
+    normalized = re.sub(r"\s+", " ", str(claim or "")).strip()
+    if not normalized:
+        return [""]
+
+    sentence_parts = [
+        part.strip(" -")
+        for part in re.split(r"(?<=[.!?])\s+", normalized)
+        if part.strip(" -")
+    ]
+    if len(sentence_parts) > 1 and all(
+        _word_count_for_citation_quality(part) >= MIN_CITATION_QUALITY_SUBCLAIM_WORDS
+        for part in sentence_parts
+    ):
+        return sentence_parts
+
+    semicolon_parts = [
+        part.strip(" -")
+        for part in re.split(r"\s*;\s*", normalized)
+        if part.strip(" -")
+    ]
+    if len(semicolon_parts) > 1 and all(
+        _word_count_for_citation_quality(part) >= MIN_CITATION_QUALITY_SUBCLAIM_WORDS
+        for part in semicolon_parts
+    ):
+        return semicolon_parts
+
+    return [normalized]
+
+
+def _citation_quality_tokens(text: str) -> set[str]:
+    return {
+        token
+        for token in re.findall(r"[a-z0-9]+", str(text).casefold())
+        if len(token) > 2
+    }
+
+
+def _split_citation_quality_excerpt(text: str) -> list[str]:
+    excerpt = re.sub(r"\s+", " ", str(text or "")).strip()
+    if not excerpt:
+        return [""]
+    if len(excerpt) <= MAX_CITATION_QUALITY_CHUNK_CHARS:
+        return [excerpt]
+
+    sentences = [
+        sentence.strip()
+        for sentence in re.split(r"(?<=[.!?])\s+", excerpt)
+        if sentence.strip()
+    ]
+    if not sentences:
+        return [
+            excerpt[index : index + MAX_CITATION_QUALITY_CHUNK_CHARS].strip()
+            for index in range(0, len(excerpt), MAX_CITATION_QUALITY_CHUNK_CHARS)
+        ]
+
+    chunks: list[str] = []
+    current = ""
+    for sentence in sentences:
+        if not current:
+            current = sentence
+            continue
+        if len(current) + 1 + len(sentence) <= MAX_CITATION_QUALITY_CHUNK_CHARS:
+            current = f"{current} {sentence}"
+        else:
+            chunks.append(current)
+            current = sentence
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+def _select_citation_quality_chunks(claim: str, excerpt: str) -> list[str]:
+    chunks = _split_citation_quality_excerpt(excerpt)
+    if len(chunks) <= MAX_CITATION_QUALITY_CHUNKS_PER_SOURCE:
+        return chunks
+
+    claim_tokens = _citation_quality_tokens(claim)
+    ranked: list[tuple[float, int, str]] = []
+    for index, chunk in enumerate(chunks):
+        chunk_tokens = _citation_quality_tokens(chunk)
+        overlap = len(claim_tokens & chunk_tokens)
+        normalized_overlap = overlap / max(1, len(claim_tokens))
+        ranked.append((normalized_overlap, -index, chunk))
+    selected = sorted(
+        ranked,
+        key=lambda item: (item[0], item[1]),
+        reverse=True,
+    )[:MAX_CITATION_QUALITY_CHUNKS_PER_SOURCE]
+    return [chunk for _, _, chunk in sorted(selected, key=lambda item: -item[1])]
+
+
+def _citation_quality_sources_for_claim(
+    claim: str,
+    claim_events: Sequence[CitationEvent],
+) -> list[dict[str, str]]:
+    sources: list[dict[str, str]] = []
+    for event in claim_events:
+        chunks = _select_citation_quality_chunks(claim, event.source_excerpt)
+        for chunk_index, chunk in enumerate(chunks, start=1):
+            source_excerpt = chunk
+            if len(chunks) > 1:
+                source_excerpt = f"Evidence chunk {chunk_index}/{len(chunks)}:\n{chunk}"
+            sources.append(
+                {
+                    "citation_id": event.citation_id,
+                    "source_id": event.source_id,
+                    "source_excerpt": source_excerpt,
+                }
+            )
+    return sources
+
+
+PROCEDURAL_REVIEW_CLAIM_TERMS = (
+    "boolean operator",
+    "search strategy",
+    "search string",
+    "database search",
+    "literature search",
+    "inclusion criteria",
+    "exclusion criteria",
+    "eligibility criteria",
+    "studies were required",
+    "studies were excluded",
+    "data extraction",
+    "quality assessment",
+    "risk of bias",
+    "screening process",
+    "narrative synthesis",
+    "meta-analytical pooling",
+    "meta analytical pooling",
+    "analytical strategy",
+    "systematic approach",
+    "systematic evidence synthesis",
+    "transparent, reproducible",
+    "methodologically rigorous",
+    "cross-study comparisons",
+    "this review aims",
+    "this review aimed",
+    "this review seeks",
+    "this scoping review",
+    "this systematic review",
+    "this meta-analysis",
+    "this section details",
+    "this section describes",
+    "the methodological architecture",
+    "designed to rigorously capture",
+    "capture, evaluate, and synthesize",
+    "transparently aggregating",
+    "evaluating, and synthesizing",
+    "studies were included if",
+    "study selection",
+    "study designs were considered eligible",
+    "trial designs were considered eligible",
+    "both parallel-group and crossover trial designs",
+    "primary outcomes were",
+    "secondary outcomes were",
+    "search was restricted",
+    "language publications",
+    "from database inception",
+    "supplementary search techniques",
+    "reference lists",
+    "bibliographies of included",
+    "manually screened",
+    "additional records",
+    "organizing endpoints",
+    "upcoming literature analysis",
+)
+
+
+def _is_procedural_review_claim(claim: str) -> bool:
+    normalized = re.sub(r"\s+", " ", str(claim).casefold()).strip()
+    if not normalized:
+        return False
+    tokens = re.findall(r"[a-z0-9]+", normalized)
+    if tokens and sum(token.isdigit() for token in tokens) / len(tokens) >= 0.5:
+        return True
+    if len(tokens) <= 3 and any(token.isdigit() for token in tokens):
+        return True
+    return any(term in normalized for term in PROCEDURAL_REVIEW_CLAIM_TERMS)
+
+
 def infer_claim_strength(event: CitationEvent) -> int:
     """Infer claim strength deterministically from event metadata and text cues."""
 
@@ -1348,6 +1930,205 @@ def score_source_fidelity(
         chunk_classifications=classifications,
         event_decisions=decisions,
         chunk_scores=chunk_scores,
+    )
+
+
+def score_citation_quality_f1(
+    final_text: str,
+    citation_manifest: Sequence[object],
+    judge: CitationQualityJudge,
+    *,
+    scaling_k: float = 0.01,
+    scaling_claim_count: float | None = None,
+) -> CitationQualityF1Result:
+    """Score LiRA-style citation quality F1 with recall scaling.
+
+    LiRA evaluates claim-citation alignment as a balance of citation recall and
+    precision, with recall scaled by ``1 - exp(-k * n_claims)``.
+    """
+
+    if not isinstance(final_text, str) or final_text.strip() == "":
+        raise ValueError("final_text must be a non-empty string")
+    if not citation_manifest:
+        raise ValueError("citation_manifest must contain at least one citation event")
+
+    events = normalize_citation_events(citation_manifest)
+    events_by_claim: dict[str, list[CitationEvent]] = defaultdict(list)
+    for event in events:
+        subclaims = _split_citation_quality_claim(event.claim_span)
+        for subclaim_index, subclaim in enumerate(subclaims, start=1):
+            event_for_claim = (
+                event
+                if len(subclaims) == 1
+                else CitationEvent(
+                    citation_id=event.citation_id,
+                    chunk_id=event.chunk_id,
+                    source_id=event.source_id,
+                    claim_span=subclaim,
+                    source_excerpt=event.source_excerpt,
+                    claim_role=event.claim_role,
+                    source_type=event.source_type,
+                    claim_strength=event.claim_strength,
+                    evidence_strength=event.evidence_strength,
+                    fidelity_penalty=event.fidelity_penalty,
+                )
+            )
+            key_suffix = (
+                event.citation_id
+                if len(subclaims) == 1
+                else f"{event.citation_id}#subclaim{subclaim_index}"
+            )
+            events_by_claim[_claim_key(subclaim, key_suffix)].append(event_for_claim)
+
+    claim_decisions: list[ClaimCitationQualityDecision] = []
+    decisions: list[CitationQualityDecision] = []
+    excluded_claims: list[dict[str, object]] = []
+    for claim_key, claim_events in events_by_claim.items():
+        claim = claim_events[0].claim_span
+        if _is_procedural_review_claim(claim):
+            excluded_claims.append(
+                {
+                    "claim_key": claim_key,
+                    "claim": claim,
+                    "citation_ids": [event.citation_id for event in claim_events],
+                    "source_ids": list(
+                        dict.fromkeys(event.source_id for event in claim_events)
+                    ),
+                    "reason": "procedural_review_claim",
+                }
+            )
+            continue
+        sources = _citation_quality_sources_for_claim(claim, claim_events)
+        claim_decision = _judge_claim_citation_quality(
+            judge=judge,
+            claim=claim,
+            claim_key=claim_key,
+            events=claim_events,
+            sources=sources,
+        )
+        claim_decisions.append(claim_decision)
+        necessary_ids = set(claim_decision.necessary_citation_ids)
+        for event in claim_events:
+            necessary = event.citation_id in necessary_ids
+            decisions.append(
+                CitationQualityDecision(
+                    citation_id=event.citation_id,
+                    claim_key=claim_key,
+                    source_id=event.source_id,
+                    supported=necessary,
+                    necessary=necessary,
+                    rationale=claim_decision.rationale,
+                )
+            )
+
+    claim_count = len(events_by_claim) - len(excluded_claims)
+    citation_count = len(decisions)
+    supported_claim_count = sum(1 for decision in claim_decisions if decision.supported)
+    necessary_citation_count = sum(1 for decision in decisions if decision.necessary)
+    recall = supported_claim_count / claim_count if claim_count else 0.0
+    precision = necessary_citation_count / citation_count if citation_count else 0.0
+    active_scaling_claim_count = (
+        float(scaling_claim_count)
+        if scaling_claim_count is not None
+        else float(claim_count)
+    )
+    if active_scaling_claim_count < 0:
+        raise ValueError("scaling_claim_count must be non-negative")
+    scaling = 1.0 - math.exp(-scaling_k * active_scaling_claim_count)
+    scaled_recall = recall * scaling
+    if precision + scaled_recall <= 0:
+        score = 0.0
+    else:
+        score = 2 * precision * scaled_recall / (precision + scaled_recall)
+
+    return CitationQualityF1Result(
+        score=round(score, 4),
+        precision=round(precision, 4),
+        recall=round(recall, 4),
+        scaled_recall=round(scaled_recall, 4),
+        scaling=round(scaling, 4),
+        scaling_claim_count=round(active_scaling_claim_count, 4),
+        claim_count=claim_count,
+        citation_count=citation_count,
+        supported_claim_count=supported_claim_count,
+        necessary_citation_count=necessary_citation_count,
+        excluded_claim_count=len(excluded_claims),
+        excluded_citation_count=sum(
+            len(item.get("citation_ids", [])) for item in excluded_claims
+        ),
+        excluded_claims=excluded_claims,
+        decisions=decisions,
+        claim_decisions=claim_decisions,
+    )
+
+
+def _judge_claim_citation_quality(
+    *,
+    judge: CitationQualityJudge,
+    claim: str,
+    claim_key: str,
+    events: Sequence[CitationEvent],
+    sources: Sequence[Mapping[str, str]],
+) -> ClaimCitationQualityDecision:
+    grouped_judge = getattr(judge, "judge_claim_citation_quality", None)
+    if callable(grouped_judge):
+        try:
+            decision = grouped_judge(claim=claim, sources=sources)
+        except Exception as exc:
+            return ClaimCitationQualityDecision(
+                claim_key=claim_key,
+                claim=claim,
+                citation_ids=[event.citation_id for event in events],
+                source_ids=[event.source_id for event in events],
+                supported=False,
+                necessary_citation_ids=[],
+                rationale=f"judge_error: {exc}",
+            )
+        valid_ids = {event.citation_id for event in events}
+        necessary_ids = [
+            citation_id
+            for citation_id in decision.necessary_citation_ids
+            if citation_id in valid_ids
+        ]
+        return ClaimCitationQualityDecision(
+            claim_key=claim_key,
+            claim=claim,
+            citation_ids=[event.citation_id for event in events],
+            source_ids=[event.source_id for event in events],
+            supported=decision.supported,
+            necessary_citation_ids=necessary_ids,
+            rationale=decision.rationale,
+        )
+
+    single_judge = getattr(judge, "judge_citation_quality", None)
+    if not callable(single_judge):
+        raise TypeError(
+            "citation quality judge must implement judge_claim_citation_quality"
+        )
+
+    event_decisions: list[CitationQualityDecision] = []
+    for event in events:
+        event_decisions.append(
+            single_judge(
+                claim=event.claim_span,
+                source_excerpt=event.source_excerpt,
+                source_id=event.source_id,
+                citation_id=event.citation_id,
+            )
+        )
+    necessary_ids = [
+        decision.citation_id for decision in event_decisions if decision.necessary
+    ]
+    return ClaimCitationQualityDecision(
+        claim_key=claim_key,
+        claim=claim,
+        citation_ids=[event.citation_id for event in events],
+        source_ids=[event.source_id for event in events],
+        supported=any(decision.supported for decision in event_decisions),
+        necessary_citation_ids=necessary_ids,
+        rationale="; ".join(
+            decision.rationale for decision in event_decisions if decision.rationale
+        ),
     )
 
 
@@ -1831,15 +2612,26 @@ def score_citation_count(
     )
 
 
-def _source_balance_penalty(max_share: float) -> float:
-    soft_upper = SOURCE_BALANCE_THRESHOLDS["soft_upper"]
-    hard_upper = SOURCE_BALANCE_THRESHOLDS["hard_upper"]
-    if max_share <= soft_upper:
-        return 0.0
-    denominator = hard_upper - soft_upper
-    if denominator <= 0:
-        return 1.0
-    return _clamp((max_share - soft_upper) / denominator, 0.0, 1.0)
+def _normalized_source_balance_score(source_counts: Mapping[str, int]) -> tuple[float, float]:
+    """Return normalized Simpson diversity and raw HHI concentration.
+
+    HHI=sum(p_i^2) is 1.0 when all citations use one source and approaches
+    1/K when citations are evenly distributed across K cited sources. The
+    normalized score maps the attainable [1/K, 1] range to [1, 0].
+    """
+
+    counts = [count for count in source_counts.values() if count > 0]
+    total = sum(counts)
+    cited_source_count = len(counts)
+    if total <= 0 or cited_source_count <= 1:
+        return 0.0, 1.0
+
+    hhi = sum((count / total) ** 2 for count in counts)
+    max_diversity = 1.0 - (1.0 / cited_source_count)
+    if max_diversity <= 0:
+        return 0.0, hhi
+    score = (1.0 - hhi) / max_diversity
+    return _clamp(score, 0.0, 1.0), hhi
 
 
 def score_source_balance(
@@ -1865,23 +2657,29 @@ def score_source_balance(
         max_count = 0
         max_share = 0.0
         dominant_source_id = ""
-        penalty = 1.0
+        score = 0.0
+        hhi = 1.0
+        cited_source_count = 0
     else:
         dominant_source_id, max_count = max(
             source_counts.items(),
             key=lambda item: (item[1], item[0]),
         )
         max_share = max_count / total_citations
-        penalty = _source_balance_penalty(max_share)
+        score, hhi = _normalized_source_balance_score(source_counts)
+        cited_source_count = sum(1 for count in source_counts.values() if count > 0)
+    penalty = 1.0 - score
 
     return SourceBalanceResult(
-        score=round(1.0 - penalty, 4),
+        score=round(score, 4),
         penalty=round(penalty, 4),
         total_citations=total_citations,
         max_single_source_count=max_count,
         max_single_source_share=round(max_share, 4),
         dominant_source_id=dominant_source_id,
-        thresholds=SOURCE_BALANCE_THRESHOLDS,
+        concentration_hhi=round(hhi, 4),
+        cited_source_count=cited_source_count,
+        method="normalized_hhi",
         source=source,
         source_counts=source_counts,
     )
@@ -2100,6 +2898,8 @@ def _extract_chunk_map(reference: Mapping[str, object]) -> object | None:
 def evaluate_citation_dimension(
     final_text: str,
     reference: Mapping[str, object],
+    *,
+    citation_quality_judge: CitationQualityJudge | Literal["default"] | None = None,
 ) -> dict[str, object]:
     """Evaluate citation-dimension scores currently implemented in MetaBench."""
 
@@ -2137,23 +2937,76 @@ def evaluate_citation_dimension(
                 "citation_count": citation_count_result.to_dict(),
                 "source_balance": source_balance_result.to_dict(),
                 "section_distribution": section_distribution_result.to_dict(),
-                "source_fidelity": {
+                "citation_quality_f1": {
                     "status": "not_evaluated",
                     "reason": "missing_citation_manifest",
                 }
             },
         }
 
-    result = score_source_fidelity(
+    source_fidelity_result = score_source_fidelity(
         final_text=final_text,
         citation_manifest=citation_manifest,
         reference=reference,
         chunk_map=chunk_map,
     )
+    quality_result: CitationQualityF1Result | None = None
+    quality_error: str | None = None
+    if citation_quality_judge == "default":
+        try:
+            active_quality_judge: CitationQualityJudge | None = (
+                create_default_citation_quality_judge()
+            )
+        except Exception as exc:
+            active_quality_judge = None
+            quality_error = str(exc)
+    else:
+        active_quality_judge = citation_quality_judge
+
+    if active_quality_judge is not None:
+        try:
+            raw_scaling_claim_count = reference.get(
+                "citation_quality_scaling_claim_count",
+                DEFAULT_CITATION_QUALITY_SCALING_CLAIM_COUNT,
+            )
+            scaling_claim_count = (
+                float(raw_scaling_claim_count)
+                if raw_scaling_claim_count is not None
+                else None
+            )
+            quality_result = score_citation_quality_f1(
+                final_text=final_text,
+                citation_manifest=citation_manifest,
+                judge=active_quality_judge,
+                scaling_claim_count=scaling_claim_count,
+            )
+        except Exception as exc:
+            quality_error = str(exc)
+
+    quality_scores = (
+        {"citation_quality_f1": quality_result.score}
+        if quality_result is not None
+        else {}
+    )
+    quality_diagnostics: dict[str, object]
+    if quality_result is not None:
+        quality_diagnostics = quality_result.to_dict()
+        quality_diagnostics["scaling_claim_count_source"] = str(
+            reference.get(
+                "citation_quality_scaling_claim_count_source",
+                DEFAULT_CITATION_QUALITY_SCALING_CLAIM_COUNT_SOURCE,
+            )
+        )
+    else:
+        quality_diagnostics = {
+            "status": "not_evaluated",
+            "reason": "citation_quality_judge_not_available",
+            **({"error": quality_error} if quality_error else {}),
+        }
     return {
         "dimension": "citation",
         "scores": {
-            "source_fidelity": result.score,
+            **quality_scores,
             "citation_count": citation_count_result.score,
             "source_balance": source_balance_result.score,
             **(
@@ -2166,6 +3019,7 @@ def evaluate_citation_dimension(
             "citation_count": citation_count_result.to_dict(),
             "source_balance": source_balance_result.to_dict(),
             "section_distribution": section_distribution_result.to_dict(),
-            "source_fidelity": result.to_dict(),
+            "citation_quality_f1": quality_diagnostics,
+            "source_fidelity_legacy": source_fidelity_result.to_dict(),
         },
     }

@@ -18,6 +18,7 @@ class StaticProxyJudge:
                 "covered_points": list(question.required_points),
                 "missing_points": [],
                 "rationale": "covered",
+                "coverage_score": 5,
             },
         )()
 
@@ -70,10 +71,10 @@ Overall, the article discusses limitations and future work for acute coronary sy
 
         self.assertEqual(result["status"], "completed")
         self.assertEqual(result["framework"], "meta_bench")
-        self.assertIn("entity_consistency_score", result["metric_scores"])
-        self.assertIn("proxy_hit_rate", result["metric_scores"])
-        self.assertIn("length_score", result["metric_scores"])
-        self.assertIn("completion_rate", result["metric_scores"])
+        self.assertIn("article_entity_recall", result["metric_scores"])
+        self.assertIn("coverage_score", result["metric_scores"])
+        self.assertIn("length_adherence", result["metric_scores"])
+        self.assertIn("heading_soft_recall", result["metric_scores"])
         self.assertIn("citation_count", result["metric_scores"])
         self.assertIn("source_balance", result["metric_scores"])
 
@@ -108,8 +109,8 @@ Overall limitations and future work.
 
         result = evaluate_meta_bench(final_text, reference, proxy_judge=None)
 
-        self.assertIn("proxy_hit_rate", result["score_coverage"]["unscored_metrics"])
-        self.assertNotIn("proxy_hit_rate", result["metric_scores"])
+        self.assertIn("coverage_score", result["score_coverage"]["unscored_metrics"])
+        self.assertNotIn("coverage_score", result["metric_scores"])
 
 
 if __name__ == "__main__":

@@ -27,8 +27,8 @@ def _fake_evaluate_meta_bench(final_text, reference):
         "framework": "meta_bench",
         "task_id": reference.get("task_id"),
         "metric_scores": {
-            "entity_consistency_score": 0.8,
-            "length_score": 0.6,
+            "article_entity_recall": 0.8,
+            "length_adherence": 0.6,
         },
         "dimensions": {},
     }
@@ -47,8 +47,8 @@ def test_degraded_run_still_scored_and_marked(monkeypatch) -> None:
 
     scores = extract_ordered_metric_scores(evaluation)
     # 关键断言：不再为空字典
-    assert scores["entity_consistency_score"] == 0.8
-    assert scores["length_score"] == 0.6
+    assert scores["article_entity_recall"] == 0.8
+    assert scores["length_adherence"] == 0.6
 
 
 def test_completed_run_marked_not_degraded(monkeypatch) -> None:
@@ -59,7 +59,27 @@ def test_completed_run_marked_not_degraded(monkeypatch) -> None:
 
     assert evaluation["generation_degraded"] is False
     assert evaluation["run_status"] == "completed"
-    assert extract_ordered_metric_scores(evaluation)["entity_consistency_score"] == 0.8
+    assert extract_ordered_metric_scores(evaluation)["article_entity_recall"] == 0.8
+
+
+def test_evaluate_if_possible_keeps_reference_unchanged(monkeypatch) -> None:
+    captured = {}
+
+    def fake_evaluate(final_text, reference):
+        del final_text
+        captured.update(reference)
+        return _fake_evaluate_meta_bench("text", reference)
+
+    monkeypatch.setattr(meta_bench, "evaluate_meta_bench", fake_evaluate)
+
+    final_text = (
+        "This intervention reduced symptom burden in randomized clinical trials. "
+        "It also improved functional status across patient-reported outcomes."
+    )
+    evaluate_if_possible(final_text, {"task_id": "t1"}, run_status="completed")
+
+    assert "citation_quality_scaling_claim_count" not in captured
+    assert "citation_quality_scaling_claim_count_source" not in captured
 
 
 def test_no_reference_returns_none(monkeypatch) -> None:

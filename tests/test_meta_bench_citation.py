@@ -2,20 +2,81 @@ import unittest
 
 from meta_bench.citation import (
     CITATION_COUNT_THRESHOLDS,
-    SOURCE_BALANCE_THRESHOLDS,
+    ClaimCitationQualityDecision,
     CitationChunk,
     CitationEvent,
+    CitationQualityDecision,
+    build_citation_quality_judge_prompt,
     classify_chunk_role,
     event_source_fidelity_penalty,
     evaluate_citation_dimension,
+    estimate_citation_quality_claim_count,
     infer_claim_strength,
     infer_evidence_strength,
     score_citation_count,
+    score_citation_quality_f1,
     score_section_distribution,
     score_source_balance,
     score_source_fidelity,
     split_into_seven_sections,
 )
+
+
+class StaticCitationQualityJudge:
+    def __init__(self, supported_by_id):
+        self.supported_by_id = supported_by_id
+
+    def judge_citation_quality(self, *, claim, source_excerpt, source_id, citation_id):
+        supported = self.supported_by_id.get(citation_id, False)
+        return CitationQualityDecision(
+            citation_id=citation_id,
+            claim_key=claim.casefold() or citation_id,
+            source_id=source_id,
+            supported=supported,
+            necessary=supported,
+            rationale="static test decision",
+        )
+
+
+class StaticClaimCitationQualityJudge:
+    def __init__(self, supported_claims):
+        self.supported_claims = supported_claims
+
+    def judge_claim_citation_quality(self, *, claim, sources):
+        supported = self.supported_claims.get(claim, False)
+        citation_ids = [str(source.get("citation_id", "")) for source in sources]
+        return ClaimCitationQualityDecision(
+            claim_key=claim.casefold(),
+            claim=claim,
+            citation_ids=citation_ids,
+            source_ids=[str(source.get("source_id", "")) for source in sources],
+            supported=supported,
+            necessary_citation_ids=citation_ids if supported else [],
+            rationale="static claim-level test decision",
+        )
+
+
+class RecordingClaimCitationQualityJudge:
+    def __init__(self):
+        self.calls = []
+
+    def judge_claim_citation_quality(self, *, claim, sources):
+        self.calls.append({"claim": claim, "sources": sources})
+        citation_ids = [str(source.get("citation_id", "")) for source in sources]
+        return ClaimCitationQualityDecision(
+            claim_key=claim.casefold(),
+            claim=claim,
+            citation_ids=citation_ids,
+            source_ids=[str(source.get("source_id", "")) for source in sources],
+            supported=True,
+            necessary_citation_ids=list(dict.fromkeys(citation_ids)),
+            rationale="recorded",
+        )
+
+
+class FailingCitationQualityJudge:
+    def judge_claim_citation_quality(self, *, claim, sources):
+        raise AssertionError("procedural claims should not be judged")
 
 
 class ChunkRoleClassifierTests(unittest.TestCase):
@@ -104,6 +165,20 @@ class ChunkRoleClassifierTests(unittest.TestCase):
 
 
 class SourceFidelityTests(unittest.TestCase):
+    def test_estimate_citation_quality_claim_count_counts_body_sentences(self):
+        text = """# Review title
+
+This intervention reduced symptom burden in randomized clinical trials. It also improved functional status across multiple patient-reported outcome measures.
+
+[1]
+
+Short.
+
+References
+"""
+
+        self.assertEqual(estimate_citation_quality_claim_count(text), 2)
+
     def test_strength_inference_uses_metadata_and_text_cues(self):
         event = CitationEvent(
             citation_id="C1",
@@ -202,8 +277,7 @@ Trials and cohorts are compared here.
         result = evaluate_citation_dimension(final_text, reference)
 
         self.assertEqual(result["dimension"], "citation")
-        self.assertEqual(result["scores"]["source_fidelity"], 1.0)
-        diagnostics = result["diagnostics"]["source_fidelity"]
+        diagnostics = result["diagnostics"]["source_fidelity_legacy"]
         self.assertEqual(
             diagnostics["chunk_classifications"][0]["canonical_type"],
             "limitations_gaps",
@@ -219,8 +293,299 @@ Trials and cohorts are compared here.
         self.assertIn("citation_count", result["diagnostics"])
         self.assertIn("source_balance", result["diagnostics"])
         self.assertEqual(
-            result["diagnostics"]["source_fidelity"]["reason"],
+            result["diagnostics"]["citation_quality_f1"]["reason"],
             "missing_citation_manifest",
+        )
+
+    def test_score_citation_quality_f1_uses_lira_scaled_recall(self):
+        final_text = "Generated article text."
+        citation_manifest = [
+            {
+                "citation_id": "C1",
+                "source_id": "S1",
+                "claim_span": "Claim one",
+                "source_excerpt": "Evidence for claim one.",
+            },
+            {
+                "citation_id": "C2",
+                "source_id": "S2",
+                "claim_span": "Claim two",
+                "source_excerpt": "Unrelated evidence.",
+            },
+        ]
+
+        result = score_citation_quality_f1(
+            final_text,
+            citation_manifest,
+            StaticCitationQualityJudge({"C1": True, "C2": False}),
+        )
+
+        self.assertEqual(result.claim_count, 2)
+        self.assertEqual(result.citation_count, 2)
+        self.assertAlmostEqual(result.precision, 0.5)
+        self.assertAlmostEqual(result.recall, 0.5)
+        self.assertLess(result.scaled_recall, result.recall)
+
+    def test_score_citation_quality_f1_accepts_benchmark_level_claim_count(self):
+        final_text = "Generated article text."
+        citation_manifest = [
+            {
+                "citation_id": "C1",
+                "source_id": "S1",
+                "claim_span": "Claim one",
+                "source_excerpt": "Evidence for claim one.",
+            },
+            {
+                "citation_id": "C2",
+                "source_id": "S2",
+                "claim_span": "Claim two",
+                "source_excerpt": "Evidence for claim two.",
+            },
+        ]
+
+        result = score_citation_quality_f1(
+            final_text,
+            citation_manifest,
+            StaticCitationQualityJudge({"C1": True, "C2": True}),
+            scaling_claim_count=100,
+        )
+
+        self.assertEqual(result.claim_count, 2)
+        self.assertEqual(result.scaling_claim_count, 100)
+        self.assertAlmostEqual(result.scaling, 0.6321, places=4)
+
+    def test_citation_quality_prompt_uses_supporting_citation_ids(self):
+        prompt = build_citation_quality_judge_prompt(
+            claim="Claim one",
+            sources=[
+                {
+                    "citation_id": "C1",
+                    "source_id": "S1",
+                    "source_excerpt": "Evidence.",
+                }
+            ],
+        )
+
+        self.assertIn("supporting_citation_ids", prompt)
+        self.assertIn("related/supportive", prompt)
+        self.assertNotIn('"necessary_citation_ids"', prompt)
+
+    def test_score_citation_quality_f1_selects_claim_relevant_reference_chunks(self):
+        final_text = "Generated article text."
+        irrelevant = " ".join(
+            f"Background sentence {index} about unrelated metabolism."
+            for index in range(80)
+        )
+        relevant = (
+            "Interleukin 17 blockade improved psoriasis severity in randomized "
+            "clinical trials and reduced inflammatory skin lesions."
+        )
+        citation_manifest = [
+            {
+                "citation_id": "C1",
+                "source_id": "S1",
+                "claim_span": "Interleukin 17 blockade improved psoriasis severity",
+                "source_excerpt": f"{irrelevant} {relevant}",
+            }
+        ]
+        judge = RecordingClaimCitationQualityJudge()
+
+        result = score_citation_quality_f1(
+            final_text,
+            citation_manifest,
+            judge,
+        )
+
+        self.assertEqual(result.supported_claim_count, 1)
+        self.assertTrue(judge.calls)
+        joined_sources = "\n".join(
+            source["source_excerpt"] for source in judge.calls[0]["sources"]
+        )
+        self.assertIn("Interleukin 17 blockade", joined_sources)
+
+    def test_score_citation_quality_f1_excludes_review_procedure_claims(self):
+        final_text = "Generated article text."
+        citation_manifest = [
+            {
+                "citation_id": "C1",
+                "source_id": "S1",
+                "claim_span": (
+                    "Boolean operators combined these pillars to maximize "
+                    "sensitivity in the literature search strategy"
+                ),
+                "source_excerpt": "Biomedical source text.",
+            }
+        ]
+
+        result = score_citation_quality_f1(
+            final_text,
+            citation_manifest,
+            FailingCitationQualityJudge(),
+        )
+
+        self.assertEqual(result.claim_count, 0)
+        self.assertEqual(result.citation_count, 0)
+        self.assertEqual(result.excluded_claim_count, 1)
+        self.assertEqual(result.excluded_citation_count, 1)
+        self.assertEqual(result.score, 0.0)
+
+    def test_score_citation_quality_f1_excludes_review_framing_claims(self):
+        final_text = "Generated article text."
+        citation_manifest = [
+            {
+                "citation_id": "C1",
+                "source_id": "S1",
+                "claim_span": (
+                    "This review aims to systematically synthesize the available "
+                    "clinical evidence for evidence-based clinical decision-making"
+                ),
+                "source_excerpt": "Biomedical source text.",
+            }
+        ]
+
+        result = score_citation_quality_f1(
+            final_text,
+            citation_manifest,
+            FailingCitationQualityJudge(),
+        )
+
+        self.assertEqual(result.claim_count, 0)
+        self.assertEqual(result.excluded_claim_count, 1)
+        self.assertEqual(result.excluded_citation_count, 1)
+
+    def test_score_citation_quality_f1_excludes_numeric_fragments(self):
+        final_text = "Generated article text."
+        citation_manifest = [
+            {
+                "citation_id": "C1",
+                "source_id": "S1",
+                "claim_span": "62",
+                "source_excerpt": "Biomedical source text.",
+            }
+        ]
+
+        result = score_citation_quality_f1(
+            final_text,
+            citation_manifest,
+            FailingCitationQualityJudge(),
+        )
+
+        self.assertEqual(result.claim_count, 0)
+        self.assertEqual(result.excluded_claim_count, 1)
+        self.assertEqual(result.excluded_citation_count, 1)
+
+    def test_score_citation_quality_f1_judges_reference_set_per_claim(self):
+        final_text = "Generated article text."
+        citation_manifest = [
+            {
+                "citation_id": "C1",
+                "source_id": "S1",
+                "claim_span": "Combined claim",
+                "source_excerpt": "Evidence for the first part.",
+            },
+            {
+                "citation_id": "C2",
+                "source_id": "S2",
+                "claim_span": "Combined claim",
+                "source_excerpt": "Evidence for the second part.",
+            },
+        ]
+
+        result = score_citation_quality_f1(
+            final_text,
+            citation_manifest,
+            StaticClaimCitationQualityJudge({"Combined claim": True}),
+        )
+
+        self.assertEqual(result.claim_count, 1)
+        self.assertEqual(result.citation_count, 2)
+        self.assertEqual(result.supported_claim_count, 1)
+        self.assertEqual(result.necessary_citation_count, 2)
+        self.assertAlmostEqual(result.precision, 1.0)
+        self.assertAlmostEqual(result.recall, 1.0)
+        self.assertEqual(len(result.claim_decisions), 1)
+
+    def test_score_citation_quality_f1_splits_obvious_multi_sentence_claims(self):
+        final_text = "Generated article text."
+        citation_manifest = [
+            {
+                "citation_id": "C1",
+                "source_id": "S1",
+                "claim_span": (
+                    "The first intervention improved symptom scores in adults. "
+                    "The second intervention reduced follow-up hospitalizations."
+                ),
+                "source_excerpt": "Evidence for both intervention effects.",
+            },
+        ]
+
+        result = score_citation_quality_f1(
+            final_text,
+            citation_manifest,
+            StaticClaimCitationQualityJudge(
+                {
+                    "The first intervention improved symptom scores in adults.": True,
+                    "The second intervention reduced follow-up hospitalizations.": True,
+                }
+            ),
+        )
+
+        self.assertEqual(result.claim_count, 2)
+        self.assertEqual(result.citation_count, 2)
+        self.assertEqual(result.supported_claim_count, 2)
+        self.assertEqual(result.necessary_citation_count, 2)
+
+    def test_evaluate_citation_dimension_includes_citation_quality_with_judge(self):
+        final_text = "Generated article text."
+        reference = {
+            "citation_quality_scaling_claim_count": 2,
+            "citation_quality_scaling_claim_count_source": "article_sentences",
+            "citation_manifest": [
+                {
+                    "citation_id": "C1",
+                    "source_id": "S1",
+                    "claim_span": "Claim one",
+                    "source_excerpt": "Evidence for claim one.",
+                }
+            ]
+        }
+
+        result = evaluate_citation_dimension(
+            final_text,
+            reference,
+            citation_quality_judge=StaticCitationQualityJudge({"C1": True}),
+        )
+
+        self.assertIn("citation_quality_f1", result["scores"])
+        self.assertIn("citation_quality_f1", result["diagnostics"])
+        self.assertEqual(
+            result["diagnostics"]["citation_quality_f1"][
+                "scaling_claim_count_source"
+            ],
+            "article_sentences",
+        )
+
+    def test_evaluate_citation_dimension_uses_benchmark_scaling_by_default(self):
+        result = evaluate_citation_dimension(
+            "Generated article text.",
+            {
+                "citation_manifest": [
+                    {
+                        "citation_id": "C1",
+                        "source_id": "S1",
+                        "claim_span": "Claim one",
+                        "source_excerpt": "Evidence for claim one.",
+                    }
+                ]
+            },
+            citation_quality_judge=StaticCitationQualityJudge({"C1": True}),
+        )
+
+        diagnostics = result["diagnostics"]["citation_quality_f1"]
+        self.assertEqual(diagnostics["scaling_claim_count"], 258.62)
+        self.assertEqual(
+            diagnostics["scaling_claim_count_source"],
+            "metabench_50task_article_sentence_mean",
         )
 
 
@@ -592,18 +957,6 @@ The reviewed cohorts report associations [2,3].
 
 
 class SourceBalanceScoreTests(unittest.TestCase):
-    def test_source_balance_thresholds_are_ordered(self):
-        self.assertGreaterEqual(SOURCE_BALANCE_THRESHOLDS["soft_upper"], 0.0)
-        self.assertLess(
-            SOURCE_BALANCE_THRESHOLDS["soft_upper"],
-            SOURCE_BALANCE_THRESHOLDS["hard_upper"],
-        )
-        self.assertLessEqual(SOURCE_BALANCE_THRESHOLDS["hard_upper"], 1.0)
-
-    def test_source_balance_thresholds_use_high_percentile_bounds(self):
-        self.assertAlmostEqual(SOURCE_BALANCE_THRESHOLDS["soft_upper"], 0.18181818181818182)
-        self.assertAlmostEqual(SOURCE_BALANCE_THRESHOLDS["hard_upper"], 0.32347248576850013)
-
     def test_source_balance_full_score_for_even_mix(self):
         result = score_source_balance(
             "Generated article text.",
@@ -621,6 +974,8 @@ class SourceBalanceScoreTests(unittest.TestCase):
         self.assertEqual(result.score, 1.0)
         self.assertEqual(result.penalty, 0.0)
         self.assertEqual(result.max_single_source_share, 0.1667)
+        self.assertEqual(result.method, "normalized_hhi")
+        self.assertAlmostEqual(result.concentration_hhi, 1 / 6, places=4)
 
     def test_source_balance_penalizes_high_share(self):
         result = score_source_balance(
@@ -634,9 +989,23 @@ class SourceBalanceScoreTests(unittest.TestCase):
             ],
         )
 
-        self.assertGreater(result.max_single_source_share, SOURCE_BALANCE_THRESHOLDS["soft_upper"])
+        self.assertEqual(result.method, "normalized_hhi")
         self.assertGreater(result.penalty, 0.0)
         self.assertLess(result.score, 1.0)
+        self.assertAlmostEqual(result.concentration_hhi, 0.68)
+
+    def test_source_balance_single_source_scores_zero(self):
+        result = score_source_balance(
+            "Generated article text.",
+            [
+                {"citation_id": "C1", "source_id": "S1"},
+                {"citation_id": "C2", "source_id": "S1"},
+            ],
+        )
+
+        self.assertEqual(result.score, 0.0)
+        self.assertEqual(result.penalty, 1.0)
+        self.assertEqual(result.cited_source_count, 1)
 
     def test_source_balance_manifest_uses_source_id_counts(self):
         result = score_source_balance(

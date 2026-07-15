@@ -12,8 +12,13 @@
 """
 from __future__ import annotations
 
-from .run_baseline import run_baseline_task
 from .run_metawriter import run_metawriter_task
+
+
+def run_baseline_task(*args, **kwargs):
+    from .run_baseline import run_baseline_task as _run_baseline_task
+
+    return _run_baseline_task(*args, **kwargs)
 
 __all__ = [
     "run_baseline_task",

@@ -103,7 +103,7 @@ def evaluate_if_possible(
 
     from meta_bench import evaluate_meta_bench
 
-    evaluation = evaluate_meta_bench(final_text, dict(reference))
+    evaluation = evaluate_meta_bench(final_text, reference)
     # 正交标记：评估自身 status 恒为 "completed"；generation_degraded 单独
     # 表达"被评估文本含彻底失败/降级章节"，二者独立，互不覆盖。
     evaluation["generation_degraded"] = run_status != "completed"

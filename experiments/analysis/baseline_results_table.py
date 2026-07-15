@@ -15,14 +15,14 @@ from statistics import mean
 from typing import Dict, List, Optional
 
 METRICS = [
-    ("entity_consistency_score", "ECS"),
-    ("proxy_hit_rate", "PHR"),
-    ("length_score", "LEN"),
-    ("completion_rate", "CMP"),
-    ("source_fidelity", "SF"),
-    ("section_distribution", "SD"),
+    ("article_entity_recall", "AER"),
+    ("coverage_score", "COV"),
+    ("length_adherence", "LEN"),
+    ("heading_soft_recall", "HSR"),
     ("citation_count", "CD"),
+    ("section_distribution", "SD"),
     ("source_balance", "SB"),
+    ("citation_quality_f1", "CQF1"),
 ]
 
 
@@ -36,10 +36,9 @@ def _read_metrics(bundle: Path) -> Optional[Dict[str, Optional[float]]]:
         return None
     data = json.loads(summary_file.read_text(encoding="utf-8"))
     scores = data.get("meta_bench_scores", {})
-    sf = data.get("source_fidelity_eval_side", {}).get("source_fidelity")
     out: Dict[str, Optional[float]] = {}
     for key, _ in METRICS:
-        out[key] = sf if key == "source_fidelity" else scores.get(key)
+        out[key] = scores.get(key)
     return out
 
 
